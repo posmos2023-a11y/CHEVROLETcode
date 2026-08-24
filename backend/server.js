@@ -95,6 +95,14 @@ if (process.env.NODE_ENV === 'production') {
 const app = express()
 app.disable('x-powered-by')
 
+// ETag(조건부 캐싱) 비활성화. Express는 기본적으로 GET 응답에 ETag를 붙이는데, 브라우저/웹뷰가
+// 같은 URL을 다시 부를 때 자동으로 If-None-Match 헤더를 실어 보내면 서버가 "안 바뀌었다"며
+// 304(본문 없음)로 응답한다. 우리 API는 전부 JSON을 기대하는 클라이언트가 소비하는데(특히 POS
+// 탭앱은 GET /api/pos/queue를 5초마다 폴링한다), 304로 빈 본문이 오면 res.json()이 파싱할 게 없어
+// 대기열이 갱신되지 않고 화면이 "무반응"으로 멈춘다. 대기열처럼 매번 달라지는 동적 응답에는 조건부
+// 캐싱 이점도 없으므로 아예 끈다. (정적 파일은 express.static이 자체 ETag를 쓰므로 이 설정과 무관하다.)
+app.set('etag', false)
+
 // Render/GCP(Cloud Run 등) 모두 로드밸런서 뒤에서 X-Forwarded-For를 붙여 전달한다.
 // trust proxy를 설정하지 않으면 express-rate-limit이 개별 클라이언트가 아니라
 // 매장 전체 트래픽을 하나로 묶어 레이트리밋을 적용해버린다. 홉 수는 배포 플랫폼마다
