@@ -8,6 +8,12 @@
 <style>
   * { box-sizing: border-box; }
 
+  /* hidden 속성이 항상 요소를 숨기도록 강제한다. `.token-screen { display: grid }`, `#main-view`
+     등에 display 규칙이 있으면, JS로 `el.hidden = true`를 줘도 브라우저 기본 [hidden]{display:none}을
+     덮어써서 화면이 안 사라진다(작성자 CSS가 UA 규칙을 이긴다). 실제로 토큰 인증에 성공해도 토큰
+     입력 화면이 그대로 남아 "확인을 눌러도 무반응"으로 보이던 버그의 원인이었다. !important로 확실히 이긴다. */
+  [hidden] { display: none !important; }
+
   :root {
     --blue: #3182f6;
     --blue-strong: #1b64da;
