@@ -34,6 +34,10 @@ const {
   markReservationCompleted,
   markReservationNotifyFailed,
   markReservationCancelled,
+  markReservationIntakeFailed,
+  clearReservationIntakeStatus,
+  countPeopleAhead,
+  listFailedReservations,
   findLatestReservationByPhone,
   createPayment,
   findPaymentByKey,
@@ -45,6 +49,7 @@ const {
   markPromoSent,
   releasePromoClaim,
   purgeExpiredPersonalData,
+  getDailySummary,
 } = require('./src/store')
 const { PostgresRateLimitStore } = require('./src/rateLimitStore')
 const logger = require('./src/logger')
@@ -364,6 +369,18 @@ app.get('/api/admin/me', requireAuth, asyncHandler(async (req, res) => {
   return res.json({ ok: true, id: req.admin.id, email: req.admin.email, role: req.admin.role, store })
 }))
 
+// 일별 요약 (관리자 전용, 계약 v3 §5.1 신규). hq_admin은 ?storeId=로 특정 매장 또는 전체(생략),
+// store_admin은 항상 자기 매장으로 고정된다(resolveScopedStoreId, 다른 라우트와 동일 패턴).
+// date는 KST YYYY-MM-DD, 기본값은 오늘. 예약은 serviceDate 기준으로 필터하고, 결제는 createdAt의
+// KST 하루 범위로 필터한다 — 두 모델의 "그 날" 기준이 다르기 때문이다(getDailySummary 주석 참고).
+app.get('/api/admin/summary', requireAuth, asyncHandler(async (req, res) => {
+  const storeId = resolveScopedStoreId(req)
+  const date = parseKstDate(req.query.date) || kstDateString()
+  const range = kstDateRangeUtc(date)
+  const summary = await getDailySummary({ storeId, date, dateStart: range.start, dateEnd: range.end })
+  return res.json({ ok: true, date, storeId: storeId || null, ...summary })
+}))
+
 // 매장 관리자 계정 발급 (본사 전용). merchantId로 매장을 찾아 그 매장에 스코프된 계정을 만든다.
 app.post('/api/admin/store-admins', requireAuth, requireRole('hq_admin'), asyncHandler(async (req, res) => {
   const email = String(req.body?.email ?? '').trim().toLowerCase()
@@ -550,6 +567,10 @@ app.post('/api/reservations', publicCors, reservationLimiter, requireStore, asyn
       error: notifyError.message,
     })
     // 접수 안내 알림 발송에 실패해도 손님은 여전히 대기중이므로 status는 바꾸지 않는다.
+    // 대신 intakeNotifyStatus='failed'만 기록해 관리자 화면이 재발송 대상을 알 수 있게 한다
+    // (계약 v3 §2.1). 중복(idempotency) 경로는 애초에 이 try 블록을 타지 않으므로 여기서
+    // 처리할 필요가 없다(기존과 동일).
+    await markReservationIntakeFailed(reservation.id)
   }
 
   return res.json({
@@ -642,6 +663,46 @@ app.post('/api/reservations/:id/retry-notify', requireAuth, asyncHandler(async (
   return res.json({ ok: true, id: reservation.id, status: outcome.status, sent: outcome.sent })
 }))
 
+// 접수(대기번호) 알림톡 재발송 (관리자 전용, 계약 v3 §2.3 신규). intakeNotifyStatus='failed'이고
+// 아직 completed/cancelled로 끝나지 않은 예약만 허용한다 — retry-notify(순서 재호출)와는 별개로,
+// "대기번호 접수됐습니다" 안내가 애초에 안 나간 건을 다시 보내는 용도다.
+// status 자체는 바꾸지 않는다(원래도 안 바꿨다) — peopleAhead만 최신값으로 다시 계산해서 보낸다.
+app.post('/api/reservations/:id/retry-intake', requireAuth, asyncHandler(async (req, res) => {
+  const existing = await getReservation(req.params.id)
+  if (!existing) {
+    return res.status(404).json({ ok: false, error: '예약을 찾을 수 없습니다.' })
+  }
+  if (!assertOwnsReservation(req, res, existing)) return
+  if (existing.intakeNotifyStatus !== 'failed' || ['completed', 'cancelled'].includes(existing.status)) {
+    return res.status(409).json({ ok: false, error: '접수 알림 발송 실패 상태의 예약만 재발송할 수 있습니다.' })
+  }
+
+  const peopleAhead = await countPeopleAhead(existing.storeId, existing.serviceDate, existing.createdAt)
+  try {
+    await solapi.sendReservationAlimtalk({
+      phone: existing.phone,
+      carNumber: existing.carNumber,
+      queueNumber: existing.queueNumber,
+      peopleAhead,
+      serviceType: existing.serviceType,
+      storeName: existing.store?.name,
+      storeId: existing.storeId,
+      reservationId: existing.id,
+    })
+    await clearReservationIntakeStatus(existing.id)
+    return res.json({ ok: true, id: existing.id, sent: true })
+  } catch (notifyError) {
+    logger.error('접수 알림 재발송 실패', {
+      reservationId: existing.id,
+      storeId: existing.storeId,
+      error: notifyError.message,
+    })
+    // 다시 실패해도 intakeNotifyStatus는 'failed'로 유지된 채(원래 값 그대로) HTTP 200 + sent:false로
+    // 알린다 — retry-notify/retry-receipt와 동일한 패턴(계약 v3 §2.3).
+    return res.json({ ok: true, id: existing.id, sent: false })
+  }
+}))
+
 // 예약을 삭제한다 (관리자 전용). 테스트 데이터 정리나 손님 취소 처리용.
 app.delete('/api/reservations/:id', requireAuth, asyncHandler(async (req, res) => {
   const reservation = await getReservation(req.params.id)
@@ -679,19 +740,23 @@ app.get('/api/reservations', adminCors, requireAuth, asyncHandler(async (req, re
   const storeId = resolveScopedStoreId(req)
   const date = parseKstDate(req.query.date)
   const statuses = parseStatusFilter(req.query.status, RESERVATION_STATUSES)
+  const q = req.query.q
   const limit = parseLimit(req.query.limit)
   const offset = parseOffset(req.query.offset)
-  const { total, items } = await listReservationsPage({ storeId, date, statuses, limit, offset })
+  const { total, items } = await listReservationsPage({ storeId, date, statuses, q, limit, offset })
   return res.json({ ok: true, count: items.length, total, hasMore: offset + items.length < total, reservations: items })
 }))
 
-// 알림톡 발송 실패 건 확인용. status는 쿼리와 무관하게 항상 notify_failed로 고정한다(계약 §3.4).
+// 알림톡 발송 실패 건 확인용(계약 v3 §2.4). 순서 호출 실패(notify_failed)와 접수 알림 실패
+// (intakeNotifyStatus='failed')를 함께 반환한다 — 응답 item은 Prisma 모델 그대로라 status/
+// intakeNotifyStatus를 모두 포함하므로 프론트가 이걸로 재발송 종류(retry-notify vs retry-intake)를
+// 판단한다. /failed 계열은 검색(q) 대상이 아니다(계약 §3.1).
 app.get('/api/reservations/failed', requireAuth, asyncHandler(async (req, res) => {
   const storeId = resolveScopedStoreId(req)
   const date = parseKstDate(req.query.date)
   const limit = parseLimit(req.query.limit)
   const offset = parseOffset(req.query.offset)
-  const { total, items } = await listReservationsPage({ storeId, date, statuses: ['notify_failed'], limit, offset })
+  const { total, items } = await listFailedReservations({ storeId, date, limit, offset })
   return res.json({ ok: true, count: items.length, total, hasMore: offset + items.length < total, reservations: items })
 }))
 
@@ -743,7 +808,10 @@ const posAuthLimiter = rateLimit({
   message: { ok: false, error: '매장 인증 실패가 반복되어 일시적으로 차단되었습니다. 15분 후 다시 시도해주세요.' },
 })
 
-// 오늘(KST) serviceDate + 아직 끝나지 않은 예약만, queueNumber 오름차순으로 보여준다(계약 §3.13).
+// 오늘(KST) serviceDate 접수분 + 아직 끝나지 않은 이월 건(called/notify_failed)을 함께 보여준다
+// (계약 v3 §4.1~4.2). 응답 최상위 serviceDate(오늘 날짜)는 그대로 유지하고, 각 item에도
+// serviceDate를 실어보내 POS 화면이 "오늘 최상위 serviceDate와 다르면 이월 건"으로 배지를 붙일 수
+// 있게 한다.
 app.get('/api/pos/queue', posQueueReadLimiter, posAuthLimiter, requireStoreToken, asyncHandler(async (req, res) => {
   const serviceDate = kstDateString()
   const reservations = await listActiveQueueForStore(req.store.id, serviceDate)
@@ -759,6 +827,7 @@ app.get('/api/pos/queue', posQueueReadLimiter, posAuthLimiter, requireStoreToken
       status: r.status,
       phoneMasked: maskPhone(r.phone),
       createdAt: r.createdAt,
+      serviceDate: r.serviceDate,
     })),
   })
 }))
@@ -783,11 +852,13 @@ app.post('/api/pos/queue/:id/call', posLimiter, posAuthLimiter, requireStoreToke
   return res.json({ ok: true, id: reservation.id, status: reservation.status, alreadyProcessed: !outcome.changed })
 }))
 
-// 해당 매장 + 오늘 serviceDate만 (계약 §3.15).
+// 해당 매장만 확인한다(계약 v3 §4.3) — day-scope(오늘 serviceDate만)는 일부러 제거했다. 밤새 맡긴
+// 차(어제 called 상태)를 다음날 POS에서 완료 처리할 수 있어야 하기 때문이다. 호출(call)은 여전히
+// 오늘 것만 허용하므로(아래 call 라우트), 여기서 day-scope를 빼도 "어제 waiting을 오늘 실수로 새로
+// 호출"하는 사고로는 이어지지 않는다.
 app.post('/api/pos/queue/:id/complete', posLimiter, posAuthLimiter, requireStoreToken, asyncHandler(async (req, res) => {
-  const serviceDate = kstDateString()
   const existing = await getReservation(req.params.id)
-  if (!existing || existing.storeId !== req.store.id || existing.serviceDate !== serviceDate) {
+  if (!existing || existing.storeId !== req.store.id) {
     return res.status(404).json({ ok: false, error: '예약을 찾을 수 없습니다.' })
   }
   const reservation = await markReservationCompleted(req.params.id)
@@ -800,12 +871,11 @@ app.post('/api/pos/queue/:id/complete', posLimiter, posAuthLimiter, requireStore
   return res.json({ ok: true, id: reservation.id, status: reservation.status })
 }))
 
-// 노쇼 손님을 대기열에서 빼는 용도 (계약 §3.16 신규). 형제 라우트(call/complete)와 동일하게
-// 해당 매장 + 오늘 serviceDate로 범위를 제한한다.
+// 노쇼 손님을 대기열에서 빼는 용도 (계약 §3.16 신규). complete와 동일하게(계약 v3 §4.3) 해당
+// 매장만 확인하고 day-scope는 두지 않는다 — 이월(called/notify_failed) 건도 취소할 수 있어야 한다.
 app.post('/api/pos/queue/:id/cancel', posLimiter, posAuthLimiter, requireStoreToken, asyncHandler(async (req, res) => {
-  const serviceDate = kstDateString()
   const existing = await getReservation(req.params.id)
-  if (!existing || existing.storeId !== req.store.id || existing.serviceDate !== serviceDate) {
+  if (!existing || existing.storeId !== req.store.id) {
     return res.status(404).json({ ok: false, error: '예약을 찾을 수 없습니다.' })
   }
   if (existing.status === 'cancelled') {
@@ -905,10 +975,11 @@ app.get('/api/payments', adminCors, requireAuth, asyncHandler(async (req, res) =
   const storeId = resolveScopedStoreId(req)
   const date = parseKstDate(req.query.date)
   const statuses = parseStatusFilter(req.query.status, PAYMENT_STATUSES)
+  const q = req.query.q
   const limit = parseLimit(req.query.limit)
   const offset = parseOffset(req.query.offset)
   const range = date ? kstDateRangeUtc(date) : null
-  const { total, items } = await listPaymentsPage({ storeId, dateStart: range?.start, dateEnd: range?.end, statuses, limit, offset })
+  const { total, items } = await listPaymentsPage({ storeId, dateStart: range?.start, dateEnd: range?.end, statuses, q, limit, offset })
   return res.json({ ok: true, count: items.length, total, hasMore: offset + items.length < total, payments: items })
 }))
 

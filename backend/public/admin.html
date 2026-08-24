@@ -171,7 +171,7 @@
     font-size: 13px;
   }
   .filterbar .filter-label { display: flex; align-items: center; gap: 6px; color: var(--muted); font-weight: 600; font-size: 12px; }
-  .filterbar input[type="date"], .filterbar select {
+  .filterbar input[type="date"], .filterbar select, .filterbar input[type="search"] {
     padding: 8px 10px;
     font-size: 13px;
     border: 1.5px solid var(--border);
@@ -181,9 +181,26 @@
     outline: none;
     font-family: inherit;
   }
+  .filterbar input[type="search"] { width: 160px; }
+  .filterbar input[type="date"]:focus, .filterbar select:focus, .filterbar input[type="search"]:focus { border-color: var(--blue); background: #fff; }
   .filterbar button.ghost { padding: 8px 12px; font-size: 12px; width: auto; }
   .filterbar button#failed-toggle-btn.active { background: var(--error); color: #fff; border-color: var(--error); }
   .filterbar .filter-note { color: var(--muted); font-size: 12px; margin-left: auto; }
+  /* 배지 옆에 붙는 접수알림실패 보조 표식 — 상태 배지는 status 기준이라 intakeNotifyStatus는 따로 표기한다. */
+  .intake-fail-mark { display: inline-block; margin-left: 6px; font-size: 11px; font-weight: 700; color: var(--error); }
+  .summary-card {
+    display: flex;
+    gap: 20px;
+    flex-wrap: wrap;
+    background: #fff;
+    border-radius: 12px;
+    padding: 14px 18px;
+    margin-bottom: 12px;
+    font-size: 13px;
+  }
+  .summary-card .summary-item { display: flex; align-items: baseline; gap: 4px; }
+  .summary-card .summary-sub { color: var(--muted); font-size: 12px; }
+  .summary-card .summary-alert { color: var(--error); font-weight: 700; }
   .pos-token-value {
     font-family: "Consolas", monospace;
     font-size: 12px;
@@ -310,6 +327,8 @@
     <div class="testform-msg" id="test-msg"></div>
   </details>
 
+  <div class="summary-card" id="summary-card"></div>
+
   <div class="tabs">
     <div class="tab active" data-tab="reservations">예약 (<span id="count-res">0</span>)</div>
     <div class="tab" data-tab="payments">결제 (<span id="count-pay">0</span>)</div>
@@ -320,6 +339,9 @@
     <button class="ghost" id="date-all-btn" type="button">전체기간</button>
     <select id="status-filter"></select>
     <button class="ghost" id="failed-toggle-btn" type="button">발송실패만 보기</button>
+    <input type="search" id="search-input" placeholder="전화번호/차량번호 검색" />
+    <button class="ghost" id="search-btn" type="button">검색</button>
+    <button class="ghost" id="search-clear-btn" type="button">지우기</button>
     <span class="filter-note" id="filter-note"></span>
   </div>
 
@@ -371,6 +393,7 @@ let resStatusFilter = ''
 let payStatusFilter = ''
 let resViewMode = 'normal' // 'normal' | 'failed' (발송실패 화면 — GET /api/reservations/failed)
 let payViewMode = 'normal' // 'normal' | 'failed' (GET /api/payments/failed)
+let currentSearchQuery = '' // 손님 검색어(전화번호/차량번호 부분일치). 예약/결제 탭 공통 — 탭별로 따로 두지 않는다.
 let reservationsList = []
 let paymentsList = []
 let reservationsTotal = 0
@@ -418,6 +441,10 @@ const statusFilterSelect = document.getElementById('status-filter')
 const failedToggleBtn = document.getElementById('failed-toggle-btn')
 const filterNote = document.getElementById('filter-note')
 const posTokenBody = document.getElementById('pos-token-body')
+const searchInput = document.getElementById('search-input')
+const searchBtn = document.getElementById('search-btn')
+const searchClearBtn = document.getElementById('search-clear-btn')
+const summaryCard = document.getElementById('summary-card')
 
 dateFilterInput.value = currentDateFilter
 
@@ -525,8 +552,28 @@ function updateFilterNote() {
   const vm = currentTab === 'reservations' ? resViewMode : payViewMode
   if (vm === 'failed') parts.push(currentTab === 'reservations' ? '알림실패만' : '영수증실패만')
   else if (sf) parts.push(`상태: ${STATUS_LABEL[sf] || sf}`)
+  if (currentSearchQuery) parts.push(`검색: ${currentSearchQuery}`)
   filterNote.textContent = parts.join(' · ')
 }
+
+// 검색어는 예약/결제 탭에 공통 적용되고, offset 0부터 다시 불러온다(loadAll reset).
+function runSearch() {
+  currentSearchQuery = searchInput.value.trim()
+  loadAll({ mode: 'reset' })
+}
+
+searchBtn.addEventListener('click', runSearch)
+searchInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    e.preventDefault()
+    runSearch()
+  }
+})
+searchClearBtn.addEventListener('click', () => {
+  currentSearchQuery = ''
+  searchInput.value = ''
+  loadAll({ mode: 'reset' })
+})
 
 dateFilterInput.addEventListener('change', () => {
   currentDateFilter = dateFilterInput.value || ''
@@ -942,6 +989,31 @@ document.getElementById('reservations-view').addEventListener('click', async (e)
     return
   }
 
+  if (btn.classList.contains('retry-intake')) {
+    btn.disabled = true
+    btn.textContent = '재발송중...'
+    try {
+      const { ok, body } = await apiPost(`/api/reservations/${id}/retry-intake`)
+      if (!ok) {
+        alert(body.error || '재발송 요청에 실패했습니다.')
+      } else if (body.sent === false) {
+        // retry-notify와 동일한 패턴 — HTTP 200 + sent:false는 재발송을 시도했지만 다시 실패했다는 뜻.
+        alert('접수 알림톡을 재발송했지만 다시 실패했습니다. 잠시 후 다시 시도해주세요.')
+      } else {
+        alert('접수 알림톡이 재발송되었습니다.')
+      }
+    } catch (err) {
+      if (err.message === 'UNAUTHORIZED') {
+        clearSession()
+        showLogin('세션이 만료되었습니다. 다시 로그인해주세요.')
+        return
+      }
+      alert('재발송 중 오류가 발생했습니다.')
+    }
+    await loadAll({ mode: 'refresh' })
+    return
+  }
+
   if (btn.classList.contains('del')) {
     if (!confirm('이 예약을 삭제할까요?')) return
     btn.disabled = true
@@ -1001,20 +1073,25 @@ function renderReservations(list, total, hasMore) {
     return
   }
   const rows = list.map((r) => {
-    const canRetry = r.status === 'notify_failed'
+    // 재발송 버튼은 실패 종류별로 다른 엔드포인트를 친다 — 순서호출 실패(notify_failed)는 기존 retry-notify,
+    // 그 외 접수 알림톡만 실패한 건(intakeNotifyStatus==='failed')은 신규 retry-intake. 완료/취소 건은 재발송 대상이 아니다.
+    const canRetryNotify = r.status === 'notify_failed'
+    const canRetryIntake = !canRetryNotify && r.intakeNotifyStatus === 'failed' && r.status !== 'completed' && r.status !== 'cancelled'
     const canCancel = r.status === 'waiting' || r.status === 'called' || r.status === 'notify_failed'
+    const intakeFailMark = r.intakeNotifyStatus === 'failed' ? '<span class="intake-fail-mark">접수알림실패</span>' : ''
     return `
     <tr>
       <td>#${r.queueNumber}</td>
       <td>${escapeHtml(r.carNumber)}</td>
       <td>${escapeHtml(r.serviceType || '-')}</td>
       <td>${escapeHtml(r.phone)}</td>
-      <td><span class="badge ${escapeHtml(r.status)}">${escapeHtml(STATUS_LABEL[r.status] || r.status)}</span></td>
+      <td><span class="badge ${escapeHtml(r.status)}">${escapeHtml(STATUS_LABEL[r.status] || r.status)}</span>${intakeFailMark}</td>
       <td>${fmtDate(r.createdAt)}</td>
       <td class="row-actions">
         <button class="row-btn call" data-id="${r.id}" ${r.status !== 'waiting' ? 'disabled' : ''}>호출</button>
         <button class="row-btn complete" data-id="${r.id}" ${r.status !== 'called' && r.status !== 'notify_failed' ? 'disabled' : ''}>완료</button>
-        ${canRetry ? `<button class="row-btn retry" data-id="${r.id}">재발송</button>` : ''}
+        ${canRetryNotify ? `<button class="row-btn retry" data-id="${r.id}">재발송</button>` : ''}
+        ${canRetryIntake ? `<button class="row-btn retry-intake" data-id="${r.id}">접수 재발송</button>` : ''}
         <button class="row-btn cancel" data-id="${r.id}" ${canCancel ? '' : 'disabled'}>취소</button>
         <button class="row-btn del" data-id="${r.id}">삭제</button>
       </td>
@@ -1064,6 +1141,7 @@ function buildListParams(kind, offset, limit) {
   if (!failed) {
     const sf = kind === 'reservations' ? resStatusFilter : payStatusFilter
     if (sf) params.set('status', sf)
+    if (currentSearchQuery) params.set('q', currentSearchQuery)
   }
   params.set('limit', String(limit))
   params.set('offset', String(offset))
@@ -1095,6 +1173,30 @@ async function loadKind(kind, offset, limit, append) {
   }
 }
 
+// 탭 위 요약 카드 — 선택된 날짜/매장 기준(§5.1과 동일한 쿼리 파라미터)으로 접수/결제/발송실패 건수를 보여준다.
+// date를 비우면(전체기간 필터) 서버가 오늘 날짜로 기본 처리하므로, 실제로 집계된 날짜는 응답의 date로 표시한다.
+async function loadSummary() {
+  const params = new URLSearchParams()
+  if (currentDateFilter) params.set('date', currentDateFilter)
+  if (currentStoreId) params.set('storeId', currentStoreId)
+  const data = await api(`/api/admin/summary?${params.toString()}`)
+  renderSummary(data)
+}
+
+function renderSummary(data) {
+  const r = data.reservations || {}
+  const p = data.payments || {}
+  const failedTotal = (r.notify_failed || 0) + (data.intakeFailed || 0)
+  summaryCard.innerHTML = `
+    <div class="summary-item"><b>${escapeHtml(data.date || '')}</b> 요약</div>
+    <div class="summary-item">접수 ${r.total || 0}건
+      <span class="summary-sub">(대기 ${r.waiting || 0}·호출 ${r.called || 0}·완료 ${r.completed || 0}·취소 ${r.cancelled || 0})</span>
+    </div>
+    <div class="summary-item">결제 ${p.total || 0}건 · 합계 ${fmtAmount(p.amountSum || 0)}</div>
+    <div class="summary-item${failedTotal > 0 ? ' summary-alert' : ''}">발송실패 ${failedTotal}건</div>
+  `
+}
+
 // mode: 'reset' — 필터/매장/탭이 바뀌어 처음부터 다시 불러온다.
 // mode: 'refresh' — 폴링/액션 이후 갱신. 지금까지 로드된 페이지 크기(= "더 보기"로 불러온 만큼)는
 //   유지한 채 offset 0부터 그만큼만 다시 받아 화면을 최신 상태로 맞춘다.
@@ -1106,6 +1208,7 @@ async function loadAll({ mode = 'reset' } = {}) {
       await Promise.all([
         loadKind('reservations', 0, PAGE_LIMIT, false),
         loadKind('payments', 0, PAGE_LIMIT, false),
+        loadSummary(),
       ])
     } else {
       const resLimit = Math.min(Math.max(reservationsList.length, PAGE_LIMIT), 500)
@@ -1113,6 +1216,7 @@ async function loadAll({ mode = 'reset' } = {}) {
       await Promise.all([
         loadKind('reservations', 0, resLimit, false),
         loadKind('payments', 0, payLimit, false),
+        loadSummary(),
       ])
     }
     connStatus.textContent = ''

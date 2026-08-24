@@ -22,6 +22,8 @@
     --green-soft: #e8f8f1;
     --red: #f04452;
     --red-soft: #fff0f1;
+    --amber: #b56a00;
+    --amber-soft: #fff2df;
     --shadow: 0 2px 8px rgba(25, 31, 40, 0.04);
   }
 
@@ -308,6 +310,11 @@
   .badge.waiting { background: var(--blue-soft); color: var(--blue-strong); }
   .badge.called { background: var(--green-soft); color: #008b5a; }
   .badge.notify_failed { background: var(--red-soft); color: var(--red); }
+
+  /* '이월' 배지: 어제(혹은 그 이전) 접수해 밤새 차를 맡겨두고 아직 진행 중인 손님임을 알리는
+     표식이다. 상태 배지(대기/호출완료/알림실패)와 나란히 붙어도 헷갈리지 않도록, 상태 배지들이
+     쓰는 파랑/초록/빨강과 겹치지 않는 차분한 주황 톤을 쓴다. */
+  .badge.carried-over { background: var(--amber-soft); color: var(--amber); }
 
   .actions {
     display: flex;

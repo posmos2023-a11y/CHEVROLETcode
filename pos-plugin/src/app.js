@@ -179,6 +179,11 @@ async function runAction(id, action) {
 }
 
 let lastReservations = []
+// GET /api/pos/queue 응답 최상단의 serviceDate(오늘, KST). 각 이월 건의 serviceDate와 비교해
+// '이월' 배지를 붙일지 판단하는 기준값이라 render() 밖에서 계속 들고 있어야 한다 — 두 번째 탭
+// 확정을 기다리는 3초 타임아웃(handleActionClick)에서도 새 응답 없이 render(lastReservations)만
+// 다시 부르므로, 그 재렌더 시점에도 마지막으로 받은 오늘 날짜를 그대로 써야 배지가 깜빡이지 않는다.
+let todayServiceDate = null
 
 function render(reservations) {
   lastReservations = reservations
@@ -212,12 +217,22 @@ function render(reservations) {
       const canCancel = r.status === 'waiting' || r.status === 'called' || r.status === 'notify_failed'
       const statusClass = ['waiting', 'called', 'notify_failed'].includes(r.status) ? r.status : 'waiting'
       const statusLabel = STATUS_LABEL[r.status] || r.status
+      // '이월' 배지: 대기열 조회는 오늘 접수분뿐 아니라, 어제(혹은 그 이전) 접수해 밤새 차를 맡겨두고
+      // 아직 호출/알림실패 상태로 남아있는 손님도 함께 내려준다(차를 못 찾아가고 하루를 넘긴 경우).
+      // 이 손님을 오늘 새로 들어온 손님과 똑같이 그리면, 정비사가 "오늘 접수 순서"로 착각해 대기
+      // 순번을 헷갈리거나 이미 호출된 손님을 다시 호출하려 할 수 있다. serviceDate가 오늘(응답
+      // 최상단 serviceDate)과 다른 행에만 조용히 배지를 붙여 "이건 어제 넘어온 건"임을 알려준다.
+      const isCarriedOver = Boolean(r.serviceDate) && Boolean(todayServiceDate) && r.serviceDate !== todayServiceDate
+      const carriedOverBadge = isCarriedOver
+        ? `<span class="badge carried-over" title="${escapeHtml(r.serviceDate)} 접수 · 오늘로 이월됨">이월</span>`
+        : ''
       return `
         <article class="queue-item status-${statusClass}">
           <div class="queue-number">#${r.queueNumber}</div>
           <div class="queue-main">
             <div class="queue-top">
               <strong class="car-number">${escapeHtml(r.carNumber)}</strong>
+              ${carriedOverBadge}
               <span class="badge ${statusClass}">${escapeHtml(statusLabel)}</span>
             </div>
             <div class="service">${escapeHtml(r.serviceType || '-')}</div>
@@ -270,10 +285,14 @@ listEl.addEventListener('click', (e) => {
   handleActionClick(btn.dataset.id, btn.dataset.action)
 })
 
-// GET /api/pos/queue 응답은 오늘(KST) 대기열 + storeName을 함께 내려준다. storeName은 헤더에
-// 표시 중인 이름(최초 로드 전 getMerchant()가 채운 임시값)을 실제 매장 이름으로 덮어쓴다.
+// GET /api/pos/queue 응답은 오늘(KST) 대기열 + storeName + 최상단 serviceDate(오늘 날짜)를 함께
+// 내려준다. storeName은 헤더에 표시 중인 이름(최초 로드 전 getMerchant()가 채운 임시값)을 실제
+// 매장 이름으로 덮어쓴다. 최상단 serviceDate는 화면에 직접 표시하진 않고, 각 항목의 serviceDate와
+// 비교해 '이월' 배지를 붙일지 판단하는 기준으로만 쓴다(render 참고). 서버로 다시 돌려보내지 않는,
+// 순수 표시용 값이다.
 function applyQueueResponse(body) {
   if (body.storeName) storeNameEl.textContent = body.storeName
+  todayServiceDate = body.serviceDate || todayServiceDate
   render(body.reservations || [])
 }
 

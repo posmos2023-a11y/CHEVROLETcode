@@ -173,6 +173,19 @@ API Gateway 등 공유 계층을 검토한다.
 
 참고: [Cloud Scheduler는 최소 한 번 전달 방식](https://docs.cloud.google.com/scheduler/docs/overview)
 
+> **2026-08-24 갱신 — 위 결정은 이미 구현 완료됨, 남은 건 실제 등록.** 세 옵션 중
+> "Cloud Scheduler → 인증된 HTTP 작업 endpoint" 방식으로 확정되어 구현이 끝났다. `backend/server.js`에는
+> 이제 `node-cron`이 전혀 없고, `POST /internal/jobs/send-promotions`(매일 10:00 KST 권장)와
+> `POST /internal/jobs/purge-expired`(매일 04:00 KST 권장, 이번 라운드에 추가된 개인정보 파기 작업)가
+> 각각 `X-Promotion-Job-Token` 헤더로 인증하는 순수 HTTP endpoint로만 존재한다. **이 endpoint들은
+> Cloud Scheduler가 실제로 호출하도록 등록해두지 않으면 영원히 자동 실행되지 않는다** — 서버 자신은
+> 언제 호출해야 하는지 전혀 모른다. gcloud 등록 명령과 재시도 안전성(claim + `promoSent`, `anonymizedAt`
+> 기준 중복 방지)은 [`README.md`의 "Cloud Scheduler 잡 등록 절차"](../README.md#cloud-scheduler-잡-등록-절차)
+> 참고. `send-promotions`는 아래 2026-08-05 실행 기록에 남은 `chevrolet-promotion-daily` 잡으로 이미 한 번
+> 등록됐을 수 있으나, 그 이후 `PROMOTION_JOB_TOKEN`이 교체된 적이 있어 헤더 값이 최신인지 재확인이
+> 필요하다. `purge-expired`는 그 실행 기록 시점 이후에 추가된 기능이라 Cloud Scheduler 잡 자체가 아직
+> 없을 가능성이 높다 — 둘 다 사장님이 gcloud/콘솔로 직접 등록·확인해야 하는 사람 작업이다.
+
 ### 5단계: API 주소와 ACL 전환
 
 현재 Front/POS 소스에는 Render 주소가 운영 API로 들어가 있다.

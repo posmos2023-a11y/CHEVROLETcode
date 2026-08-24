@@ -328,13 +328,32 @@ function listReservations(storeId) {
   })
 }
 
+// 손님 검색(계약 v3 §3.1) OR절 공통 빌더. qRaw가 빈 문자열이면 필터를 아예 적용하지 않도록
+// 호출부(listReservationsPage/listPaymentsPage)가 undefined를 받아 where에서 생략한다.
+// ⚠️ contains는 앞뒤 와일드카드(부분일치)라 btree 인덱스를 타지 못한다 — 예: "%1234%" 검색은
+// 인덱스 스캔이 아니라 시퀀셜 스캔이 된다. 매장당 데이터량이 크지 않고(단일 매장 관리자가 가끔
+// 쓰는 조회) 빈도도 낮아 여기서는 허용하지만, 데이터가 크게 늘면 pg_trgm GIN 인덱스 등을
+// 고려해야 한다.
+function buildSearchOr(q) {
+  const qRaw = String(q ?? '').trim()
+  if (!qRaw) return null
+  const qDigits = qRaw.replace(/\D/g, '')
+  return {
+    OR: [
+      { carNumber: { contains: qRaw } },
+      ...(qDigits ? [{ phone: { contains: qDigits } }] : []),
+    ],
+  }
+}
+
 // 예약 목록(관리자 화면) 페이지네이션 + 필터. count/필터/정렬을 전부 DB(Prisma)에 위임해서
 // 매장이 많아지거나 기간이 길어져도 매 요청마다 전체 로우를 애플리케이션 메모리로 끌어오지 않는다.
-async function listReservationsPage({ storeId, date, statuses, limit, offset }) {
+async function listReservationsPage({ storeId, date, statuses, q, limit, offset }) {
   const where = {
     ...(storeId ? { storeId } : {}),
     ...(date ? { serviceDate: date } : {}),
     ...(statuses && statuses.length ? { status: { in: statuses } } : {}),
+    ...(buildSearchOr(q) || {}),
   }
   const [total, items] = await Promise.all([
     prisma.reservation.count({ where }),
@@ -345,11 +364,12 @@ async function listReservationsPage({ storeId, date, statuses, limit, offset }) 
 
 // 결제 목록(관리자 화면) 페이지네이션 + 필터. Payment는 serviceDate가 없어서 date 필터는
 // createdAt을 KST 하루 범위(dateStart~dateEnd, kstDateRangeUtc)로 변환해 넘겨받는다.
-async function listPaymentsPage({ storeId, dateStart, dateEnd, statuses, limit, offset }) {
+async function listPaymentsPage({ storeId, dateStart, dateEnd, statuses, q, limit, offset }) {
   const where = {
     ...(storeId ? { storeId } : {}),
     ...(dateStart && dateEnd ? { createdAt: { gte: dateStart, lt: dateEnd } } : {}),
     ...(statuses && statuses.length ? { status: { in: statuses } } : {}),
+    ...(buildSearchOr(q) || {}),
   }
   const [total, items] = await Promise.all([
     prisma.payment.count({ where }),
@@ -358,13 +378,23 @@ async function listPaymentsPage({ storeId, dateStart, dateEnd, statuses, limit, 
   return { total, items }
 }
 
-// POS 탭앱 대기열 조회 전용(§3.13). 오늘(KST) serviceDate + 아직 끝나지 않은(완료/취소 제외) 예약만,
-// queueNumber 오름차순으로 돌려준다. 어제 마감된 대기열이 오늘 POS 화면에 남아있으면 안 되므로
-// 반드시 day-scope를 서버가 강제한다(POS 탭앱이 보내는 값을 신뢰하지 않는다).
+// POS 탭앱 대기열 조회 전용(계약 v3 §4.1). 오늘(KST) serviceDate 접수분 전부 + 날짜와 무관하게
+// 아직 끝나지 않은(called/notify_failed) 이월 건을 함께 돌려준다. 대기열을 "오늘 것만"으로
+// 완전히 막으면 밤새 맡긴 차(어제 called 상태)를 다음날 POS에서 완료 처리할 수 없어지므로,
+// 이미 호출까지 끝난(더 이상 "새로 호출"할 대상이 아닌) 이월 건만 예외로 섞는다 — 어제 waiting
+// (노쇼로 추정되는 건)은 여전히 여기 뜨지 않는다. serviceDate 오름차순을 앞세워 이월 건이
+// 위쪽에 보이게 하고, 그 안에서는 queueNumber 오름차순을 유지한다.
 function listActiveQueueForStore(storeId, serviceDate) {
   return prisma.reservation.findMany({
-    where: { storeId, serviceDate, status: { notIn: CLOSED_RESERVATION_STATUSES } },
-    orderBy: { queueNumber: 'asc' },
+    where: {
+      storeId,
+      status: { notIn: CLOSED_RESERVATION_STATUSES },
+      OR: [
+        { serviceDate },
+        { status: { in: ['called', 'notify_failed'] } },
+      ],
+    },
+    orderBy: [{ serviceDate: 'asc' }, { queueNumber: 'asc' }],
   })
 }
 
@@ -447,6 +477,60 @@ async function markReservationNotifyFailed(id) {
   } catch {
     return null
   }
+}
+
+// 접수(대기번호) 알림톡 발송 실패 기록(계약 v3 §2.2). status는 건드리지 않는다 — 손님은 여전히
+// waiting 상태로 정상 대기 중이고, 이건 "안내 문자가 못 나갔다"만 별도로 추적하는 값이다.
+// updateMany라 대상이 이미 지워졌거나 없어도 조용히 넘어간다(발송 실패 처리 중 또 에러를
+// 던지면 안 되므로 실패해도 삼킨다).
+async function markReservationIntakeFailed(id) {
+  try {
+    await prisma.reservation.updateMany({ where: { id }, data: { intakeNotifyStatus: 'failed' } })
+  } catch {
+    // 기록 실패는 삼킨다 — 접수 자체는 이미 끝난 뒤라 손님에게 영향이 없어야 한다.
+  }
+}
+
+// 접수 알림 재발송(retry-intake) 성공 시 'failed' 표식을 지운다.
+async function clearReservationIntakeStatus(id) {
+  try {
+    await prisma.reservation.updateMany({ where: { id }, data: { intakeNotifyStatus: null } })
+  } catch {
+    // 표식 해제 실패는 삼킨다 — 재발송 자체(sent:true)는 이미 성공했으므로 응답에 영향을 주지 않는다.
+  }
+}
+
+// 재발송 메시지의 "앞으로 N명"을 최신값으로 다시 계산한다. createReservation의 peopleAhead와
+// 동일 규칙(오늘 접수분 중 완료/취소가 아닌 예약 수, beforeCreatedAt 이전 접수분만) — 접수 시점과
+// 재발송 시점 사이에 다른 손님이 왔다 갔다 했을 수 있어 그 시점 값을 그대로 재사용하면 안 된다.
+function countPeopleAhead(storeId, serviceDate, beforeCreatedAt) {
+  return prisma.reservation.count({
+    where: {
+      storeId,
+      serviceDate,
+      status: { notIn: CLOSED_RESERVATION_STATUSES },
+      createdAt: { lt: beforeCreatedAt },
+    },
+  })
+}
+
+// 발송실패 목록(계약 v3 §2.4): 순서 호출 실패(status='notify_failed')와 접수 알림 실패
+// (intakeNotifyStatus='failed', 아직 completed/cancelled로 끝나지 않은 건)를 함께 반환한다.
+// 한 건이 두 조건을 동시에 만족해도(예: 접수는 실패했는데 그 뒤 호출까지 실패) OR라 중복 없이 한 번만 잡힌다.
+async function listFailedReservations({ storeId, date, limit, offset }) {
+  const where = {
+    ...(storeId ? { storeId } : {}),
+    ...(date ? { serviceDate: date } : {}),
+    OR: [
+      { status: 'notify_failed' },
+      { intakeNotifyStatus: 'failed', status: { notIn: CLOSED_RESERVATION_STATUSES } },
+    ],
+  }
+  const [total, items] = await Promise.all([
+    prisma.reservation.count({ where }),
+    prisma.reservation.findMany({ where, orderBy: { createdAt: 'desc' }, take: limit, skip: offset }),
+  ])
+  return { total, items }
 }
 
 // 손님 취소/노쇼 처리(§3.9, §3.16 공용). waiting|called|notify_failed 상태에서만 cancelled로
@@ -683,6 +767,62 @@ async function purgeExpiredPersonalData(retentionDays) {
   return { reservations, payments }
 }
 
+// 일별 요약(계약 v3 §5.1). 예약은 serviceDate 기준(접수일), 결제는 createdAt의 KST 하루 범위
+// (dateStart~dateEnd, 호출부가 kstDateRangeUtc로 변환해 넘김) 기준이다 — 두 모델의 "그 날" 기준이
+// 서로 다르기 때문에 인자를 분리해서 받는다. groupBy 대신 상태별 개별 count를 쓴 이유: 상태
+// 목록이 고정된 5/4가지뿐이라 groupBy 결과를 다시 매핑하는 것보다 Promise.all로 병렬 count하는
+// 쪽이 더 읽기 쉽고, 존재하지 않는 상태(count 0)도 굳이 채워 넣을 필요가 없다.
+async function getDailySummary({ storeId, date, dateStart, dateEnd }) {
+  const reservationWhere = { ...(storeId ? { storeId } : {}), serviceDate: date }
+  const paymentWhere = {
+    ...(storeId ? { storeId } : {}),
+    ...(dateStart && dateEnd ? { createdAt: { gte: dateStart, lt: dateEnd } } : {}),
+  }
+
+  const [
+    reservationTotal,
+    waiting,
+    called,
+    notifyFailed,
+    completed,
+    cancelled,
+    paymentTotal,
+    amountAgg,
+    receiptFailed,
+    intakeFailed,
+  ] = await Promise.all([
+    prisma.reservation.count({ where: reservationWhere }),
+    prisma.reservation.count({ where: { ...reservationWhere, status: 'waiting' } }),
+    prisma.reservation.count({ where: { ...reservationWhere, status: 'called' } }),
+    prisma.reservation.count({ where: { ...reservationWhere, status: 'notify_failed' } }),
+    prisma.reservation.count({ where: { ...reservationWhere, status: 'completed' } }),
+    prisma.reservation.count({ where: { ...reservationWhere, status: 'cancelled' } }),
+    prisma.payment.count({ where: paymentWhere }),
+    prisma.payment.aggregate({ where: paymentWhere, _sum: { amount: true } }),
+    prisma.payment.count({ where: { ...paymentWhere, status: 'receipt_failed' } }),
+    prisma.reservation.count({
+      where: { ...reservationWhere, intakeNotifyStatus: 'failed', status: { notIn: CLOSED_RESERVATION_STATUSES } },
+    }),
+  ])
+
+  return {
+    reservations: {
+      total: reservationTotal,
+      waiting,
+      called,
+      notify_failed: notifyFailed,
+      completed,
+      cancelled,
+    },
+    payments: {
+      total: paymentTotal,
+      amountSum: amountAgg._sum.amount || 0,
+      receiptFailed,
+    },
+    intakeFailed,
+  }
+}
+
 module.exports = {
   prisma,
   kstDateString,
@@ -715,6 +855,10 @@ module.exports = {
   markReservationCompleted,
   markReservationNotifyFailed,
   markReservationCancelled,
+  markReservationIntakeFailed,
+  clearReservationIntakeStatus,
+  countPeopleAhead,
+  listFailedReservations,
   findLatestReservationByPhone,
   createPayment,
   findPaymentByKey,
@@ -727,4 +871,5 @@ module.exports = {
   markPromoSent,
   releasePromoClaim,
   purgeExpiredPersonalData,
+  getDailySummary,
 }

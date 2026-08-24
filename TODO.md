@@ -25,6 +25,15 @@
       "개인정보·광고성 정보 처리" 섹션에 명시된 미검토 상태 해소
 - [ ] Cloud Run 배포에서 `RUN_MIGRATIONS_ON_BOOT=false`로 전환하고 `prisma migrate deploy`를
       별도 사전 단계(Cloud Run Job 등)로 분리 — 동시 콜드스타트 시 advisory lock 경합/크래시 루프 방지
+- [ ] Cloud Scheduler 잡 2개(`send-promotions`, `purge-expired`) 실제 gcloud/콘솔 등록 — `README.md`의
+      "Cloud Scheduler 잡 등록 절차" 참고. `send-promotions`는 2026-08-05 GCP 초기 구성 때
+      `chevrolet-promotion-daily`로 이미 등록됐을 수 있으나 이후 `PROMOTION_JOB_TOKEN`이 교체되어 헤더
+      값 재확인이 필요하고, `purge-expired`는 등록 여부 자체가 아직 미확인
+- [ ] 실결제 1건에 대해 토스 웹훅 payload의 `paymentKey`↔`orderId` 대응 관계 실제 확인
+      (`developer-support@tossplace.com` 문의 필요) — `README.md` "토스 SDK 공식 문서 대조 재검토" 항목의
+      미해결 사항 참고. 확정 전까지는 웹훅 수신 시 로그만 남기고 자동으로 결제 레코드를 만들지 않음
+- [ ] 매장별 POS 토큰 실제 전달(발급된 64자리 토큰을 각 매장 직원에게 안내) — `README.md`
+      "POS 토큰 발급·재발급 운영 절차" 참고
 
 ## P1 — GCP 이전 준비
 
@@ -58,6 +67,9 @@
 - [x] 알림톡 발송 지연·실패 시 재처리 정책 확정 — 관리자가 수동으로 재시도하는
       `POST /api/reservations/:id/retry-notify`/`POST /api/payments/:id/retry-receipt` API 추가(자동
       재처리는 아님, 사람이 실패 목록을 보고 눌러야 함 — 자동 재시도가 필요하면 추가 설계 필요)
+- [x] 접수(대기번호 안내) 알림톡 실패도 순서 호출 실패와 같은 방식으로 추적 — `intakeNotifyStatus`
+      컬럼 추가, `POST /api/reservations/:id/retry-intake`로 별도 재발송, `GET /api/reservations/failed`가
+      두 실패 종류를 함께(union) 반환
 - [ ] Cloud Run 동시성·최대 인스턴스·DB 커넥션 풀 결정 — `DATABASE_URL`에 `?connection_limit=` 지정
       가이드는 `backend/.env.example`에 추가했지만, 실제 인스턴스 수/풀 크기 숫자는 아직 미정
 

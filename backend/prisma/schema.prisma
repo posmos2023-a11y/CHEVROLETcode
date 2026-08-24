@@ -57,10 +57,14 @@ model Reservation {
   marketingConsentAt DateTime? // 광고성 정보 수신 동의 시각(선택) — null이면 프로모션 발송 대상에서 제외
   anonymizedAt       DateTime? // 보관기간(DATA_RETENTION_DAYS) 경과 후 파기(익명화) 시각
 
+  intakeNotifyStatus String? // null = 정상/미시도, 'failed' = 접수(대기번호) 알림톡 발송 실패. 성공 시엔
+  // 아무것도 쓰지 않는다(null 유지) — 해피패스에 DB 쓰기를 늘리지 않기 위함(계약 v3 §1).
+
   @@index([storeId])
   @@index([storeId, serviceDate, status])
   @@index([storeId, createdAt])
   @@index([storeId, phone])
+  @@index([storeId, intakeNotifyStatus])
 }
 
 model Payment {

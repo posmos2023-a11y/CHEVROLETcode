@@ -130,7 +130,7 @@ pos-plugin/                  # 토스 POS 탭앱 (독립 프로젝트 폴더, es
 
 ### 관리자 화면용 (JWT)
 
-목록 조회 3종(`GET /api/reservations`, `/api/reservations/failed`, `/api/payments`, `/api/payments/failed`)은
+목록 조회 4종(`GET /api/reservations`, `/api/reservations/failed`, `/api/payments`, `/api/payments/failed`)은
 공통으로 아래 쿼리 파라미터와 응답 형태를 씁니다.
 
 | 파라미터 | 기본값 | 설명 |
@@ -138,6 +138,7 @@ pos-plugin/                  # 토스 POS 탭앱 (독립 프로젝트 폴더, es
 | `storeId` | — | `hq_admin`만 유효(전체 매장 중 필터). `store_admin`이 보내면 무시하고 자기 매장으로 고정 |
 | `date` | 없음(전체 기간) | KST 날짜 `YYYY-MM-DD`. 예약은 `serviceDate`, 결제는 `createdAt`의 KST 날짜 기준 |
 | `status` | 없음 | 콤마로 구분한 상태값(예: `waiting,called`). `/failed` 계열은 이 값을 무시하고 각각 `notify_failed`/`receipt_failed`로 고정 |
+| `q` | 없음(필터 미적용) | **신규.** 전화번호 또는 차량번호 부분일치 검색어. `GET /api/reservations`와 `GET /api/payments`에만 적용되고(`/failed` 계열은 미적용), 전화번호는 숫자만 남겨서 비교하므로 하이픈 포함 검색어도 매칭됨. 선행 와일드카드(`contains`) 검색이라 인덱스를 타지 않지만, 매장 단위 관리자 조회라 빈도가 낮아 허용 |
 | `limit` | `100` | 1~500으로 클램프 |
 | `offset` | `0` | 0 이상 |
 
@@ -148,14 +149,16 @@ pos-plugin/                  # 토스 POS 탭앱 (독립 프로젝트 폴더, es
 | 메서드/경로 | 설명 | 인증 |
 | --- | --- | --- |
 | `GET /api/reservations` | 예약 목록 조회(위 공통 파라미터/응답) | JWT (Bearer) |
-| `GET /api/reservations/failed` | 순서/접수 알림톡 발송 실패 건(`notify_failed`) 조회 | JWT (Bearer) |
+| `GET /api/reservations/failed` | 순서 호출 실패(`status: 'notify_failed'`)와 접수(대기번호) 알림 실패(`intakeNotifyStatus: 'failed'`, 완료/취소 제외)를 **함께(union)** 조회. 응답 item에 `status`/`intakeNotifyStatus`가 모두 포함돼 있어 관리자 화면이 이 값으로 재발송 종류(`retry-notify`/`retry-intake`)를 구분함 | JWT (Bearer) |
 | `GET /api/payments` | 결제 목록 조회(위 공통 파라미터/응답) | JWT (Bearer) |
 | `GET /api/payments/failed` | 전자영수증 발송 실패 건(`receipt_failed`) 조회 | JWT (Bearer) |
+| `GET /api/admin/summary` | **신규.** 지정 날짜(`date`, KST `YYYY-MM-DD`, 기본 오늘)·매장(`storeId`, 의미는 위 공통 파라미터와 동일) 기준 일별 요약. 예약 상태별 건수, 결제 건수·합계금액, 접수 알림 실패 건수(`intakeFailed`)를 한 번에 반환해 대시보드 상단 요약 카드에 씀(응답 형태는 §세부 동작 참고) | JWT (Bearer) |
 | `POST /api/queue/call-next?storeId=` | 지정한 매장의 **오늘(KST) 서비스 날짜** `waiting` 중 대기번호가 가장 앞선 손님만 호출(어제 이월분은 호출 안 함), "순서입니다" 알림톡 발송 | JWT (Bearer) |
 | `POST /api/reservations/:id/call` | 특정 예약을 순서와 무관하게 즉시 호출 (`waiting` 상태만 가능) | JWT (Bearer) |
 | `POST /api/reservations/:id/complete` | 정비완료 처리. 이후 예약들의 "앞사람" 계산에서 빠짐 | JWT (Bearer) |
 | `POST /api/reservations/:id/cancel` | **신규.** `waiting`/`called`/`notify_failed` → `cancelled`. 이미 취소된 건이면 `alreadyCancelled: true`로 200 응답, 이미 완료된 건이면 409 | JWT (Bearer) |
 | `POST /api/reservations/:id/retry-notify` | **신규.** `notify_failed` 상태만 허용(아니면 409). 순서 안내 알림톡을 재발송하고 성공하면 `called`로, 실패해도 `notify_failed`를 유지한 채 200으로 응답(재시도 자체가 실패라는 신호는 응답의 `sent: false`로 전달) | JWT (Bearer) |
+| `POST /api/reservations/:id/retry-intake` | **신규.** 접수 시 대기번호 안내 알림톡이 실패한 건(`intakeNotifyStatus: 'failed'`) 전용 재발송 — `completed`/`cancelled`가 아니어야 하며, 아니면 409. 앞사람 수(`peopleAhead`)를 최신값으로 다시 계산해 재발송하고, 성공하면 `intakeNotifyStatus`를 지우고(`null`) `sent: true`, 실패해도 `'failed'`를 유지한 채 `sent: false`로 200 응답(`retry-notify`와 동일한 패턴) | JWT (Bearer) |
 | `DELETE /api/reservations/:id` | 예약 삭제 (테스트 데이터 정리) | JWT (Bearer) |
 | `POST /api/payments/:id/retry-receipt` | **신규.** `receipt_failed` 상태만 허용(아니면 409). 전자영수증 알림톡 재발송, 응답 형태는 `retry-notify`와 동일한 패턴(`sent` 플래그) | JWT (Bearer) |
 | `GET /api/admin/stores` | 등록된 가맹점(매장) 목록 조회. 각 매장 객체에 `posToken`(POS 탭앱 인증용) 포함 | JWT (Bearer), `hq_admin` 전용 |
@@ -175,10 +178,10 @@ pos-plugin/                  # 토스 POS 탭앱 (독립 프로젝트 폴더, es
 
 | 메서드/경로 | 설명 | 인증 |
 | --- | --- | --- |
-| `GET /api/pos/queue` | 오늘(KST) 서비스 날짜의 대기열(정비완료·취소 제외)을 대기번호순으로 조회. **전화번호는 마스킹**(`010-****-5678`)해서 내려줌(POS 화면에 원본이 필요 없음) | `X-Store-Token` |
-| `POST /api/pos/queue/:id/call` | 오늘 등록된 해당 매장 예약만 호출 가능(아니면 404) | `X-Store-Token` |
-| `POST /api/pos/queue/:id/complete` | 오늘 등록된 해당 매장 예약만 정비완료 처리 | `X-Store-Token` |
-| `POST /api/pos/queue/:id/cancel` | **신규.** 노쇼 등으로 대기열에서 제외. `waiting`/`called`/`notify_failed` → `cancelled` | `X-Store-Token` |
+| `GET /api/pos/queue` | 오늘(KST) 서비스 날짜 접수분 전체 + 아직 안 끝난(취소·완료 아님) **이월 건**(전날 이하 `called`/`notify_failed`, 어제 `waiting`은 노쇼로 보고 제외)을 서비스 날짜순·대기번호순으로 조회. 각 item에 `serviceDate`가 포함돼 응답 최상위 `serviceDate`(오늘 날짜)와 다르면 이월 건임을 화면에서 구분할 수 있음. **전화번호는 마스킹**(`010-****-5678`)해서 내려줌(POS 화면에 원본이 필요 없음) | `X-Store-Token` |
+| `POST /api/pos/queue/:id/call` | 오늘 등록된 해당 매장 예약만 호출 가능(아니면 404) — 이월 건은 이미 `called`라 어차피 호출 대상이 아니고, 어제 `waiting`을 오늘 실수로 새로 호출하는 사고를 막기 위해 **이 endpoint만 날짜 제한을 유지**함 | `X-Store-Token` |
+| `POST /api/pos/queue/:id/complete` | 오늘 등록분은 물론 **이월 건도** 정비완료 처리 가능(날짜 제한 없음). 해당 매장 예약이 아니면 404 | `X-Store-Token` |
+| `POST /api/pos/queue/:id/cancel` | **신규.** 노쇼 등으로 대기열에서 제외. 오늘 접수분·이월 건 모두 가능(날짜 제한 없음). `waiting`/`called`/`notify_failed` → `cancelled` | `X-Store-Token` |
 
 ### 내부 배치 작업용 (`X-Promotion-Job-Token`, Cloud Scheduler가 호출)
 
@@ -186,6 +189,65 @@ pos-plugin/                  # 토스 POS 탭앱 (독립 프로젝트 폴더, es
 | --- | --- | --- |
 | `POST /internal/jobs/send-promotions` | 결제 3개월 경과 + 광고성 정보 수신에 동의(`marketingConsentAt` not null)한 손님에게 프로모션 알림톡 발송. 100건씩 배치로 claim해 **1회 실행 최대 `PROMO_MAX_PER_RUN`건(기본 2000) 또는 50초 예산**까지 처리하고, 상한에 걸려 남은 대상이 있으면 `exhausted: true` | `X-Promotion-Job-Token` |
 | `POST /internal/jobs/purge-expired` | **신규.** `DATA_RETENTION_DAYS`(기본 1095일)보다 오래된 예약/결제 중 아직 파기 안 된 건의 전화번호·차량번호를 익명화(`anonymizedAt` 기록). 한 번에 최대 1000건씩 최대 10회 반복 | `X-Promotion-Job-Token` |
+
+### Cloud Scheduler 잡 등록 절차
+
+위 두 endpoint는 **코드가 이미 만들어져 있을 뿐**입니다 — 서버 안에는 더 이상 `node-cron` 같은 자체
+스케줄러가 없으므로, **Cloud Scheduler에 잡을 등록해두지 않으면 두 작업 모두 영원히 자동으로 실행되지
+않습니다**(수동으로 curl/Postman으로 호출하지 않는 한). 이 등록은 **사장님이 직접** gcloud CLI(또는 GCP
+콘솔의 Cloud Scheduler 화면)로 해야 하는 작업입니다 — 로컬에 `gcloud`가 없다면
+[Cloud Shell](https://console.cloud.google.com/cloudshell)에서 브라우저로 바로 실행할 수 있습니다.
+
+- **`send-promotions`** — 매일 10:00 KST (3개월 경과 프로모션 알림톡 발송)
+- **`purge-expired`** — 매일 04:00 KST (개인정보 보관기간 경과분 파기, 트래픽이 적은 새벽 시간대로 지정)
+- 대상 리전 `asia-northeast3`, 프로젝트 `tossplugincar-dev`(§GCP 이전 및 트래픽 확장의 2026-08-05 실행
+  기록과 동일한 운영 리소스)
+
+```bash
+gcloud scheduler jobs create http chevrolet-send-promotions \
+  --project=tossplugincar-dev \
+  --location=asia-northeast3 \
+  --schedule="0 10 * * *" \
+  --time-zone="Asia/Seoul" \
+  --uri="https://chevrolet-api-813801981857.asia-northeast3.run.app/internal/jobs/send-promotions" \
+  --http-method=POST \
+  --headers="X-Promotion-Job-Token=<PROMOTION_JOB_TOKEN 실제 값>"
+
+gcloud scheduler jobs create http chevrolet-purge-expired \
+  --project=tossplugincar-dev \
+  --location=asia-northeast3 \
+  --schedule="0 4 * * *" \
+  --time-zone="Asia/Seoul" \
+  --uri="https://chevrolet-api-813801981857.asia-northeast3.run.app/internal/jobs/purge-expired" \
+  --http-method=POST \
+  --headers="X-Promotion-Job-Token=<PROMOTION_JOB_TOKEN 실제 값>"
+```
+
+`<PROMOTION_JOB_TOKEN 실제 값>`은 Secret Manager/Cloud Run 서비스에 설정된 실제 토큰 문자열로 바꿔서
+실행하세요(이 문서나 커밋에 실제 토큰 값을 남기지 말 것). Cloud Run 서비스 자체는 공개 상태로 두고
+이 헤더 하나로만 인증하는 구조이므로(`backend/.env.example`의 `PROMOTION_JOB_TOKEN` 설명 참고),
+`--oidc-service-account-email` 같은 IAM 인증 플래그는 필요 없습니다.
+
+**재시도는 안전합니다.** Cloud Scheduler가 타임아웃/네트워크 문제로 같은 실행을 다시 호출해도,
+`send-promotions`는 대상을 먼저 claim한 뒤 `promoSent`로 표시하므로 이미 보낸 대상을 다시 잡지 않고,
+`purge-expired`는 이미 `anonymizedAt`이 찍힌 건을 다시 대상으로 삼지 않습니다 — 그러므로 중복 발송·
+중복 파기 걱정 없이 재시도 정책을 기본값(Cloud Scheduler 기본 재시도)으로 둬도 됩니다.
+
+> ⚠️ `send-promotions`는 2026-08-05 GCP 초기 구성 때 `chevrolet-promotion-daily`라는 이름으로 이미 한 번
+> 등록됐을 수 있습니다(`docs/gcp-migration-and-scale-plan.md`의 실행 기록 참고). 이후 `PROMOTION_JOB_TOKEN`이
+> 교체된 적이 있어 그 잡의 헤더가 최신 토큰인지 불확실합니다 — 새로 만들기 전에
+> `gcloud scheduler jobs describe chevrolet-promotion-daily --location=asia-northeast3 --project=tossplugincar-dev`로
+> 기존 잡이 있는지 먼저 확인하세요. 있다면 이름이 다른 잡을 새로 만들어 endpoint를 이중으로 호출하게
+> 만들지 말고, 아래처럼 헤더만 최신 토큰으로 갱신하는 편이 안전합니다.
+>
+> ```bash
+> gcloud scheduler jobs update http chevrolet-promotion-daily \
+>   --location=asia-northeast3 --project=tossplugincar-dev \
+>   --headers="X-Promotion-Job-Token=<PROMOTION_JOB_TOKEN 실제 값>"
+> ```
+>
+> `purge-expired`는 이번 라운드 이전 v2 하드닝에서 endpoint만 추가된 상태라, Cloud Scheduler 잡 자체가
+> 아직 없을 가능성이 높습니다 — 위 `create` 명령으로 새로 등록하면 됩니다.
 
 ### POS 토큰 발급·재발급 운영 절차
 
@@ -251,6 +313,18 @@ POS 탭앱은 이제 매장마다 다른 64자리 hex 토큰(`Store.posToken`)�
   알림톡 발송 실패(`notify_failed`/`receipt_failed`) 건도 "재시도" 버튼으로 즉시 재발송을 시도할 수 있습니다(§API).
 - 관리자 로그인은 IP 기준 레이트리밋 외에 **같은 계정이 비밀번호를 5회 연속 틀리면 15분 잠금**됩니다(계정 존재 여부는
   여전히 노출하지 않도록, 존재하지 않는 이메일은 이전과 동일하게 401만 돌려줍니다).
+- 예약의 알림톡 실패 신호는 두 종류입니다 — `status: 'notify_failed'`(순서 호출 알림톡 실패, 예약 상태 자체가 바뀜)와
+  `intakeNotifyStatus: 'failed'`(접수 시 대기번호 안내 알림톡 실패, 예약 상태와 무관하게 별도 컬럼으로만 추적). 접수
+  알림이 성공하면 이 컬럼엔 아무것도 쓰지 않고 `null`을 유지합니다 — 해피패스에 DB 쓰기를 늘리지 않기 위해서입니다.
+  두 실패 모두 `GET /api/reservations/failed`에서 함께 조회되고, 관리자 화면은 `status`/`intakeNotifyStatus` 값을 보고
+  `retry-notify`/`retry-intake` 중 맞는 재발송 API를 고릅니다.
+- POS 대기열은 오늘 접수분과 함께 아직 안 끝난 **이월 건**(예: 밤새 맡겨둔 차의 어제 `called` 예약)도 함께 보여줍니다.
+  단, 어제 `waiting`(즉 어제 안에 한 번도 호출되지 않은 손님)은 노쇼로 보고 목록에서 빼고, 호출(`call`)은 여전히 오늘
+  접수분만 가능합니다 — 그래야 "어제 대기 손님을 오늘 실수로 새로 호출"하는 사고를 계속 막을 수 있습니다.
+- `GET /api/admin/summary` 응답은 `{ ok, date, storeId, reservations: {total, waiting, called, notify_failed, completed,
+  cancelled}, payments: {total, amountSum, receiptFailed}, intakeFailed }` 형태입니다. 예약은 `serviceDate` 기준, 결제는
+  `createdAt`의 KST 하루 범위 기준으로 집계하며, 관리자 화면 요약 카드의 "발송실패 F건"은
+  `reservations.notify_failed + intakeFailed`(순서 호출 실패 + 접수 알림 실패)를 더한 값입니다.
 
 </details>
 
@@ -507,8 +581,11 @@ Secret Manager 이전, 운영 데이터 마이그레이션, Toss ACL 전환, 부
     `developer-support@tossplace.com`에 직접 문의해야 합니다.
 - **솔라피 키 미발급.** `.env`의 `SOLAPI_*` 값이 전부 비어 있어도 예약/결제 접수 API는 정상 동작하고,
   알림톡 발송만 실패 로그를 남기고 넘어갑니다 (요청 자체는 실패시키지 않음).
-- **3개월 프로모션 스케줄러는 `node-cron`으로 매일 10시 실행.** 서버가 그 시각에 떠 있지 않으면(예: 무료 플랜 슬립) 그날은 건너뛰지만,
-  다음 실행 때 `promoAt`이 이미 지난 건은 다시 잡혀서 발송 시도합니다 (재시도 자체는 됨, 정시 발송은 보장 안 됨).
+- **3개월 프로모션·개인정보 파기 작업은 이제 `node-cron`이 아니라 Cloud Scheduler가 호출하는 내부 HTTP endpoint입니다**
+  (`POST /internal/jobs/send-promotions`, `POST /internal/jobs/purge-expired`, §API 내부 배치 작업용). 서버 프로세스
+  자체에는 스케줄링 로직이 전혀 없으므로 **Cloud Scheduler에 잡을 등록해두지 않으면 두 작업 모두 자동으로는 절대
+  실행되지 않습니다** — 등록 방법은 [Cloud Scheduler 잡 등록 절차](#cloud-scheduler-잡-등록-절차) 참고. 등록 후
+  재시도가 와도 claim+`promoSent`(프로모션)/`anonymizedAt`(파기) 기준으로 중복 처리는 막습니다.
 - **레이트리밋 적용됨.** `POST /api/reservations`는 IP당 10분에 5회, `POST /api/payments`는 10분에 10회로 제한됩니다.
 - **토스프론트/POS 플러그인은 아직 실제 계정에 라이브 배포 안 됨.** 코드·ZIP 생성은 준비됐지만,
   토스플레이스 개발자센터 플러그인 등록·테스트 가맹점/단말기 연결·개발 배포는 사업자 계정 로그인이 필요해서
@@ -533,6 +610,8 @@ Secret Manager 이전, 운영 데이터 마이그레이션, Toss ACL 전환, 부
 - [ ] 인스턴스 간 공유 레이트리밋(Redis/Cloud Armor/API Gateway) 도입 — 지금은 인스턴스별 메모리
       기준이라 여러 인스턴스로 확장되면 전역 한도가 느슨해짐
 - [ ] POS 토큰 인증·목록 페이지네이션 적용 후 부하 테스트(동시 예약/POS 폴링/관리자 목록 조회) 재검증
+- [ ] Cloud Scheduler 잡 2개(`send-promotions`, `purge-expired`) 실제 등록/재확인 —
+      [Cloud Scheduler 잡 등록 절차](#cloud-scheduler-잡-등록-절차) 참고
 - [ ] Cloud Scheduler 재시도 시 프로모션 중복 발송 방지와 Cloud Logging/복구 검증
 - [ ] Toss Front/POS ACL과 운영 API 주소를 GCP URL로 전환
 - [ ] **토스플레이스 개발자센터에서 실제 플러그인 등록·테스트 가맹점 연결·단말기 온보딩** (사업자 계정 필요, [토스프론트 플러그인 연동](#토스프론트-플러그인-연동) 섹션 절차대로)

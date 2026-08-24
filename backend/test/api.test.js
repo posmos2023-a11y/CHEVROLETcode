@@ -788,6 +788,335 @@ testSerial('limit은 최대 500으로 클램프된다', async () => {
 
 // --- 동시성(레이스 컨디션) ---
 
+// --- 접수 알림 실패 추적 + 재발송 (API 계약 v3 §2) ---
+
+testSerial('접수 알림톡 발송이 실패하면 intakeNotifyStatus가 failed로 기록되고 /failed 목록에 잡히며, retry-intake 성공 시 목록에서 빠진다', async () => {
+  const store = await createStore('intake-fail-retry-ok')
+  const admin = await createHqAdmin()
+  const authorization = authHeader(admin)
+
+  forceFailureFor = 'sendReservationAlimtalk'
+  const created = await request(app).post('/api/reservations').send({
+    merchantId: store.merchantId,
+    carNumber: '12가3456',
+    phone: '01011110000',
+    serviceType: 'oil',
+    privacyConsent: true,
+  })
+  assert.equal(created.status, 200)
+  const id = created.body.id
+
+  const stored = await prisma.reservation.findUnique({ where: { id } })
+  assert.equal(stored.intakeNotifyStatus, 'failed')
+  assert.equal(stored.status, 'waiting') // 접수 알림 실패는 예약 status 자체를 바꾸지 않는다.
+
+  const failedList = await request(app).get('/api/reservations/failed').set('Authorization', authorization)
+  assert.equal(failedList.status, 200)
+  assert.ok(failedList.body.reservations.some((r) => r.id === id))
+
+  const retry = await request(app).post(`/api/reservations/${id}/retry-intake`).set('Authorization', authorization)
+  assert.equal(retry.status, 200)
+  assert.equal(retry.body.sent, true)
+
+  const clearedRow = await prisma.reservation.findUnique({ where: { id } })
+  assert.equal(clearedRow.intakeNotifyStatus, null)
+
+  const failedAfter = await request(app).get('/api/reservations/failed').set('Authorization', authorization)
+  assert.ok(!failedAfter.body.reservations.some((r) => r.id === id))
+})
+
+testSerial('접수 알림 재발송(retry-intake)이 다시 실패하면 sent:false + 200을 반환하고 intakeNotifyStatus는 failed로 남는다', async () => {
+  const store = await createStore('intake-fail-retry-fail')
+  const admin = await createHqAdmin()
+  const authorization = authHeader(admin)
+
+  forceFailureFor = 'sendReservationAlimtalk'
+  const created = await request(app).post('/api/reservations').send({
+    merchantId: store.merchantId,
+    carNumber: '12가3456',
+    phone: '01011110001',
+    serviceType: 'oil',
+    privacyConsent: true,
+  })
+  const id = created.body.id
+
+  forceFailureFor = 'sendReservationAlimtalk'
+  const retry = await request(app).post(`/api/reservations/${id}/retry-intake`).set('Authorization', authorization)
+  assert.equal(retry.status, 200)
+  assert.equal(retry.body.sent, false)
+
+  const stored = await prisma.reservation.findUnique({ where: { id } })
+  assert.equal(stored.intakeNotifyStatus, 'failed')
+})
+
+testSerial('retry-intake는 intakeNotifyStatus가 failed가 아니거나 이미 completed/cancelled인 예약은 409로 거부한다', async () => {
+  const store = await createStore('intake-retry-guard')
+  const admin = await createHqAdmin()
+  const authorization = authHeader(admin)
+
+  // 접수 알림이 정상 성공한 예약(intakeNotifyStatus가 null)은 재발송 대상이 아니다.
+  const normal = await request(app).post('/api/reservations').send({
+    merchantId: store.merchantId,
+    carNumber: '12가3456',
+    phone: '01011110002',
+    serviceType: 'oil',
+    privacyConsent: true,
+  })
+  const normalRetry = await request(app)
+    .post(`/api/reservations/${normal.body.id}/retry-intake`)
+    .set('Authorization', authorization)
+  assert.equal(normalRetry.status, 409)
+
+  // 접수 알림은 실패했지만 이미 완료 처리된 예약도 재발송 대상이 아니다.
+  forceFailureFor = 'sendReservationAlimtalk'
+  const completedFlow = await request(app).post('/api/reservations').send({
+    merchantId: store.merchantId,
+    carNumber: '34나5678',
+    phone: '01011110003',
+    serviceType: 'oil',
+    privacyConsent: true,
+  })
+  const completedId = completedFlow.body.id
+  await request(app).post(`/api/reservations/${completedId}/call`).set('Authorization', authorization)
+  await request(app).post(`/api/reservations/${completedId}/complete`).set('Authorization', authorization)
+  const completedRetry = await request(app)
+    .post(`/api/reservations/${completedId}/retry-intake`)
+    .set('Authorization', authorization)
+  assert.equal(completedRetry.status, 409)
+})
+
+testSerial('/api/reservations/failed는 순서호출 실패(notify_failed)와 접수 실패(intakeNotifyStatus)를 함께 반환한다(union)', async () => {
+  const store = await createStore('failed-union')
+  const admin = await createHqAdmin()
+  const authorization = authHeader(admin)
+
+  forceFailureFor = 'sendReservationAlimtalk'
+  const intakeFailed = await request(app).post('/api/reservations').send({
+    merchantId: store.merchantId,
+    carNumber: '12가3456',
+    phone: '01011110004',
+    serviceType: 'oil',
+    privacyConsent: true,
+  })
+
+  const notifyFailedFlow = await request(app).post('/api/reservations').send({
+    merchantId: store.merchantId,
+    carNumber: '34나5678',
+    phone: '01011110005',
+    serviceType: 'oil',
+    privacyConsent: true,
+  })
+  forceFailureFor = 'sendQueueTurnAlimtalk'
+  await request(app).post(`/api/reservations/${notifyFailedFlow.body.id}/call`).set('Authorization', authorization)
+
+  const failedList = await request(app).get('/api/reservations/failed').set('Authorization', authorization)
+  assert.equal(failedList.status, 200)
+  const ids = failedList.body.reservations.map((r) => r.id)
+  assert.ok(ids.includes(intakeFailed.body.id))
+  assert.ok(ids.includes(notifyFailedFlow.body.id))
+
+  const intakeRow = failedList.body.reservations.find((r) => r.id === intakeFailed.body.id)
+  assert.equal(intakeRow.intakeNotifyStatus, 'failed')
+  assert.equal(intakeRow.status, 'waiting')
+  const notifyRow = failedList.body.reservations.find((r) => r.id === notifyFailedFlow.body.id)
+  assert.equal(notifyRow.status, 'notify_failed')
+})
+
+// --- 손님 검색 (API 계약 v3 §3) ---
+
+testSerial('예약/결제 목록의 q 파라미터가 전화번호 일부/차량번호 일부로 필터링하고 하이픈 포함 검색어도 매칭된다', async () => {
+  const store = await createStore('search')
+  const admin = await createHqAdmin()
+  const authorization = authHeader(admin)
+
+  const reservationA = await request(app).post('/api/reservations').send({
+    merchantId: store.merchantId,
+    carNumber: '12가3456',
+    phone: '01055551234',
+    serviceType: 'oil',
+    privacyConsent: true,
+  })
+  const reservationB = await request(app).post('/api/reservations').send({
+    merchantId: store.merchantId,
+    carNumber: '34나9999',
+    phone: '01099998888',
+    serviceType: 'oil',
+    privacyConsent: true,
+  })
+  assert.equal(reservationA.status, 200)
+  assert.equal(reservationB.status, 200)
+
+  // 전화번호 일부(하이픈 포함 검색어) 검색 — qDigits로 정규화되어 매칭돼야 한다.
+  const byPhone = await request(app)
+    .get(`/api/reservations?storeId=${store.id}&q=${encodeURIComponent('010-5555')}`)
+    .set('Authorization', authorization)
+  assert.equal(byPhone.status, 200)
+  assert.deepEqual(byPhone.body.reservations.map((r) => r.id), [reservationA.body.id])
+
+  // 차량번호 일부 검색.
+  const byCarNumber = await request(app)
+    .get(`/api/reservations?storeId=${store.id}&q=${encodeURIComponent('나9999')}`)
+    .set('Authorization', authorization)
+  assert.equal(byCarNumber.status, 200)
+  assert.deepEqual(byCarNumber.body.reservations.map((r) => r.id), [reservationB.body.id])
+
+  const paymentA = await request(app).post('/api/payments').send({
+    merchantId: store.merchantId,
+    phone: '01055551234',
+    carNumber: '12가3456',
+    amount: 10000,
+    paymentKey: unique('pay-search-a'),
+    privacyConsent: true,
+  })
+  assert.equal(paymentA.status, 200)
+
+  const paymentByPhone = await request(app)
+    .get(`/api/payments?storeId=${store.id}&q=${encodeURIComponent('5555-1234')}`)
+    .set('Authorization', authorization)
+  assert.equal(paymentByPhone.status, 200)
+  assert.deepEqual(paymentByPhone.body.payments.map((p) => p.id), [paymentA.body.id])
+})
+
+// --- 전날 손님 POS 완료/취소 (API 계약 v3 §4) ---
+
+testSerial('어제 called 상태의 예약이 POS 대기열에 이월 표시되어 완료 처리되고, 어제 waiting은 뜨지 않으며 call은 오늘 것만 허용한다', async () => {
+  const store = await createStore('carry-over')
+  const yesterday = kstDateString(new Date(Date.now() - 24 * 60 * 60 * 1000))
+
+  const calledYesterday = await prisma.reservation.create({
+    data: {
+      storeId: store.id,
+      carNumber: '12가3456',
+      phone: '01022220000',
+      serviceType: '정비',
+      queueNumber: 1,
+      serviceDate: yesterday,
+      status: 'called',
+    },
+  })
+  const waitingYesterday = await prisma.reservation.create({
+    data: {
+      storeId: store.id,
+      carNumber: '34나7777',
+      phone: '01022220001',
+      serviceType: '정비',
+      queueNumber: 2,
+      serviceDate: yesterday,
+      status: 'waiting',
+    },
+  })
+
+  const queue = await request(app).get('/api/pos/queue').set('X-Store-Token', store.posToken)
+  assert.equal(queue.status, 200)
+  const ids = queue.body.reservations.map((r) => r.id)
+  assert.ok(ids.includes(calledYesterday.id)) // 이월(called) 건은 뜬다.
+  assert.ok(!ids.includes(waitingYesterday.id)) // 어제 waiting(노쇼 추정)은 안 뜬다.
+  const carriedItem = queue.body.reservations.find((r) => r.id === calledYesterday.id)
+  assert.equal(carriedItem.serviceDate, yesterday)
+  assert.notEqual(carriedItem.serviceDate, queue.body.serviceDate)
+
+  // call은 여전히 오늘 것만 — 어제 waiting 건을 호출하려 하면 404.
+  const callYesterdayWaiting = await request(app)
+    .post(`/api/pos/queue/${waitingYesterday.id}/call`)
+    .set('X-Store-Token', store.posToken)
+  assert.equal(callYesterdayWaiting.status, 404)
+
+  // 이월(called) 건은 day-scope 없이 완료 처리할 수 있다.
+  const complete = await request(app)
+    .post(`/api/pos/queue/${calledYesterday.id}/complete`)
+    .set('X-Store-Token', store.posToken)
+  assert.equal(complete.status, 200)
+  assert.equal(complete.body.status, 'completed')
+})
+
+// --- 일별 요약 (API 계약 v3 §5) ---
+
+testSerial('/api/admin/summary가 상태별 카운트/결제합계/intakeFailed를 정확히 집계하고 store_admin은 자기 매장만 본다', async () => {
+  const storeA = await createStore('summary-a')
+  const storeB = await createStore('summary-b')
+  const hqAdmin = await createHqAdmin()
+  const hqAuth = authHeader(hqAdmin)
+  const storeAdminA = await createStoreAdmin(storeA)
+  const storeAAuth = authHeader(storeAdminA)
+  const today = kstDateString()
+
+  // storeA: waiting 1건, completed 1건(먼저 call+complete), 접수 알림 실패 1건.
+  const waitingRes = await request(app).post('/api/reservations').send({
+    merchantId: storeA.merchantId,
+    carNumber: '12가3456',
+    phone: '01033330000',
+    serviceType: 'oil',
+    privacyConsent: true,
+  })
+  const completedFlow = await request(app).post('/api/reservations').send({
+    merchantId: storeA.merchantId,
+    carNumber: '34나7777',
+    phone: '01033330001',
+    serviceType: 'oil',
+    privacyConsent: true,
+  })
+  await request(app).post(`/api/reservations/${completedFlow.body.id}/call`).set('Authorization', hqAuth)
+  await request(app).post(`/api/reservations/${completedFlow.body.id}/complete`).set('Authorization', hqAuth)
+
+  forceFailureFor = 'sendReservationAlimtalk'
+  const intakeFailedRes = await request(app).post('/api/reservations').send({
+    merchantId: storeA.merchantId,
+    carNumber: '56다8888',
+    phone: '01033330002',
+    serviceType: 'oil',
+    privacyConsent: true,
+  })
+
+  // storeA 결제 2건(합계 확인용), 그중 1건은 영수증 발송 실패.
+  await request(app).post('/api/payments').send({
+    merchantId: storeA.merchantId,
+    phone: '01033330000',
+    amount: 10000,
+    paymentKey: unique('pay-summary-1'),
+    privacyConsent: true,
+  })
+  forceFailureFor = 'sendReceiptAlimtalk'
+  await request(app).post('/api/payments').send({
+    merchantId: storeA.merchantId,
+    phone: '01033330001',
+    amount: 25000,
+    paymentKey: unique('pay-summary-2'),
+    privacyConsent: true,
+  })
+
+  // storeB에도 데이터를 넣어 store_admin 스코프 격리를 확인한다.
+  await request(app).post('/api/reservations').send({
+    merchantId: storeB.merchantId,
+    carNumber: '78라1111',
+    phone: '01044440000',
+    serviceType: 'oil',
+    privacyConsent: true,
+  })
+
+  const hqSummary = await request(app)
+    .get(`/api/admin/summary?storeId=${storeA.id}&date=${today}`)
+    .set('Authorization', hqAuth)
+  assert.equal(hqSummary.status, 200)
+  assert.equal(hqSummary.body.date, today)
+  assert.equal(hqSummary.body.storeId, storeA.id)
+  assert.equal(hqSummary.body.reservations.total, 3)
+  assert.equal(hqSummary.body.reservations.waiting, 2) // waitingRes + intakeFailedRes(둘 다 waiting 상태 유지)
+  assert.equal(hqSummary.body.reservations.completed, 1)
+  assert.equal(hqSummary.body.payments.total, 2)
+  assert.equal(hqSummary.body.payments.amountSum, 35000)
+  assert.equal(hqSummary.body.payments.receiptFailed, 1)
+  assert.equal(hqSummary.body.intakeFailed, 1)
+
+  // store_admin은 storeId 쿼리를 보내지 않아도(혹은 다른 값을 보내도) 자기 매장으로 강제된다.
+  const scopedSummary = await request(app)
+    .get(`/api/admin/summary?storeId=${storeB.id}&date=${today}`)
+    .set('Authorization', storeAAuth)
+  assert.equal(scopedSummary.status, 200)
+  assert.equal(scopedSummary.body.storeId, storeA.id)
+  assert.equal(scopedSummary.body.reservations.total, 3)
+  assert.equal(waitingRes.status, 200)
+})
+
 testSerial('같은 매장에 동시에 여러 예약이 접수돼도 대기번호가 충돌하지 않는다', async () => {
   // QueueCounter 원자적 채번(INSERT ... ON CONFLICT DO UPDATE)이 없던 시절엔 오늘 첫 두 손님이
   // 거의 동시에 접수하면 하나가 unique 제약(P2002)에 걸려 500을 돌려주는 버그가 있었다.
