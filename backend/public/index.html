@@ -19,6 +19,7 @@
 
       <div class="steps">
         <span class="dot active" data-step="car"></span>
+        <span class="dot" data-step="service"></span>
         <span class="dot" data-step="phone"></span>
       </div>
 
@@ -33,6 +34,21 @@
         <button id="skipCarBtn" class="ghost hidden">차량번호 없이 진행</button>
       </section>
 
+      <section id="step-service" class="step hidden">
+        <label class="field-label">정비 항목</label>
+        <div class="service-grid" id="serviceGrid">
+          <button type="button" class="service-opt" data-value="oil">엔진오일 교체</button>
+          <button type="button" class="service-opt" data-value="inspection">정기점검</button>
+          <button type="button" class="service-opt" data-value="tire">타이어 교체·펑크수리</button>
+          <button type="button" class="service-opt" data-value="battery">배터리 교체</button>
+          <button type="button" class="service-opt" data-value="brake">브레이크 정비</button>
+          <button type="button" class="service-opt" data-value="etc">기타 수리·상담</button>
+        </div>
+        <p id="serviceError" class="error" role="alert"></p>
+        <button id="toPhoneFromServiceBtn" disabled>다음</button>
+        <button id="backFromServiceBtn" class="ghost">이전으로</button>
+      </section>
+
       <section id="step-phone" class="step hidden">
         <label class="field-label" for="phone">전화번호</label>
         <div class="input-wrap">
@@ -44,6 +60,31 @@
           <input id="amount" type="number" inputmode="numeric" placeholder="결제금액 (선택)" />
         </div>
         <p id="phoneError" class="error" role="alert"></p>
+
+        <!--
+          아래 동의 문구는 초안이며 정식 서비스 전 법무 검토가 필요하다.
+          회사명/연락처/구체적 보유기간(년수) 등은 임의로 기재하지 않았다 — 실제 값은 법무 검토 후 확정한다.
+        -->
+        <div class="consent-block">
+          <label class="consent-row">
+            <input type="checkbox" id="privacyConsent" />
+            <span><strong>[필수]</strong> 개인정보 수집·이용 동의</span>
+          </label>
+          <details class="consent-details">
+            <summary>자세히 보기</summary>
+            <p>
+              수집 항목: 차량번호, 전화번호<br />
+              수집 목적: 정비 예약 접수 및 순서 안내<br />
+              보유 기간: 관계 법령에 따른 보관 기간 경과 후 파기<br />
+              동의를 거부할 수 있으나, 거부 시 예약 접수가 제한됩니다.
+            </p>
+          </details>
+          <label class="consent-row">
+            <input type="checkbox" id="marketingConsent" />
+            <span><strong>[선택]</strong> 광고성 정보 수신 동의</span>
+          </label>
+        </div>
+
         <button id="submitBtn" disabled>
           <span class="btn-label">예약 완료</span>
           <span class="spinner hidden" aria-hidden="true"></span>

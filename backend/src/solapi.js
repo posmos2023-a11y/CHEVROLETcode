@@ -120,18 +120,27 @@ async function sendReceiptAlimtalk({ phone, carNumber, serviceType, amount, stor
   })
 }
 
-// 결제 3개월 후 자동 홍보 알림톡
+// 결제 3개월 후 자동 홍보 알림톡. 정보통신망법 제50조(영리목적 광고성 정보 전송 제한)에 따라
+// (1) 본문 맨 앞에 "(광고)" 표시, (2) 수신거부 방법을 본문 끝에 명시해야 한다 — 접수/순서/영수증
+// 알림(sendReservationAlimtalk 등)은 거래에 부수하는 정보성 메시지라 이 규제 대상이 아니지만,
+// 프로모션은 순수 광고이므로 반드시 붙인다(계약 §4). 문구는 PROMO_OPT_OUT_TEXT로 바꿀 수 있다
+// (법무 검토 전 기본값이라 운영 반영 전 확정 필요 — .env.example 참고).
+const DEFAULT_PROMO_OPT_OUT_TEXT = '무료수신거부: 매장으로 연락 주시면 즉시 처리해 드립니다.'
+
 async function sendPromoAlimtalk({ phone, carNumber, storeName, storeId, paymentId }) {
+  const optOutText = process.env.PROMO_OPT_OUT_TEXT || DEFAULT_PROMO_OPT_OUT_TEXT
+  const body = `그동안 ${storeName || '저희 매장'}을 이용해주셔서 감사합니다. 지금 다시 방문하시면 혜택을 드립니다.`
   return sendAlimtalk({
     phone,
     storeId,
     recordId: paymentId,
     recordType: 'payment',
-    text: `[안내]\n그동안 ${storeName || '저희 매장'}을 이용해주셔서 감사합니다. 지금 다시 방문하시면 혜택을 드립니다.`,
+    text: `(광고)\n${body}\n\n${optOutText}`,
     templateId: process.env.SOLAPI_KAKAO_TEMPLATE_PROMO,
     variables: {
       '#{매장명}': storeName || '',
       '#{차량번호}': carNumber || '',
+      '#{수신거부}': optOutText,
     },
   })
 }

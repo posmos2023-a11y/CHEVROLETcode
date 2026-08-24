@@ -14,6 +14,7 @@ model Store {
   name           String
   businessNumber String?
   status         String   @default("active")
+  posToken       String?  @unique // 매장별 POS 탭앱 인증 토큰(64자 hex, X-Store-Token 헤더로 검증)
   createdAt      DateTime @default(now())
 
   reservations  Reservation[]
@@ -25,50 +26,65 @@ model Store {
 // Design Ref: docs/02-design/features/multi-store-support.design.md Phase 3
 // role: "hq_admin"(storeId 없음, 전체 매장 접근) | "store_admin"(storeId 필수, 자기 매장만)
 model AdminUser {
-  id           String   @id @default(uuid())
-  email        String   @unique
-  passwordHash String
-  role         String
-  storeId      String?
-  store        Store?   @relation(fields: [storeId], references: [id])
-  createdAt    DateTime @default(now())
-  lastLoginAt  DateTime?
+  id               String    @id @default(uuid())
+  email            String    @unique
+  passwordHash     String
+  role             String
+  storeId          String?
+  store            Store?    @relation(fields: [storeId], references: [id])
+  failedLoginCount Int       @default(0) // 로그인 실패 누적 횟수. 성공 시 0으로 리셋된다.
+  lockedUntil      DateTime? // 5회 실패 시 이 시각까지 로그인 자체를 막는다(423 응답).
+  createdAt        DateTime  @default(now())
+  lastLoginAt      DateTime?
 }
 
 model Reservation {
-  id          String    @id @default(uuid())
-  storeId     String
-  store       Store     @relation(fields: [storeId], references: [id])
-  carNumber   String
-  phone       String
-  serviceType String
-  queueNumber Int
-  idempotencyKey String? @unique
-  status      String    @default("waiting")
-  createdAt   DateTime  @default(now())
-  calledAt    DateTime?
-  completedAt DateTime?
+  id             String    @id @default(uuid())
+  storeId        String
+  store          Store     @relation(fields: [storeId], references: [id])
+  carNumber      String
+  phone          String
+  serviceType    String
+  queueNumber    Int
+  serviceDate    String // 접수 시점 KST 날짜 'YYYY-MM-DD'. 대기열/조회를 "오늘 것만"으로 한정할 때 쓴다.
+  idempotencyKey String?   @unique
+  status         String    @default("waiting") // waiting | called | notify_failed | completed | cancelled
+  createdAt      DateTime  @default(now())
+  calledAt       DateTime?
+  completedAt    DateTime?
+
+  privacyConsentAt   DateTime? // 개인정보 수집·이용 동의 시각
+  marketingConsentAt DateTime? // 광고성 정보 수신 동의 시각(선택) — null이면 프로모션 발송 대상에서 제외
+  anonymizedAt       DateTime? // 보관기간(DATA_RETENTION_DAYS) 경과 후 파기(익명화) 시각
 
   @@index([storeId])
+  @@index([storeId, serviceDate, status])
+  @@index([storeId, createdAt])
+  @@index([storeId, phone])
 }
 
 model Payment {
-  id          String    @id @default(uuid())
-  storeId     String
-  store       Store     @relation(fields: [storeId], references: [id])
-  paymentKey  String?   @unique
-  carNumber   String?
-  serviceType String?
-  phone       String?
-  amount      Int?
-  status      String    @default("requested")
-  promoAt     DateTime
-  promoSent   Boolean   @default(false)
-  promoSentAt DateTime?
+  id             String    @id @default(uuid())
+  storeId        String
+  store          Store     @relation(fields: [storeId], references: [id])
+  paymentKey     String?   @unique
+  carNumber      String?
+  serviceType    String?
+  phone          String?
+  amount         Int?
+  status         String    @default("requested") // requested | receipt_sent | receipt_failed | cancelled
+  promoAt        DateTime
+  promoSent      Boolean   @default(false)
+  promoSentAt    DateTime?
   promoClaimedAt DateTime?
-  createdAt   DateTime  @default(now())
+  createdAt      DateTime  @default(now())
+
+  privacyConsentAt   DateTime?
+  marketingConsentAt DateTime?
+  anonymizedAt       DateTime?
 
   @@index([storeId])
+  @@index([storeId, createdAt])
   @@index([promoAt, promoSent, promoClaimedAt])
 }
 

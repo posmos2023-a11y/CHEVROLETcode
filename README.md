@@ -11,8 +11,14 @@
 **독립 웹페이지** 두 가지 형태로 제공됩니다.
 
 - 🔗 저장소: https://github.com/one030728-cloud/CHEVROLETcode
-- 🌐 배포 주소: https://chevroletcode.onrender.com
-- ☁️ GCP API: https://chevrolet-api-amib56yomq-du.a.run.app
+<!-- TODO(운영): 정본 확정 필요 — 아래 표시는 잠정 값이다. Dockerfile/Cloud Run 인프라가 최신이고
+     TODO.md의 GCP 이전 작업이 Cloud Run을 대상으로 진행 중이라 정본 후보로 표시해뒀지만, 실제로 손님이
+     접속하는 운영 트래픽이 지금 Render/Cloud Run 중 어느 쪽인지는 운영 담당자만 확정할 수 있다.
+     결정되면 이 주석을 지우고 레거시 쪽 항목은 "폐기됨" 또는 삭제로 정리할 것. -->
+- ☁️ **정본(source of truth, 잠정) — GCP Cloud Run**: https://chevrolet-api-813801981857.asia-northeast3.run.app
+- 🌐 **레거시/롤백 대상 — Render**: https://chevroletcode.onrender.com
+  (GCP 전환 이전의 운영 배포. Cloud Run 장애 시 롤백처로 당분간 유지하고, 정본이 확정되면
+  [`TODO.md`](TODO.md)에 폐기 시점을 기록할 것)
 
 ## 목차
 
@@ -23,6 +29,7 @@
 - [API](#api)
 - [토스프론트 플러그인 연동](#토스프론트-플러그인-연동)
 - [환경 변수 / 알림톡 설정](#환경-변수--알림톡-설정)
+- [개인정보·광고성 정보 처리](#개인정보광고성-정보-처리)
 - [Render 배포](#render-배포)
 - [GCP 이전 및 트래픽 확장 계획](docs/gcp-migration-and-scale-plan.md)
 - [TODO](TODO.md)
@@ -94,35 +101,111 @@ front-plugin/                # 토스프론트 플러그인 (독립 프로젝트
   reservation.html           # 차량번호 → 정비항목 → 전화번호 → 대기번호 (Template API)
   payment.html                # 금액입력 → 실제 결제(sdk.payment) → 전화번호 → 영수증
   onboarding.html, settings.html, sdk.js   # 템플릿 요구 파일 (자세한 설명은 파일 내 주석)
-  package.ps1                              # 공식 업로드용 ZIP 생성 스크립트 (npm run zip)
+  api-config.js                            # window.CHEVROLET_API_BASE_URL 설정(빌드 시 placeholder 치환)
+  package.ps1, package.sh                  # 공식 업로드용 ZIP 생성 스크립트 (npm run zip은 package.ps1 호출,
+                                            # PowerShell 없는 환경은 package.sh 직접 실행)
 
 pos-plugin/                  # 토스 POS 탭앱 (독립 프로젝트 폴더, esbuild 빌드 필요 — pos-plugin/README.md 참고)
-  src/app.js                # 대기열 조회/호출/완료 (posPluginSdk.merchant.getMerchant()로 매장 자동 식별)
+  src/app.js                # 대기열 조회/호출/완료. 매장 식별은 X-Store-Token 헤더로 하고,
+                             # posPluginSdk.merchant.getMerchant()는 화면에 보여줄 매장명 표시용 보조 정보로만 사용
   public/, build.js          # 탭 매니페스트/빌드 스크립트 (manifest의 tab.href 포함)
-  package.ps1                # dist 빌드 + 공식 업로드용 ZIP 생성 (npm run zip)
+  package.ps1, package.sh    # dist 빌드 + 공식 업로드용 ZIP 생성 (npm run zip은 package.ps1 호출,
+                             # PowerShell 없는 환경은 package.sh 직접 실행)
 ```
 
 ## API
 
+용도별로 인증 방식이 다릅니다 — 손님용 API는 `merchantId`로 매장만 식별(사실상 무인증), POS 탭앱은
+매장별 발급 토큰(`X-Store-Token`), 관리자 화면은 로그인 후 JWT, 배치 작업은 별도 공유 토큰을 씁니다.
+
+### 손님용 (무인증, `merchantId`로 매장 식별)
+
 | 메서드/경로 | 설명 | 인증 |
 | --- | --- | --- |
-| `POST /api/reservations` | `merchantId`(토스 SDK `sdk.merchant.id`, 필수)로 가맹점을 식별하고, 차량번호+정비항목(`serviceType`)+전화번호 등록, 대기번호(매장별로 독립 채번) 발급. 모든 예약은 `waiting` 상태로 접수되며 접수 알림톡만 발송 | 없음 (10분당 5회 레이트리밋) |
-| `GET /api/reservations` | 예약 목록 조회 (관리자 화면용, 최신순). `?storeId=`로 특정 매장만 필터링, 생략하면 전체 매장(본사 뷰) | JWT (Bearer) |
-| `POST /api/queue/call-next?storeId=` | 지정한 매장의 대기열 맨 앞(`waiting`) 손님을 호출, "순서입니다" 알림톡 발송. `storeId` 쿼리파라미터 필수 | JWT (Bearer) |
+| `POST /api/reservations` | 차량번호+정비항목(`serviceType`)+전화번호로 대기번호(매장·날짜별 독립 채번) 발급. `privacyConsent: true`가 없으면 400(개인정보 수집·이용 동의 필수), `marketingConsent: true`면 광고 수신동의 시각 기록. 응답에 `serviceDate`(접수일 KST) 포함, `peopleAhead`는 오늘 서비스 날짜 기준으로 계산. `Idempotency-Key` 헤더로 중복 접수 방지 | 없음 (10분당 5회 IP 레이트리밋) |
+| `POST /api/payments` | 전화번호(+금액/`paymentKey`) 등록, 차량번호/정비항목은 같은 매장·전화번호의 예약 기록에서 자동 매칭. `privacyConsent: true` 필수(없으면 400), `amount`는 0~1억 사이 정수만 허용(그 외 400). 전자영수증 즉시 발송, 3개월 후 프로모션 예약(동의한 경우만) | 없음 (10분당 10회 IP 레이트리밋) |
+| `POST /api/webhooks/toss/payment` | 결제 승인/취소 웹훅(백업 경로). `x-toss-webhook-id` 중복 방지 → 서명 검증(`x-toss-signature`) → 본 처리 순서로 실행하고, 본 처리가 실패하면 웹훅 기록을 지우고 500을 반환해 토스가 재시도하게 함. **`NODE_ENV=production`에서 `TOSS_WEBHOOK_SECRET` 미설정 시 서버가 부팅하지 않음**(§환경 변수) | 없음(웹훅 전용, 토스가 호출) |
+| `GET /health` | 헬스체크(liveness). DB 접근 없이 즉시 `200 'ok'` | 없음 |
+| `GET /health/ready` | 헬스체크(readiness). `SELECT 1` 성공 시 `200 {ok:true}`, 실패 시 `503 {ok:false}` — Cloud Run 등에서 새 리비전으로 트래픽을 넘기기 전 DB 연결 확인용 | 없음 |
+
+### 관리자 화면용 (JWT)
+
+목록 조회 3종(`GET /api/reservations`, `/api/reservations/failed`, `/api/payments`, `/api/payments/failed`)은
+공통으로 아래 쿼리 파라미터와 응답 형태를 씁니다.
+
+| 파라미터 | 기본값 | 설명 |
+| --- | --- | --- |
+| `storeId` | — | `hq_admin`만 유효(전체 매장 중 필터). `store_admin`이 보내면 무시하고 자기 매장으로 고정 |
+| `date` | 없음(전체 기간) | KST 날짜 `YYYY-MM-DD`. 예약은 `serviceDate`, 결제는 `createdAt`의 KST 날짜 기준 |
+| `status` | 없음 | 콤마로 구분한 상태값(예: `waiting,called`). `/failed` 계열은 이 값을 무시하고 각각 `notify_failed`/`receipt_failed`로 고정 |
+| `limit` | `100` | 1~500으로 클램프 |
+| `offset` | `0` | 0 이상 |
+
+응답은 `{ ok, count, total, hasMore, reservations }`(또는 `payments`) 형태입니다 — `count`는 이번 페이지
+건수, `total`은 필터 적용 후 전체 건수, `hasMore`는 `offset + count < total`. **서버가 이미
+`createdAt desc`로 정렬해서 내려주므로 관리자 화면에서 다시 정렬/역순 처리하지 않습니다.**
+
+| 메서드/경로 | 설명 | 인증 |
+| --- | --- | --- |
+| `GET /api/reservations` | 예약 목록 조회(위 공통 파라미터/응답) | JWT (Bearer) |
+| `GET /api/reservations/failed` | 순서/접수 알림톡 발송 실패 건(`notify_failed`) 조회 | JWT (Bearer) |
+| `GET /api/payments` | 결제 목록 조회(위 공통 파라미터/응답) | JWT (Bearer) |
+| `GET /api/payments/failed` | 전자영수증 발송 실패 건(`receipt_failed`) 조회 | JWT (Bearer) |
+| `POST /api/queue/call-next?storeId=` | 지정한 매장의 **오늘(KST) 서비스 날짜** `waiting` 중 대기번호가 가장 앞선 손님만 호출(어제 이월분은 호출 안 함), "순서입니다" 알림톡 발송 | JWT (Bearer) |
 | `POST /api/reservations/:id/call` | 특정 예약을 순서와 무관하게 즉시 호출 (`waiting` 상태만 가능) | JWT (Bearer) |
 | `POST /api/reservations/:id/complete` | 정비완료 처리. 이후 예약들의 "앞사람" 계산에서 빠짐 | JWT (Bearer) |
-| `DELETE /api/reservations/:id` | 예약 삭제 (테스트 데이터 정리, 취소 처리용) | JWT (Bearer) |
-| `GET /api/reservations/failed` | 순서/접수 알림톡 발송 실패 건 조회. `?storeId=` 필터 가능 | JWT (Bearer) |
-| `POST /api/payments` | `merchantId`(필수)로 가맹점을 식별하고, 전화번호(+금액/paymentKey) 등록. 차량번호/정비항목은 같은 매장 안에서 그 전화번호로 등록된 예약 기록에서 자동으로 가져옴(없으면 클라이언트가 보낸 `carNumber`로 대체). 전자영수증 즉시 발송, 3개월 후 프로모션 예약 | 없음 (10분당 10회 레이트리밋) |
-| `GET /api/payments` | 결제 목록 조회 (관리자 화면용, 최신순). `?storeId=` 필터 가능 | JWT (Bearer) |
-| `GET /api/payments/failed` | 전자영수증 발송 실패 건 조회. `?storeId=` 필터 가능 | JWT (Bearer) |
-| `GET /api/admin/stores` | 등록된 가맹점(매장) 목록 조회 | JWT (Bearer), `hq_admin` 전용 |
-| `POST /api/admin/stores` | 가맹점 등록. `merchantId`(토스 SDK merchant.id와 매핑되는 값)+매장명(+사업자번호)을 받아 내부 `store_id`를 발급 | JWT (Bearer), `hq_admin` 전용 |
-| `POST /api/admin/login` | 이메일/비밀번호로 로그인, JWT 발급 (`role`: `hq_admin`\|`store_admin`, `storeId` 포함) | 없음 |
-| `GET /api/admin/me` | 로그인한 관리자 본인 정보(역할, 소속 매장) 조회 | JWT (Bearer) |
+| `POST /api/reservations/:id/cancel` | **신규.** `waiting`/`called`/`notify_failed` → `cancelled`. 이미 취소된 건이면 `alreadyCancelled: true`로 200 응답, 이미 완료된 건이면 409 | JWT (Bearer) |
+| `POST /api/reservations/:id/retry-notify` | **신규.** `notify_failed` 상태만 허용(아니면 409). 순서 안내 알림톡을 재발송하고 성공하면 `called`로, 실패해도 `notify_failed`를 유지한 채 200으로 응답(재시도 자체가 실패라는 신호는 응답의 `sent: false`로 전달) | JWT (Bearer) |
+| `DELETE /api/reservations/:id` | 예약 삭제 (테스트 데이터 정리) | JWT (Bearer) |
+| `POST /api/payments/:id/retry-receipt` | **신규.** `receipt_failed` 상태만 허용(아니면 409). 전자영수증 알림톡 재발송, 응답 형태는 `retry-notify`와 동일한 패턴(`sent` 플래그) | JWT (Bearer) |
+| `GET /api/admin/stores` | 등록된 가맹점(매장) 목록 조회. 각 매장 객체에 `posToken`(POS 탭앱 인증용) 포함 | JWT (Bearer), `hq_admin` 전용 |
+| `POST /api/admin/stores` | 가맹점 등록. `merchantId`+매장명(+사업자번호)을 받아 내부 `store_id`와 **POS 토큰을 함께 자동 발급** | JWT (Bearer), `hq_admin` 전용 |
+| `POST /api/admin/stores/bulk` | 매장 대량 등록(최대 500건), 항목별 성공/실패를 나눠서 반환. 성공 항목마다 `posToken` 포함 | JWT (Bearer), `hq_admin` 전용 |
+| `POST /api/admin/stores/:id/pos-token` | **신규.** 해당 매장의 POS 토큰을 재발급(회전) — 기존 토큰은 즉시 무효화됨. 없는 매장이면 404 | JWT (Bearer), `hq_admin` 전용 |
 | `POST /api/admin/store-admins` | 매장 관리자 계정 발급. `merchantId`로 매장을 찾아 그 매장에 스코프된 `store_admin` 계정 생성 | JWT (Bearer), `hq_admin` 전용 |
-| `POST /api/admin/stores/bulk` | 매장 대량 등록. `{ stores: [{merchantId, name, businessNumber?}, ...] }` (최대 500건), 항목별 성공/실패를 나눠서 반환 | JWT (Bearer), `hq_admin` 전용 |
-| `POST /api/webhooks/toss/payment` | 토스플레이스 결제 승인/취소 웹훅 수신(백업 경로). `x-toss-webhook-id`로 중복 방지, `x-toss-signature`로 서명 검증(TOSS_WEBHOOK_SECRET 설정 시) | 없음(웹훅 전용, 토스가 호출) |
+| `POST /api/admin/login` | 이메일/비밀번호로 로그인, JWT 발급(`role`: `hq_admin`\|`store_admin`, `storeId` 포함). 기존 IP 레이트리밋에 더해 **같은 계정 비밀번호 5회 연속 실패 시 15분 계정 잠금**(423 응답) 추가 | 없음 |
+| `GET /api/admin/me` | 로그인한 관리자 본인 정보(역할, 소속 매장) 조회. `store` 객체에 `posToken` 포함(자기 매장이므로 `store_admin`도 조회 가능) | JWT (Bearer) |
+
+### POS 탭앱용 (`X-Store-Token`, ⚠️ 인증 방식이 바뀜)
+
+`merchantId`는 더 이상 POS API의 인증 수단이 아닙니다(요청에 실려도 무시됩니다) — 매장별로 발급된
+64자리 hex 토큰을 `X-Store-Token` 헤더로 보내야 합니다. 토큰이 없거나 틀리면 401
+(`STORE_TOKEN_REQUIRED`/`INVALID_STORE_TOKEN`), 매장이 비활성 상태면 403을 반환합니다. 발급/재발급
+절차는 바로 아래 [POS 토큰 발급·재발급 운영 절차](#pos-토큰-발급재발급-운영-절차) 참고.
+
+| 메서드/경로 | 설명 | 인증 |
+| --- | --- | --- |
+| `GET /api/pos/queue` | 오늘(KST) 서비스 날짜의 대기열(정비완료·취소 제외)을 대기번호순으로 조회. **전화번호는 마스킹**(`010-****-5678`)해서 내려줌(POS 화면에 원본이 필요 없음) | `X-Store-Token` |
+| `POST /api/pos/queue/:id/call` | 오늘 등록된 해당 매장 예약만 호출 가능(아니면 404) | `X-Store-Token` |
+| `POST /api/pos/queue/:id/complete` | 오늘 등록된 해당 매장 예약만 정비완료 처리 | `X-Store-Token` |
+| `POST /api/pos/queue/:id/cancel` | **신규.** 노쇼 등으로 대기열에서 제외. `waiting`/`called`/`notify_failed` → `cancelled` | `X-Store-Token` |
+
+### 내부 배치 작업용 (`X-Promotion-Job-Token`, Cloud Scheduler가 호출)
+
+| 메서드/경로 | 설명 | 인증 |
+| --- | --- | --- |
+| `POST /internal/jobs/send-promotions` | 결제 3개월 경과 + 광고성 정보 수신에 동의(`marketingConsentAt` not null)한 손님에게 프로모션 알림톡 발송. 100건씩 배치로 claim해 **1회 실행 최대 `PROMO_MAX_PER_RUN`건(기본 2000) 또는 50초 예산**까지 처리하고, 상한에 걸려 남은 대상이 있으면 `exhausted: true` | `X-Promotion-Job-Token` |
+| `POST /internal/jobs/purge-expired` | **신규.** `DATA_RETENTION_DAYS`(기본 1095일)보다 오래된 예약/결제 중 아직 파기 안 된 건의 전화번호·차량번호를 익명화(`anonymizedAt` 기록). 한 번에 최대 1000건씩 최대 10회 반복 | `X-Promotion-Job-Token` |
+
+### POS 토큰 발급·재발급 운영 절차
+
+POS 탭앱은 이제 매장마다 다른 64자리 hex 토큰(`Store.posToken`)이 있어야 대기열 API를 호출할 수
+있습니다(§API POS 탭앱용). 운영 절차는 다음과 같습니다.
+
+1. **발급 (매장 등록 시 자동)** — 본사(`hq_admin`)가 관리자 화면(`/admin.html`)에서 `POST /api/admin/stores`로
+   매장을 등록하면 `posToken`이 자동으로 함께 발급됩니다. 대량 등록(`/bulk`)도 동일합니다.
+2. **직원 입력 (최초 1회)** — 매장 직원이 POS 탭앱을 처음 열면 토큰 입력 화면이 뜹니다. 본사 또는
+   매장관리자가 관리자 화면의 **POS 토큰 관리** 표에서 해당 매장 토큰을 "보기"/"복사"해 전달하면, 직원이
+   그 값을 한 번 입력합니다. 입력한 토큰은 POS 단말기의 `localStorage`에 저장되어 이후에는 다시
+   묻지 않습니다.
+3. **재발급(회전)** — 토큰이 유출됐거나(직원 퇴사, 단말기 분실 등) 정기 로테이션이 필요하면 `hq_admin`이
+   관리자 화면에서 **재발급** 버튼(`POST /api/admin/stores/:id/pos-token`)을 누릅니다. **재발급 즉시 기존
+   토큰은 무효화되며, 그 토큰을 쓰던 모든 POS 단말기는 다음 요청부터 401(`INVALID_STORE_TOKEN`)을 받고
+   자동으로 토큰 재입력 화면으로 돌아갑니다** — 그러므로 재발급 직후 매장에 새 토큰을 다시 전달해야
+   대기열 화면이 끊기지 않습니다. `store_admin`은 조회/복사만 가능하고 재발급 권한은 없습니다(`hq_admin` 전용).
+4. **로컬 개발** — 자동 시드되는 테스트 매장(`merchantId '0'`)은 최초 생성 시 토큰이 비어 있을 수 있으므로,
+   관리자 화면에서 한 번 재발급을 눌러 값을 채워야 합니다. 자세한 절차는
+   [`pos-plugin/README.md`의 "로컬 미리보기"](pos-plugin/README.md#로컬-미리보기) 참고.
 
 <details>
 <summary>멀티 가맹점(매장) 구조 — merchantId ↔ store_id, 2계층 관리자</summary>
@@ -163,6 +246,11 @@ pos-plugin/                  # 토스 POS 탭앱 (독립 프로젝트 폴더, es
 - 결제 화면에서 차량번호를 다시 입력받지 않는 대신, 전화번호로 `findLatestReservationByPhone`가 그 손님의 예약 기록을 찾습니다
   (같은 날 예약을 우선하고, 없으면 그 번호로 등록된 가장 최근 예약을 사용). 예약 없이 바로 결제하러 온 손님은 매칭되는 기록이 없어
   차량번호/정비항목 없이 영수증이 나갑니다.
+- 예약 상태값은 `waiting`(대기중)/`called`(호출완료)/`notify_failed`(알림실패)/`completed`(정비완료)/`cancelled`(취소됨) 5가지,
+  결제 상태값은 `requested`/`receipt_sent`/`receipt_failed`/`cancelled` 4가지입니다. 관리자 화면에서 예약/결제를 취소하면
+  알림톡 발송 실패(`notify_failed`/`receipt_failed`) 건도 "재시도" 버튼으로 즉시 재발송을 시도할 수 있습니다(§API).
+- 관리자 로그인은 IP 기준 레이트리밋 외에 **같은 계정이 비밀번호를 5회 연속 틀리면 15분 잠금**됩니다(계정 존재 여부는
+  여전히 노출하지 않도록, 존재하지 않는 이메일은 이전과 동일하게 401만 돌려줍니다).
 
 </details>
 
@@ -195,6 +283,7 @@ pos-plugin/                  # 토스 POS 탭앱 (독립 프로젝트 폴더, es
 
 1. [토스플레이스 개발자센터](https://developers.tossplace.com/login)에 로그인 → **내 플러그인 → 플러그인 등록**,
    타입은 "토스프론트"로 선택 (플러그인 이름/ID/회사명 입력). ACL에는 `https://chevroletcode.onrender.com`을 등록
+   (이 문서 상단의 배포 주소 정본이 Cloud Run으로 확정되면 이 ACL도 함께 옮겨야 합니다 — `TODO(운영)` 참고)
 2. 등록하면 예제 기반 기본 플러그인이 자동 생성됨 (이 저장소의 `front-plugin/` 코드로 교체할 부분)
 3. **테스트 가맹점 관리**에서 기존 테스트 가맹점 선택 또는 신규 생성 → 매장고유번호/사업자번호/휴대폰번호 발급
 4. 테스트 가맹점 상세화면에서 이 플러그인 사용 여부를 켬
@@ -301,8 +390,37 @@ SOLAPI_KAKAO_TEMPLATE_PROMO=         # 결제 3개월 후 홍보
 | `#{대기인원}` | 내 앞에 대기중인 인원수 (예약 접수 템플릿 전용) |
 | `#{정비항목}` | 예약 시 선택한 정비 종류 (예: 엔진오일 교체). 예약 접수/순서호출/영수증 템플릿에서 사용. 영수증에서는 전화번호로 찾은 예약 기록에서 가져오며, 매칭되는 예약이 없으면 빈 값 |
 | `#{결제금액}` | 예) "15,000원" (영수증 템플릿) |
+| `#{수신거부}` | 무료수신거부 안내 문구(`PROMO_OPT_OUT_TEXT`, 기본값은 §개인정보·광고성 정보 처리 참고). 프로모션(광고) 템플릿 전용 |
 
 </details>
+
+## 개인정보·광고성 정보 처리
+
+> ⚠️ **이 섹션의 동의/수신거부 문구와 보관기간(`DATA_RETENTION_DAYS`)은 아직 법무 검토를 거치지 않았습니다.**
+> 실제 서비스에 적용하기 전에 반드시 법무 검토(개인정보보호법, 정보통신망법 제50조 등)를 받아야 합니다 —
+> 아래 내용은 "기능적으로 동의 수집·광고 구분·파기 로직이 만들어져 있다"는 것이지, 문구 자체가 법적으로
+> 완결됐다는 뜻이 아닙니다.
+
+- **수집 동의.** 예약(`POST /api/reservations`)과 결제(`POST /api/payments`) 화면 모두 `privacyConsent: true`를
+  실제 사용자 동의 UI(체크박스 등)를 통해 받아야 요청이 통과합니다 — 동의 없이 하드코딩으로 `true`를
+  보내면 안 됩니다(front-plugin/backend 공용 화면 모두 동일). 동의 시각은 `privacyConsentAt`에 저장됩니다.
+- **광고 수신동의.** `marketingConsent: true`를 함께 보낸 손님만 `marketingConsentAt`이 기록되고,
+  결제 3개월 후 프로모션 알림톡(`POST /internal/jobs/send-promotions`) 대상에 포함됩니다. 동의하지 않은
+  손님에게는 광고성 알림톡이 발송되지 않습니다 — 예약/접수/순서호출/영수증 같은 정보성 알림톡은 동의
+  여부와 무관하게 그대로 발송됩니다(광고가 아니므로).
+- **광고 문구 표시 의무(정보통신망법 제50조 대응).** 프로모션 알림톡은 맨 앞에 `(광고) ` 접두사가 붙고,
+  맨 끝에 무료수신거부 안내(`PROMO_OPT_OUT_TEXT` 환경변수, 미설정 시 기본값
+  "무료수신거부: 매장으로 연락 주시면 즉시 처리해 드립니다.")가 따라붙습니다. 지금 기본값은 "매장으로
+  연락"하는 방식뿐이라 실제로 정보통신망법이 요구하는 수준(예: 무료 전화/URL 등 구체적 수신거부 수단)을
+  충족하는지는 검토가 필요합니다.
+- **보관기간 및 파기.** `POST /internal/jobs/purge-expired`(Cloud Scheduler가 주기 호출, `X-Promotion-Job-Token`
+  인증)가 `DATA_RETENTION_DAYS`(기본 1095일 = 3년)보다 오래된 예약/결제 기록의 전화번호·차량번호를
+  익명화합니다(`anonymizedAt` 기록). 결제 기록은 전화번호를 `null`로, 예약 기록은 `phone` 컬럼이
+  `NOT NULL`이라 `'0100000000'`(더미값)으로 바꿉니다. 보관기간 3년이 업종·기록 성격에 맞는 값인지도
+  법무 검토 대상입니다.
+- **관리자 화면에서 개인정보 노출 최소화.** POS 탭앱(`GET /api/pos/queue`)은 전화번호를 마스킹된 형태
+  (`010-****-5678`)로만 내려받습니다 — 매장 직원이 대기열 화면에서 원본 전화번호를 볼 필요가 없기
+  때문입니다. 관리자 대시보드(JWT)는 여전히 원본을 보여줍니다(고객 응대/환불 등에 필요).
 
 ## Render 배포
 
@@ -313,7 +431,9 @@ SOLAPI_KAKAO_TEMPLATE_PROMO=         # 결제 3개월 후 홍보
 3. Build Command: `cd backend && npm install && npx prisma migrate deploy && cd ../pos-plugin && npm install && npm run build`
 4. Start Command: `cd backend && npm start`
 5. Environment 탭에서 위 `DATABASE_URL`(Postgres 연결 문자열 — Render 무료 플랜은 재배포 시 로컬 파일이 초기화되므로
-   SQLite가 아니라 반드시 외부 Postgres 사용), `JWT_SECRET`, `ADMIN_BOOTSTRAP_*`, `SOLAPI_*` 키들을 등록
+   SQLite가 아니라 반드시 외부 Postgres 사용), `JWT_SECRET`, `ADMIN_BOOTSTRAP_*`, `SOLAPI_*` 키들을 등록.
+   **Render는 기본적으로 `NODE_ENV=production`으로 실행되므로 `TOSS_WEBHOOK_SECRET`을 반드시 같이
+   등록해야 합니다** — 비어 있으면 서버가 부팅 자체를 하지 못합니다(§환경 변수).
 6. `main` 브랜치에 push하면 Render가 자동 재배포합니다 (Auto-Deploy 켜져 있는 경우)
 
 > ⚠️ Render 무료 플랜은 트래픽이 없으면 슬립 상태가 되어 오전 10시 프로모션 스케줄러가 안 돌 수 있습니다.
@@ -324,9 +444,21 @@ SOLAPI_KAKAO_TEMPLATE_PROMO=         # 결제 3개월 후 홍보
 GCP 이전을 위한 애플리케이션·데이터베이스·배포 기반 작업은 완료되어 있습니다.
 
 - Prisma datasource를 PostgreSQL로 전환하고 운영용 migration을 추가했습니다.
-- 저장소 루트의 `Dockerfile`로 Cloud Run에서 빌드·실행할 수 있습니다.
-- Cloud Scheduler가 호출할 `/internal/jobs/send-promotions` 작업 endpoint와 인증을 추가했습니다.
+- 저장소 루트의 `Dockerfile`로 Cloud Run에서 빌드·실행할 수 있습니다. 이제 `npm ci`(lockfile 고정)로
+  빌드하고, `RUN_MIGRATIONS_ON_BOOT=true`(기본값)면 기존처럼 컨테이너 부팅 시 `prisma migrate deploy`를
+  실행합니다 — 콜드스타트마다 여러 인스턴스가 동시에 뜨는 Cloud Run 환경에서는 이게 advisory lock
+  경합/크래시 루프의 원인이 될 수 있으므로, 트래픽이 늘면 이 값을 `false`로 바꾸고 마이그레이션을
+  별도 사전 단계(Cloud Run Job 등)로 분리하는 걸 권장합니다(자세한 이유는 `Dockerfile` 주석,
+  변수 목록은 `backend/.env.example` 참고).
+- Cloud Run의 상태 확인(startup/liveness probe)은 `GET /health`(DB 접근 없는 liveness)와
+  `GET /health/ready`(`SELECT 1`로 DB 연결까지 확인하는 readiness)를 구분해서 등록하세요.
+- Cloud Scheduler가 호출할 `/internal/jobs/send-promotions`(프로모션 발송)와
+  `/internal/jobs/purge-expired`(개인정보 보관기간 경과분 파기, §개인정보·광고성 정보 처리) 작업
+  endpoint와 인증(`X-Promotion-Job-Token`)을 추가했습니다.
 - Front/POS API 주소를 환경별 설정으로 분리했습니다.
+- Cloud Run은 트래픽에 따라 인스턴스를 자동 확장하는데, Prisma 커넥션 풀은 인스턴스마다 따로 생기므로
+  `DATABASE_URL`에 `?connection_limit=`을 지정해 Cloud SQL 커넥션 한도를 넘지 않게 해야 합니다
+  (`backend/.env.example` 참고, 구체적인 값 결정은 아직 안 됨 — TODO).
 - 현재 확인된 운영 리소스는 `chevrolet-postgres` Cloud SQL과
   `chevrolet-api` Cloud Run(`asia-northeast3`)입니다.
 
@@ -339,6 +471,16 @@ Secret Manager 이전, 운영 데이터 마이그레이션, Toss ACL 전환, 부
 <details open>
 <summary><strong>현재 상태</strong></summary>
 
+- **프로덕션 하드닝 1차 완료 (2026-08-24).** 크래시 방지(`asyncHandler`, 전역 에러 핸들러,
+  `unhandledRejection`/`uncaughtException` 처리, graceful shutdown), 보안 헤더/CSP, 관리자 API
+  CORS 제한(`ADMIN_ALLOWED_ORIGINS`), 로그인 계정 잠금, POS 탭앱 토큰 인증(`X-Store-Token`,
+  merchantId 기반 인증 폐지), 예약/결제 목록 페이지네이션, 예약/영수증 수동 재시도(`retry-notify`/
+  `retry-receipt`)와 취소 API, 개인정보 수집·광고 수신 동의 수집 + 보관기간 경과 파기 작업
+  (`purge-expired`), `npm ci` 기반 재현 가능한 Docker 빌드, Cloud Run 크래시 루프 방지용
+  `RUN_MIGRATIONS_ON_BOOT` 옵션, CI에 POS 번들 빌드 검증/구문 검사 추가까지 반영했습니다.
+  **아직 안 된 것**: 개인정보·광고 문구 법무 검토, Render/Cloud Run 중 운영 정본 확정,
+  Redis/Cloud Armor 등 인스턴스 간 공유 레이트리밋, 실제 부하 테스트 — 자세한 남은 작업은
+  [`TODO.md`](TODO.md) 참고.
 - **GCP용 DB 전환 기반 완료 (PostgreSQL, Prisma).** `backend/prisma/schema.prisma`의 provider를
   PostgreSQL로 전환하고 `backend/prisma/migrations/20260805120000_init_postgresql/` 운영 migration을
   추가했습니다. Cloud Run 컨테이너는 `DATABASE_URL`로 Cloud SQL에 연결합니다. 운영 데이터 export/import,
@@ -376,13 +518,26 @@ Secret Manager 이전, 운영 데이터 마이그레이션, Toss ACL 전환, 부
 
 **TODO**
 
+- [ ] **운영 정본 배포(Render vs GCP Cloud Run) 확정** — 이 문서 상단 배포 주소의
+      `TODO(운영)` 주석 참고, 결정되면 레거시 쪽 항목 정리
+- [ ] 개인정보 수집·이용 동의 문구, 광고 수신동의/수신거부 문구(`PROMO_OPT_OUT_TEXT`),
+      보관기간(`DATA_RETENTION_DAYS`) 법무 검토 (§개인정보·광고성 정보 처리)
 - [ ] 솔라피 알림톡 키/템플릿 4종 발급받아 Render Environment와 로컬 `.env`에 채우기
 - [ ] Cloud SQL 운영 데이터 export/import 및 재배포 후 데이터 유지 확인
-- [ ] GCP Secret Manager에 `DATABASE_URL`, `JWT_SECRET`, 관리자 계정, Solapi 키 등록
-- [ ] Cloud Run 동시성·최대 인스턴스·DB 커넥션 풀 및 p95 응답시간 검증
+- [ ] GCP Secret Manager에 `DATABASE_URL`, `JWT_SECRET`, 관리자 계정, Solapi 키에 더해
+      `TOSS_WEBHOOK_SECRET`(운영 필수), `ADMIN_ALLOWED_ORIGINS`, `DATA_RETENTION_DAYS`,
+      `PROMO_OPT_OUT_TEXT`, `PROMO_MAX_PER_RUN` 등록
+- [ ] Cloud Run 배포 시 `RUN_MIGRATIONS_ON_BOOT=false`로 전환하고 `prisma migrate deploy`를
+      별도 사전 단계(Cloud Run Job 등)로 분리
+- [ ] Cloud Run 동시성·최대 인스턴스·DB 커넥션 풀(`DATABASE_URL`의 `connection_limit`) 및 p95 응답시간 검증
+- [ ] 인스턴스 간 공유 레이트리밋(Redis/Cloud Armor/API Gateway) 도입 — 지금은 인스턴스별 메모리
+      기준이라 여러 인스턴스로 확장되면 전역 한도가 느슨해짐
+- [ ] POS 토큰 인증·목록 페이지네이션 적용 후 부하 테스트(동시 예약/POS 폴링/관리자 목록 조회) 재검증
 - [ ] Cloud Scheduler 재시도 시 프로모션 중복 발송 방지와 Cloud Logging/복구 검증
 - [ ] Toss Front/POS ACL과 운영 API 주소를 GCP URL로 전환
 - [ ] **토스플레이스 개발자센터에서 실제 플러그인 등록·테스트 가맹점 연결·단말기 온보딩** (사업자 계정 필요, [토스프론트 플러그인 연동](#토스프론트-플러그인-연동) 섹션 절차대로)
 - [ ] `front-plugin/` ZIP(`npm run zip`) 개발 배포 → 실제 프론트 단말기에서 화면/결제 흐름 확인
 - [ ] `pos-plugin/` ZIP(`npm run zip`) 개발 배포 → 실제 POS에서 대기열 탭 확인
-- [ ] (선택) 결제 승인 웹훅 수신이 필요하면 developer-support@tossplace.com에 문의해서 웹훅 등록
+- [ ] 결제 승인 웹훅 등록 — 개발자센터 → 내 애플리케이션 → OpenAPI → 웹훅에서 수신 URL
+      (`https://<운영 도메인>/api/webhooks/toss/payment`)과 서명 secret을 직접 설정하고, 같은 secret 값을
+      서버의 `TOSS_WEBHOOK_SECRET` 환경변수에 넣는다 (production에서는 이 값이 없으면 서버가 부팅되지 않는다)

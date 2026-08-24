@@ -63,7 +63,7 @@
           subtitle: '차량번호 ' + carNumber,
           options: SERVICE_TYPES.map((service) => ({
             title: service.title,
-            onClick: () => showPhoneInput(carNumber, service.value),
+            onClick: () => showConsent(carNumber, service.value),
           })),
           onBack: () => {
             showCarNumberInput()
@@ -71,7 +71,43 @@
         })
       }
 
-      function showPhoneInput(carNumber, serviceType, errorText, idempotencyKey = crypto.randomUUID()) {
+      // TODO(법무 검토): 아래 동의 화면(showConsent)의 고지 문구(수집 항목·목적·보유기간·광고
+      // 동의 안내)는 최종 배포 전 법무 검토를 거쳐 확정해야 한다. 회사명·연락처·구체적인
+      // 보유기간은 임의로 채우지 않았다(개인정보보호법 제15조, 정보통신망법 제50조 대응).
+      //
+      // 차량번호·전화번호를 실제로 입력받기 직전에 반드시 이 동의 화면을 거치게 한다. 필수
+      // (개인정보 수집·이용) 동의와 선택(광고성 정보 수신) 동의를 분리해서, 광고 수신을 거부해도
+      // 예약 접수 자체는 그대로 진행되도록 한다. 아직 아무 개인정보도 서버로 전송되지 않은
+      // 시점이라("동의하지 않음"을 눌러도 잃을 게 없다), 거부 시 이전 단계(정비 항목 선택)로
+      // 그냥 돌아간다.
+      function showConsent(carNumber, serviceType) {
+        sdk.template.renderSelectPage({
+          title: '개인정보 수집·이용에 동의해주세요',
+          subtitle:
+            '수집 항목: 차량번호, 전화번호\n' +
+            '수집 목적: 정비 예약 접수 및 순서 안내, 전자영수증 발송\n' +
+            '광고성 정보 수신 동의는 선택이며, 거부하셔도 예약 서비스 이용에 제한이 없습니다.',
+          options: [
+            {
+              title: '필수 항목에만 동의하고 계속',
+              onClick: () => showPhoneInput(carNumber, serviceType, { privacyConsent: true, marketingConsent: false }),
+            },
+            {
+              title: '필수 + 광고성 정보 수신에 모두 동의',
+              onClick: () => showPhoneInput(carNumber, serviceType, { privacyConsent: true, marketingConsent: true }),
+            },
+            {
+              title: '동의하지 않음',
+              onClick: () => showServiceTypeSelect(carNumber),
+            },
+          ],
+          onBack: () => {
+            showServiceTypeSelect(carNumber)
+          },
+        })
+      }
+
+      function showPhoneInput(carNumber, serviceType, consent, errorText, idempotencyKey = crypto.randomUUID()) {
         sdk.template.renderInputPage({
           type: 'phone',
           top: {
@@ -83,28 +119,37 @@
           onSubmit: async (value) => {
             const phone = value.replace(/-/g, '').trim()
             if (!PHONE_RE.test(phone)) {
-              showPhoneInput(carNumber, serviceType, '전화번호 형식이 올바르지 않습니다.', idempotencyKey)
+              showPhoneInput(carNumber, serviceType, consent, '전화번호 형식이 올바르지 않습니다.', idempotencyKey)
               return
             }
-            await submitReservation(carNumber, phone, serviceType, idempotencyKey)
+            await submitReservation(carNumber, phone, serviceType, consent, idempotencyKey)
           },
           onBack: () => {
-            showServiceTypeSelect(carNumber)
+            showConsent(carNumber, serviceType)
           },
         })
       }
 
-      async function submitReservation(carNumber, phone, serviceType, idempotencyKey) {
+      async function submitReservation(carNumber, phone, serviceType, consent, idempotencyKey) {
         try {
           // App API(https://docs.tossplace.com/reference/plugin-sdk/front/app.html)의 비동기 함수.
           // 실제 단말기에서는 토스프론트가 그 단말기에 온보딩된 실제 가맹점 정보를 반환하고,
           // 로컬 브라우저 미리보기에서는 sdk.js가 채워둔 테스트 매장 정보가 반환된다.
           const merchant = await sdk.app.getMerchant()
           const merchantId = merchant?.id
+          // privacyConsent/marketingConsent는 showConsent 화면에서 손님이 실제로 고른 값을 그대로
+          // 전달한다 — 서버가 privacyConsent !== true면 400으로 거부하므로 여기서 하드코딩하면 안 된다.
           const res = await fetch(`${API_BASE}/api/reservations`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Idempotency-Key': idempotencyKey },
-            body: JSON.stringify({ carNumber, phone, serviceType, merchantId }),
+            body: JSON.stringify({
+              carNumber,
+              phone,
+              serviceType,
+              merchantId,
+              privacyConsent: consent.privacyConsent,
+              marketingConsent: consent.marketingConsent,
+            }),
           })
           const json = await res.json().catch(() => ({}))
 

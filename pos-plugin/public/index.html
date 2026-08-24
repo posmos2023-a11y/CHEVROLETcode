@@ -75,14 +75,31 @@
   .store-status {
     display: flex;
     align-items: center;
+    flex-wrap: wrap;
+    justify-content: flex-end;
     gap: 7px;
-    max-width: 45%;
-    padding-top: 7px;
+    max-width: 55%;
+    padding-top: 4px;
     color: var(--sub);
     font-size: 12px;
     font-weight: 600;
     text-align: right;
   }
+
+  .token-reset-button {
+    min-height: 30px;
+    padding: 0 10px;
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    background: var(--surface);
+    color: var(--sub);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    cursor: pointer;
+  }
+
+  .token-reset-button:active { transform: scale(0.96); }
 
   .connection-dot {
     width: 7px;
@@ -267,6 +284,16 @@
     white-space: nowrap;
   }
 
+  .phone {
+    overflow: hidden;
+    margin-top: 3px;
+    color: var(--muted);
+    font-size: 12px;
+    letter-spacing: -0.01em;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
   .badge {
     display: inline-flex;
     align-items: center;
@@ -284,12 +311,14 @@
 
   .actions {
     display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
     gap: 7px;
     flex: 0 0 auto;
   }
 
   .action-button {
-    min-width: 74px;
+    min-width: 64px;
     min-height: 48px;
     padding: 0 13px;
     border: 0;
@@ -308,6 +337,19 @@
   .action-button.confirm { background: var(--red); color: #fff; }
   .action-button:disabled { background: #f1f2f4; color: #b4bcc7; cursor: not-allowed; }
   .action-button:disabled:active { transform: none; }
+
+  /* 취소는 노쇼 손님을 대기열에서 영구히 빼는, 되돌릴 수 없는 조작이다. 평소에도 빨간 테두리로
+     "위험한 버튼"임을 항상 드러내고(호출/완료는 평소엔 파랑/초록의 중립적인 색), 확정 대기 상태에서는
+     .confirm과 같은 진한 빨강으로 채워 다른 버튼의 확정 상태와 구분되게 한다. */
+  .action-button.cancel {
+    border: 1.5px solid var(--red);
+    background: var(--surface);
+    color: var(--red);
+  }
+  .action-button.cancel.confirm { background: var(--red); color: #fff; }
+  /* 등호 우선순위(specificity) 동률에서 소스 순서로만 이기는 상태라 background/color까지 다시
+     명시해야 한다 — 안 그러면 .action-button.cancel이 나중에 와서 disabled 스타일을 덮어써버린다. */
+  .action-button.cancel:disabled { background: #f1f2f4; color: #b4bcc7; border-color: transparent; }
 
   .empty, .error-card {
     padding: 42px 20px;
@@ -386,6 +428,99 @@
     border: 0;
   }
 
+  .token-screen {
+    display: grid;
+    place-items: center;
+    min-height: calc(100vh - 40px);
+    padding: 20px 4px;
+  }
+
+  .token-card {
+    width: 100%;
+    max-width: 420px;
+    padding: 30px 22px;
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    background: var(--surface);
+    box-shadow: var(--shadow);
+    text-align: center;
+  }
+
+  .token-mark {
+    display: grid;
+    place-items: center;
+    width: 46px;
+    height: 46px;
+    margin: 0 auto 14px;
+    border-radius: 15px;
+    background: var(--blue-soft);
+    color: var(--blue);
+    font-size: 20px;
+    font-weight: 800;
+  }
+
+  .token-card h1 {
+    font-size: 19px;
+    letter-spacing: -0.04em;
+  }
+
+  .token-desc {
+    margin-top: 12px;
+    color: var(--sub);
+    font-size: 13px;
+    line-height: 1.6;
+    letter-spacing: -0.02em;
+    text-align: left;
+  }
+
+  .token-desc strong { color: var(--ink); }
+
+  .token-input {
+    width: 100%;
+    min-height: 48px;
+    margin-top: 20px;
+    padding: 0 14px;
+    border: 1px solid var(--line);
+    border-radius: 13px;
+    background: var(--canvas);
+    color: var(--ink);
+    font-size: 14px;
+    letter-spacing: -0.01em;
+  }
+
+  .token-input:focus {
+    outline: none;
+    border-color: var(--blue);
+    background: var(--surface);
+  }
+
+  .token-submit {
+    width: 100%;
+    min-height: 48px;
+    margin-top: 10px;
+    border: 0;
+    border-radius: 13px;
+    background: var(--blue);
+    color: #fff;
+    font-size: 15px;
+    font-weight: 750;
+    letter-spacing: -0.03em;
+    cursor: pointer;
+    transition: transform 120ms ease;
+  }
+
+  .token-submit:active { transform: scale(0.98); }
+  .token-submit:disabled { background: var(--muted); cursor: wait; }
+
+  .token-error {
+    min-height: 16px;
+    margin: 10px 0 0;
+    color: var(--red);
+    font-size: 12.5px;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+  }
+
   @media (max-width: 560px) {
     #app { padding: 16px 12px 22px; }
     h1 { font-size: 21px; }
@@ -398,44 +533,73 @@
 </head>
 <body>
   <main id="app">
-    <header class="topbar">
-      <div>
-        <span class="eyebrow">매장 대기관리</span>
-        <h1>정비 대기열</h1>
-      </div>
-      <div class="store-status">
-        <span class="connection-dot checking" id="connection-dot" aria-hidden="true"></span>
-        <span id="store-name">매장 확인 중</span>
-      </div>
-    </header>
-
-    <section class="summary" aria-label="대기열 요약">
-      <div class="summary-card primary">
-        <span class="summary-label">현재 대기</span>
-        <strong class="summary-value" id="waiting-count">0</strong><span class="summary-unit">명</span>
-        <span class="summary-note">아직 호출되지 않은 고객</span>
-      </div>
-      <div class="summary-card">
-        <span class="summary-label">다음 호출</span>
-        <strong class="summary-value" id="next-number">—</strong>
-        <span class="summary-note">가장 먼저 호출할 번호</span>
+    <section class="token-screen" id="token-screen" aria-labelledby="token-heading">
+      <div class="token-card">
+        <div class="token-mark" aria-hidden="true">🔒</div>
+        <h1 id="token-heading">매장 인증 토큰을 입력해주세요</h1>
+        <p class="token-desc">
+          이 화면은 매장별 인증 토큰이 있어야 대기열을 볼 수 있습니다. 토큰은
+          <strong>관리자 웹의 매장 관리 → POS 토큰</strong>에서 매장 담당자가 확인할 수 있습니다.
+          토큰이 노출됐거나 담당자가 바뀌면 관리자 웹에서 재발급(회전)한 뒤 여기에 새 토큰을
+          다시 입력해주세요.
+        </p>
+        <label class="sr-only" for="token-input">매장 인증 토큰</label>
+        <input
+          class="token-input"
+          id="token-input"
+          type="text"
+          inputmode="text"
+          autocomplete="off"
+          autocapitalize="off"
+          spellcheck="false"
+          placeholder="매장 토큰 붙여넣기"
+        />
+        <button class="token-submit" id="token-submit" type="button">확인</button>
+        <p class="token-error" id="token-error" role="alert" aria-live="assertive"></p>
       </div>
     </section>
 
-    <section aria-labelledby="queue-heading">
-      <div class="section-heading">
+    <div id="main-view" hidden>
+      <header class="topbar">
         <div>
-          <h2 id="queue-heading">대기 고객</h2>
-          <p id="last-updated">5초마다 자동 업데이트</p>
+          <span class="eyebrow">매장 대기관리</span>
+          <h1>정비 대기열</h1>
         </div>
-        <button class="refresh-button" id="refresh-button" type="button" aria-label="대기열 새로고침">↻</button>
-      </div>
-      <div class="list" id="list"></div>
-    </section>
+        <div class="store-status">
+          <span class="connection-dot checking" id="connection-dot" aria-hidden="true"></span>
+          <span id="store-name">매장 확인 중</span>
+          <button class="token-reset-button" id="token-reset-button" type="button">토큰 재설정</button>
+        </div>
+      </header>
 
-    <div class="hint">
-      <span class="hint-mark" aria-hidden="true">i</span>
-      <p>호출 또는 완료는 버튼을 한 번 누른 뒤 3초 안에 같은 버튼을 한 번 더 눌러 확정합니다.</p>
+      <section class="summary" aria-label="대기열 요약">
+        <div class="summary-card primary">
+          <span class="summary-label">현재 대기</span>
+          <strong class="summary-value" id="waiting-count">0</strong><span class="summary-unit">명</span>
+          <span class="summary-note">아직 호출되지 않은 고객</span>
+        </div>
+        <div class="summary-card">
+          <span class="summary-label">다음 호출</span>
+          <strong class="summary-value" id="next-number">—</strong>
+          <span class="summary-note">가장 먼저 호출할 번호</span>
+        </div>
+      </section>
+
+      <section aria-labelledby="queue-heading">
+        <div class="section-heading">
+          <div>
+            <h2 id="queue-heading">대기 고객</h2>
+            <p id="last-updated">5초마다 자동 업데이트</p>
+          </div>
+          <button class="refresh-button" id="refresh-button" type="button" aria-label="대기열 새로고침">↻</button>
+        </div>
+        <div class="list" id="list"></div>
+      </section>
+
+      <div class="hint">
+        <span class="hint-mark" aria-hidden="true">i</span>
+        <p>호출·완료·취소는 버튼을 한 번 누른 뒤 3초 안에 같은 버튼을 한 번 더 눌러 확정합니다. 취소는 노쇼 등으로 대기열에서 뺄 때 사용하며 되돌릴 수 없습니다.</p>
+      </div>
     </div>
     <p class="sr-only" id="page-status" role="status" aria-live="polite"></p>
   </main>

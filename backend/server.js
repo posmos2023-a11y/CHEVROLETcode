@@ -3,8 +3,11 @@ const express = require('express')
 const cors = require('cors')
 const rateLimit = require('express-rate-limit')
 const path = require('node:path')
+const crypto = require('node:crypto')
 const {
   prisma,
+  kstDateString,
+  kstDateRangeUtc,
   ensureDefaultStore,
   ensureDefaultHqAdmin,
   bulkCreateStores,
@@ -12,31 +15,45 @@ const {
   findAdminUserByEmail,
   createAdminUser,
   markAdminLogin,
+  recordFailedLogin,
   createStore,
   listStores,
   getStore,
   findStoreByMerchantId,
+  findStoreByPosToken,
+  rotatePosToken,
   createReservation,
-  listReservations,
+  listReservationsPage,
+  listActiveQueueForStore,
   getNextWaitingReservation,
   getReservation,
   deleteReservation,
   markReservationCalled,
+  markReservationCalledFromNotifyFailed,
   markReservationCompleted,
   markReservationNotifyFailed,
+  markReservationCancelled,
   findLatestReservationByPhone,
   createPayment,
   findPaymentByKey,
+  getPayment,
   markPaymentStatus,
-  listPayments,
+  markPaymentReceiptRetrying,
+  listPaymentsPage,
   claimDuePromotions,
   markPromoSent,
   releasePromoClaim,
+  purgeExpiredPersonalData,
 } = require('./src/store')
 const { PostgresRateLimitStore } = require('./src/rateLimitStore')
 const logger = require('./src/logger')
 const solapi = require('./src/solapi')
 const { hashPassword, verifyPassword, signAdminToken, verifyAdminToken } = require('./src/auth')
+const { securityHeaders } = require('./src/securityHeaders')
+
+// --- 부팅 가드 (계약 §10) ---
+// production에서 없으면 안 되는 값은 throw로 배포 자체를 막는다(서버가 뜨지 않아야 사고를 막는다).
+// 없어도 기능 일부만 제한되는 값(SOLAPI/PROMOTION_JOB_TOKEN/ADMIN_ALLOWED_ORIGINS)은 경고만 남긴다.
 
 // JWT_SECRET이 없으면(로컬 개발) 매 부팅마다 랜덤 값을 생성한다 — 서버를 재시작하면
 // 이전 로그인 토큰은 전부 무효화되지만(재로그인 필요), 로컬 개발엔 문제없다.
@@ -45,17 +62,93 @@ if (!process.env.JWT_SECRET && process.env.NODE_ENV === 'production') {
   throw new Error('운영 환경에서는 JWT_SECRET을 반드시 설정해야 합니다.')
 }
 if (!process.env.JWT_SECRET) {
-  process.env.JWT_SECRET = require('node:crypto').randomBytes(32).toString('hex')
+  process.env.JWT_SECRET = crypto.randomBytes(32).toString('hex')
   logger.warn('[auth] JWT_SECRET이 설정되지 않아 임시 값으로 발급합니다.', { environment: process.env.NODE_ENV || 'development' })
 }
 
+// TOSS_WEBHOOK_SECRET 없이 운영에 올라가면 서명 검증 없이 결제 웹훅을 받게 된다 — 누구나 위조된
+// "결제 승인" 이벤트를 보내 가짜 결제 기록을 만들 수 있는 심각한 문제라, 아예 부팅을 막는다
+// (계약 §3.23-1, §10). 로컬 개발(NODE_ENV != production)에서는 비워둬도 되며, 그 경우
+// 웹훅 핸들러가 서명 검증을 건너뛰고 경고 로그만 남긴다.
+if (process.env.NODE_ENV === 'production' && !process.env.TOSS_WEBHOOK_SECRET) {
+  throw new Error('운영 환경에서는 TOSS_WEBHOOK_SECRET을 반드시 설정해야 합니다.')
+}
+
+if (process.env.NODE_ENV === 'production') {
+  if (!process.env.SOLAPI_API_KEY || !process.env.SOLAPI_API_SECRET || !process.env.SOLAPI_SENDER) {
+    logger.warn('[boot] SOLAPI_API_KEY/SOLAPI_API_SECRET/SOLAPI_SENDER 중 일부가 설정되지 않았습니다. 알림톡 발송이 모두 실패합니다.')
+  }
+  if (!process.env.PROMOTION_JOB_TOKEN) {
+    logger.warn('[boot] PROMOTION_JOB_TOKEN이 설정되지 않았습니다. /internal/jobs/* 엔드포인트가 항상 503을 반환합니다.')
+  }
+  if (!process.env.ADMIN_ALLOWED_ORIGINS) {
+    logger.warn('[boot] ADMIN_ALLOWED_ORIGINS이 설정되지 않아 관리자 API를 모든 오리진에 허용합니다.')
+  }
+}
+
 const app = express()
+app.disable('x-powered-by')
+
 // Render/GCP(Cloud Run 등) 모두 로드밸런서 뒤에서 X-Forwarded-For를 붙여 전달한다.
 // trust proxy를 설정하지 않으면 express-rate-limit이 개별 클라이언트가 아니라
 // 매장 전체 트래픽을 하나로 묶어 레이트리밋을 적용해버린다. 홉 수는 배포 플랫폼마다
 // 다를 수 있어 하드코딩하지 않고 TRUST_PROXY_HOPS로 뺀다 (기본 1홉: 대부분의 PaaS 로드밸런서).
 app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS ?? 1))
-app.use(cors())
+app.use(securityHeaders)
+
+// --- CORS 설정 (계약 §8) ---
+// 손님/POS 단말기는 토스 결제 단말기 내장 브라우저 등 매번 다른 로컬 오리진에서 접근하므로
+// Origin 검증 자체가 불가능하다 — 전체 허용을 유지한다.
+const publicCors = cors()
+
+// 관리자 화면은 우리가 배포한 오리진에서만 열려야 한다. ADMIN_ALLOWED_ORIGINS(콤마 구분)가
+// 설정돼 있으면 그 목록으로 제한해, 토큰이 유출돼도 다른 사이트에서 관리자 API를 끌어쓰지
+// 못하게 막는다. 미설정이면(로컬 개발 등) 기존처럼 전체 허용한다(부팅 경고는 위에서 이미 남김).
+const adminAllowedOrigins = (process.env.ADMIN_ALLOWED_ORIGINS || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean)
+
+const adminCors = cors(
+  adminAllowedOrigins.length
+    ? {
+        origin(origin, callback) {
+          // Origin 헤더가 없는 요청(서버-투-서버 호출, curl, 같은-오리진 요청 등)은 브라우저의
+          // CORS 검증 대상이 아니므로 통과시킨다 — 여기서 막아도 보안상 의미가 없다(위조 가능).
+          if (!origin || adminAllowedOrigins.includes(origin)) return callback(null, true)
+          return callback(new Error('CORS로 허용되지 않은 오리진입니다.'))
+        },
+      }
+    : {}
+)
+
+// /api/reservations, /api/payments는 같은 경로를 손님용 POST(전체 허용)와 관리자용
+// GET(오리진 제한)이 함께 쓴다. 브라우저 preflight(OPTIONS)는 실제 메서드를 담은
+// Access-Control-Request-Method 헤더를 보내주므로, 그 값을 보고 어떤 CORS 정책을 적용할지 고른다.
+function methodAwarePreflight(policyByMethod, fallbackPolicy) {
+  return (req, res, next) => {
+    const requestedMethod = (req.get('access-control-request-method') || '').toUpperCase()
+    const policy = policyByMethod[requestedMethod] || fallbackPolicy
+    return policy(req, res, next)
+  }
+}
+
+// /api/admin/* 전체(로그인 포함)와 JWT가 필요한 나머지 라우트에 관리자 CORS 정책을 건다.
+// app.use는 해당 경로 프리픽스의 모든 HTTP 메서드(OPTIONS 포함)에 매칭되므로 preflight도
+// 자동으로 처리된다. /api/reservations/:id/..., /api/payments/:id/...처럼 파라미터가 있는
+// 마운트는 그 하위 경로(예: /api/reservations/:id/call, /api/reservations/failed)까지 덮는다 —
+// 이 두 베이스 경로 아래에는 손님용 공개 라우트가 없으므로 안전하게 전체를 관리자 정책으로 묶을 수 있다.
+app.use('/api/admin', adminCors)
+app.use('/api/queue', adminCors)
+app.use('/api/reservations/:id', adminCors)
+app.use('/api/payments/:id', adminCors)
+app.options('/api/reservations', methodAwarePreflight({ GET: adminCors }, publicCors))
+app.options('/api/payments', methodAwarePreflight({ GET: adminCors }, publicCors))
+
+// POS 탭앱/웹훅은 항상 전체 허용(§8).
+app.use('/api/pos', publicCors)
+app.use('/api/webhooks', publicCors)
+
 // 웹훅 서명 검증(HMAC)은 재직렬화한 JSON이 아니라 원본 바이트가 필요해서, verify 훅으로
 // req.rawBody에 원본을 남겨둔다 (POST /api/webhooks/toss/payment에서 사용).
 app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf } }))
@@ -68,6 +161,15 @@ app.use(express.static(path.join(__dirname, 'public')))
 app.use('/toss-plugin', express.static(path.join(__dirname, '..', 'front-plugin')))
 app.use('/pos-plugin', express.static(path.join(__dirname, '..', 'pos-plugin', 'dist')))
 
+// 모든 async 라우트 핸들러/미들웨어를 이걸로 감싼다. 안 감싸면 async 함수 안에서 던진 예외가
+// Express 4의 기본 에러 처리 경로를 타지 않고 unhandledRejection으로 새어나가 프로세스가
+// 죽을 수 있다(계약 §5) — 실제로 notifyQueueTurn이 명시적으로 throw하는데 이걸 부르는
+// 라우트 3곳(POST /api/queue/call-next, /api/reservations/:id/call, /api/pos/queue/:id/call)이
+// try/catch 없이 호출하고 있어서 예약이 이미 called인데 알림 실패 처리 중 등 특정 타이밍에
+// 서버 전체가 재시작되는 사고로 이어질 수 있었다. asyncHandler + 아래 4-arity 에러 핸들러가
+// 이 클래스의 버그 전체를 한 번에 막는다.
+const asyncHandler = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next)
+
 const CAR_NUMBER_RE = /^\d{2,3}[가-힣]\d{4}$/
 const PHONE_RE = /^01[0-9]{8,9}$/
 
@@ -79,6 +181,41 @@ const SERVICE_TYPES = {
   battery: '배터리 교체',
   brake: '브레이크 정비',
   etc: '기타 수리·상담',
+}
+
+const RESERVATION_STATUSES = new Set(['waiting', 'called', 'notify_failed', 'completed', 'cancelled'])
+const PAYMENT_STATUSES = new Set(['requested', 'receipt_sent', 'receipt_failed', 'cancelled'])
+
+// 목록 조회 쿼리파라미터(date/status/limit/offset) 공통 파싱. 잘못된 값은 에러를 내는 대신
+// 조용히 기본값/무시로 처리한다 — 관리자 화면 필터 UI가 실수로 이상한 값을 보내도 500이 아니라
+// "필터 없이 전체"로 동작하는 편이 운영 중 더 안전하다.
+function parseStatusFilter(raw, allowed) {
+  if (!raw) return null
+  const list = String(raw).split(',').map((s) => s.trim()).filter((s) => allowed.has(s))
+  return list.length ? list : null
+}
+function parseLimit(raw) {
+  const n = Number(raw)
+  if (!Number.isFinite(n)) return 100
+  return Math.min(Math.max(Math.trunc(n), 1), 500)
+}
+function parseOffset(raw) {
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n < 0) return 0
+  return Math.trunc(n)
+}
+function parseKstDate(raw) {
+  const s = String(raw || '').trim()
+  return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : null
+}
+
+// POS 화면은 순번 호출용이라 손님 전화번호 원본이 필요 없다 — 대기실 화면을 스치듯 보는 다른
+// 손님에게 노출될 수 있으므로 마스킹해서 내려준다(계약 §3.13). 표준(010 + 7~8자리)과 자리수가
+// 안 맞는 값은 부분적으로 어설프게 노출하느니 전부 가린다.
+function maskPhone(phone) {
+  const digits = String(phone || '').replace(/\D/g, '')
+  if (digits.length < 9 || digits.length > 11) return '010-****-****'
+  return `${digits.slice(0, 3)}-****-${digits.slice(-4)}`
 }
 
 // Design Ref: docs/02-design/features/multi-store-support.design.md Phase 3
@@ -115,8 +252,8 @@ function resolveScopedStoreId(req) {
   return String(req.query?.storeId ?? '').trim() || undefined
 }
 
-// call/complete/delete처럼 :id로 특정 예약을 조작하는 라우트에서, store_admin이 다른 매장의
-// 예약을 건드리지 못하도록 막는다. hq_admin은 항상 통과.
+// call/complete/cancel/delete처럼 :id로 특정 예약을 조작하는 라우트에서, store_admin이 다른
+// 매장의 예약을 건드리지 못하도록 막는다. hq_admin은 항상 통과.
 function assertOwnsReservation(req, res, reservation) {
   if (req.admin.role === 'store_admin' && reservation.storeId !== req.admin.storeId) {
     res.status(403).json({ ok: false, error: '다른 매장의 예약입니다.' })
@@ -125,10 +262,20 @@ function assertOwnsReservation(req, res, reservation) {
   return true
 }
 
+function assertOwnsPayment(req, res, payment) {
+  if (req.admin.role === 'store_admin' && payment.storeId !== req.admin.storeId) {
+    res.status(403).json({ ok: false, error: '다른 매장의 결제입니다.' })
+    return false
+  }
+  return true
+}
+
 // 토스 SDK가 단말기에서 넘겨주는 merchant.id를 우리 내부 store(가맹점) 레코드로 변환한다.
 // 등록되지 않은 merchantId면(=본사가 아직 이 매장을 승인 안 함) null을 반환한다.
 // 요청 바디의 merchantId를 필수로 강제해 여러 매장 데이터가 서로 섞이는 걸 서버단에서 막는다.
-async function requireStore(req, res, next) {
+// 손님용 공개 API(예약/결제)는 계약 §2.3에 따라 여전히 이 방식을 쓴다 — 키오스크 특성상
+// 손님 개인을 인증할 방법이 없어 merchantId가 유일한 신뢰 경계다.
+const requireStore = asyncHandler(async (req, res, next) => {
   const merchantId = req.body?.merchantId ?? req.query?.merchantId
   if (merchantId === undefined || merchantId === null || merchantId === '') {
     return res.status(400).json({ ok: false, error: '가맹점 정보(merchantId)가 없습니다.' })
@@ -142,7 +289,28 @@ async function requireStore(req, res, next) {
   }
   req.store = store
   next()
-}
+})
+
+// POS 탭앱 인증(계약 §2.2, 가장 중요한 변경). merchantId는 더 이상 POS 라우트의 인증 수단이
+// 아니다(보내도 무시) — 매장별로 발급된 X-Store-Token(64자 hex, Store.posToken)만 신뢰한다.
+// merchantId 방식은 매장 단말기 안에서 SDK가 자동으로 실어주는 값이라 탈취/위조가 쉬운데,
+// POS 탭앱은 대기열의 손님 전화번호(부분 마스킹이라도)와 호출/완료/취소 같은 상태 변경 권한을
+// 가지므로 훨씬 강한 인증이 필요하다.
+const requireStoreToken = asyncHandler(async (req, res, next) => {
+  const token = String(req.get('x-store-token') || '').trim()
+  if (!token) {
+    return res.status(401).json({ ok: false, error: '매장 인증 토큰이 필요합니다.', code: 'STORE_TOKEN_REQUIRED' })
+  }
+  const store = await findStoreByPosToken(token)
+  if (!store) {
+    return res.status(401).json({ ok: false, error: '매장 인증 토큰이 올바르지 않습니다.', code: 'INVALID_STORE_TOKEN' })
+  }
+  if (store.status !== 'active') {
+    return res.status(403).json({ ok: false, error: '비활성화된 가맹점입니다.' })
+  }
+  req.store = store
+  next()
+})
 
 // --- 관리자 인증 ---
 const adminLoginLimiter = rateLimit({
@@ -154,7 +322,10 @@ const adminLoginLimiter = rateLimit({
   message: { ok: false, error: '요청이 너무 많습니다. 잠시 후 다시 시도해주세요.' },
 })
 
-app.post('/api/admin/login', adminLoginLimiter, async (req, res) => {
+// 계정 잠금(계약 §3.22): IP 기준 레이트리밋과 별개로, 같은 "계정"에 대한 비밀번호 실패가
+// 5회 쌓이면 15분간 그 계정으로는 로그인 자체를 막는다. IP 레이트리밋만으로는 공격자가 여러 IP를
+// 돌려가며(혹은 낮은 빈도로) 한 계정을 크리덴셜 스터핑하는 걸 못 막기 때문이다.
+app.post('/api/admin/login', adminLoginLimiter, asyncHandler(async (req, res) => {
   const email = String(req.body?.email ?? '').trim().toLowerCase()
   const password = String(req.body?.password ?? '')
   if (!email || !password) {
@@ -162,27 +333,38 @@ app.post('/api/admin/login', adminLoginLimiter, async (req, res) => {
   }
 
   const admin = await findAdminUserByEmail(email)
-  if (!admin || !(await verifyPassword(password, admin.passwordHash))) {
+  if (!admin) {
+    // 존재하지 않는 이메일은 계정 존재 여부가 새어나가지 않도록 기존과 동일하게 401만 반환한다.
+    return res.status(401).json({ ok: false, error: '이메일 또는 비밀번호가 올바르지 않습니다.' })
+  }
+
+  if (admin.lockedUntil && admin.lockedUntil.getTime() > Date.now()) {
+    return res.status(423).json({ ok: false, error: '로그인 시도가 너무 많습니다. 15분 후 다시 시도해주세요.' })
+  }
+
+  if (!(await verifyPassword(password, admin.passwordHash))) {
+    await recordFailedLogin(admin.id)
     return res.status(401).json({ ok: false, error: '이메일 또는 비밀번호가 올바르지 않습니다.' })
   }
 
   await markAdminLogin(admin.id)
   const token = signAdminToken(admin)
   return res.json({ ok: true, token, role: admin.role, storeId: admin.storeId, email: admin.email })
-})
+}))
 
-// 로그인한 관리자 본인 정보 (역할/소속 매장). store_admin이 자기 매장의 merchantId를 알아야
-// 테스트 예약 등록 같은 매장-스코프 액션을 할 수 있어서, 이 매장 조회는 role 제한 없이 허용한다.
-app.get('/api/admin/me', requireAuth, async (req, res) => {
+// 로그인한 관리자 본인 정보 (역할/소속 매장). store_admin이 자기 매장의 merchantId/posToken을 알아야
+// 테스트 예약 등록이나 POS 탭앱 토큰 입력 같은 매장-스코프 액션을 할 수 있어서, 이 매장 조회는
+// role 제한 없이 허용한다(store 안에 posToken이 포함되지만 어차피 "자기 매장"의 값이라 안전하다).
+app.get('/api/admin/me', requireAuth, asyncHandler(async (req, res) => {
   let store = null
   if (req.admin.storeId) {
     store = await getStore(req.admin.storeId)
   }
   return res.json({ ok: true, id: req.admin.id, email: req.admin.email, role: req.admin.role, store })
-})
+}))
 
 // 매장 관리자 계정 발급 (본사 전용). merchantId로 매장을 찾아 그 매장에 스코프된 계정을 만든다.
-app.post('/api/admin/store-admins', requireAuth, requireRole('hq_admin'), async (req, res) => {
+app.post('/api/admin/store-admins', requireAuth, requireRole('hq_admin'), asyncHandler(async (req, res) => {
   const email = String(req.body?.email ?? '').trim().toLowerCase()
   const password = String(req.body?.password ?? '')
   const merchantId = String(req.body?.merchantId ?? '').trim()
@@ -204,7 +386,7 @@ app.post('/api/admin/store-admins', requireAuth, requireRole('hq_admin'), async 
   const passwordHash = await hashPassword(password)
   const admin = await createAdminUser({ email, passwordHash, role: 'store_admin', storeId: store.id })
   return res.json({ ok: true, admin: { id: admin.id, email: admin.email, role: admin.role, storeId: admin.storeId } })
-})
+}))
 
 const reservationLimiter = rateLimit({
   windowMs: 10 * 60 * 1000,
@@ -224,22 +406,10 @@ const paymentLimiter = rateLimit({
   message: { ok: false, error: '요청이 너무 많습니다. 잠시 후 다시 시도해주세요.' },
 })
 
-// 대기중인 예약을 호출 처리하고 "순서입니다" 알림톡을 보낸다.
-// 예약 접수 자체는 호출로 취급하지 않으며, 관리자/POS의 수동 호출 API에서만 이 함수를 쓴다.
-// DB 업데이트와 별개로, 호출부(server.js)가 응답 본문을 만들 때 쓰는 로컬 reservation 객체의
-// status도 함께 갱신해준다 — 인메모리 시절엔 같은 객체를 참조해서 자동으로 반영됐지만
-// Prisma는 매번 새 객체를 반환하므로 명시적으로 맞춰줘야 한다.
-async function notifyQueueTurn(reservation) {
-  const called = await markReservationCalled(reservation.id)
-  if (!called) {
-    const current = await getReservation(reservation.id)
-    if (current && ['called', 'notify_failed', 'completed'].includes(current.status)) {
-      reservation.status = current.status
-      return { changed: false, status: current.status }
-    }
-    throw new Error('대기중인 예약이 아니거나 이미 삭제되었습니다.')
-  }
-  reservation.status = 'called'
+// 대기중인 예약을 호출 처리하고 "순서입니다" 알림톡을 보낸다. status를 'called'로 바꾸는 것과
+// 알림 발송은 최초 호출(notifyQueueTurn)과 재발송(retry-notify) 두 지점에서 공유하므로
+// sendQueueTurnAndSync로 분리했다 — 발송 실패 시 notify_failed로 되돌리는 로직도 공유한다.
+async function sendQueueTurnAndSync(reservation) {
   try {
     await solapi.sendQueueTurnAlimtalk({
       phone: reservation.phone,
@@ -250,6 +420,7 @@ async function notifyQueueTurn(reservation) {
       storeId: reservation.storeId,
       reservationId: reservation.id,
     })
+    return { sent: true, status: 'called' }
   } catch (notifyError) {
     logger.error('순서 알림톡 발송 실패', {
       reservationId: reservation.id,
@@ -257,83 +428,95 @@ async function notifyQueueTurn(reservation) {
       error: notifyError.message,
     })
     const failed = await markReservationNotifyFailed(reservation.id)
-    reservation.status = failed?.status || (await getReservation(reservation.id))?.status || 'notify_failed'
+    return { sent: false, status: failed?.status || 'notify_failed' }
   }
-  return { changed: true, status: reservation.status }
+}
+
+// 예약 접수 자체는 호출로 취급하지 않으며, 관리자/POS의 수동 호출 API에서만 이 함수를 쓴다.
+// DB 업데이트와 별개로, 호출부(server.js)가 응답 본문을 만들 때 쓰는 로컬 reservation 객체의
+// status도 함께 갱신해준다 — 인메모리 시절엔 같은 객체를 참조해서 자동으로 반영됐지만
+// Prisma는 매번 새 객체를 반환하므로 명시적으로 맞춰줘야 한다.
+// ⚠️ 이 함수는 markReservationCalled가 실패하면(=이미 다른 상태) Error를 던진다. 호출부가
+// asyncHandler로 감싸져 있지 않으면 이 throw가 unhandledRejection으로 새어나가 프로세스가
+// 죽을 수 있었다(계약 §5) — 지금은 이 함수를 부르는 3개 라우트 전부 asyncHandler로 감쌌다.
+async function notifyQueueTurn(reservation) {
+  const called = await markReservationCalled(reservation.id)
+  if (!called) {
+    const current = await getReservation(reservation.id)
+    if (current && ['called', 'notify_failed', 'completed', 'cancelled'].includes(current.status)) {
+      reservation.status = current.status
+      return { changed: false, status: current.status }
+    }
+    throw new Error('대기중인 예약이 아니거나 이미 삭제되었습니다.')
+  }
+  reservation.status = 'called'
+  const outcome = await sendQueueTurnAndSync(reservation)
+  reservation.status = outcome.status
+  return { changed: true, status: outcome.status }
 }
 
 // --- 예약(대기순번) ---
 // 차량번호 + 전화번호를 등록하고 대기번호를 발급한다.
-// "앞에 몇 명 있는지"는 status가 'completed'가 아닌(=아직 정비가 안 끝난) 예약 수로 센다.
+// "앞에 몇 명 있는지"는 오늘(serviceDate) 접수분 중 완료/취소가 아닌 예약 수로 센다.
 // 단순히 'waiting'만 세면, 이미 호출됐지만 아직 정비 중인 손님을 무시하고 대기인원을 잘못 계산한다
 // (정비 베이가 몇 개 비었는지는 모르니, 관리자가 /api/reservations/:id/complete로 "정비완료"를
 // 눌러줘야 그 손님이 앞에서 빠진다).
 // 예약 접수 시에는 앞에 사람이 없더라도 항상 waiting 상태로 두고 접수 알림톡만 보낸다.
 // 실제 호출은 직원이 POS/관리자 화면에서 명시적으로 눌렀을 때만 발생한다.
-app.post('/api/reservations', reservationLimiter, requireStore, async (req, res) => {
+app.post('/api/reservations', publicCors, reservationLimiter, requireStore, asyncHandler(async (req, res) => {
+  const storeId = req.store.id
+  const carNumber = String(req.body?.carNumber ?? '').trim()
+  const phone = String(req.body?.phone ?? '').replace(/-/g, '').trim()
+  const serviceTypeKey = String(req.body?.serviceType ?? '').trim()
+
+  if (!CAR_NUMBER_RE.test(carNumber)) {
+    return res.status(400).json({ ok: false, error: '차량번호 형식이 올바르지 않습니다. 예) 12가3456' })
+  }
+  if (!PHONE_RE.test(phone)) {
+    return res.status(400).json({ ok: false, error: '전화번호 형식이 올바르지 않습니다.' })
+  }
+  if (!SERVICE_TYPES[serviceTypeKey]) {
+    return res.status(400).json({ ok: false, error: '정비 항목을 선택해주세요.' })
+  }
+  const serviceType = SERVICE_TYPES[serviceTypeKey]
+
+  // 개인정보보호법 제15조: 수집·이용 동의 없이는 접수 자체를 막는다(계약 §3.1). 광고 수신
+  // 동의(marketingConsent)는 선택 항목이라 false/누락이어도 접수는 진행하되, 그 손님은 나중에
+  // claimDuePromotions가 marketingConsentAt IS NOT NULL만 대상으로 하므로 자동으로 프로모션
+  // 발송 대상에서 빠진다(계약 §4).
+  if (req.body?.privacyConsent !== true) {
+    return res.status(400).json({ ok: false, error: '개인정보 수집·이용에 동의해주세요.' })
+  }
+  const consentAt = new Date()
+  const privacyConsentAt = consentAt
+  const marketingConsentAt = req.body?.marketingConsent === true ? consentAt : null
+
+  const idempotencyKey = String(req.get('idempotency-key') || '').trim() || null
+  if (idempotencyKey && idempotencyKey.length > 200) {
+    return res.status(400).json({ ok: false, error: 'Idempotency-Key가 너무 깁니다.' })
+  }
+
+  let reservation, peopleAhead, duplicate
   try {
-    const storeId = req.store.id
-    const carNumber = String(req.body?.carNumber ?? '').trim()
-    const phone = String(req.body?.phone ?? '').replace(/-/g, '').trim()
-    const serviceTypeKey = String(req.body?.serviceType ?? '').trim()
-
-    if (!CAR_NUMBER_RE.test(carNumber)) {
-      return res.status(400).json({ ok: false, error: '차량번호 형식이 올바르지 않습니다. 예) 12가3456' })
-    }
-    if (!PHONE_RE.test(phone)) {
-      return res.status(400).json({ ok: false, error: '전화번호 형식이 올바르지 않습니다.' })
-    }
-    if (!SERVICE_TYPES[serviceTypeKey]) {
-      return res.status(400).json({ ok: false, error: '정비 항목을 선택해주세요.' })
-    }
-    const serviceType = SERVICE_TYPES[serviceTypeKey]
-
-    const idempotencyKey = String(req.get('idempotency-key') || '').trim() || null
-    if (idempotencyKey && idempotencyKey.length > 200) {
-      return res.status(400).json({ ok: false, error: 'Idempotency-Key가 너무 깁니다.' })
-    }
-    const { reservation, peopleAhead, duplicate } = await createReservation({
+    ;({ reservation, peopleAhead, duplicate } = await createReservation({
       storeId,
       carNumber,
       phone,
       serviceType,
       idempotencyKey,
-    })
-
-    if (duplicate) {
-      return res.json({
-        ok: true,
-        id: reservation.id,
-        queueNumber: reservation.queueNumber,
-        peopleAhead,
-        serviceType: reservation.serviceType,
-        status: reservation.status,
-        duplicate: true,
-      })
+      privacyConsentAt,
+      marketingConsentAt,
+    }))
+  } catch (e) {
+    logger.error('reservation error', { storeId, error: e.message, code: e.code })
+    if (e?.code === 'IDEMPOTENCY_KEY_CONFLICT') {
+      return res.status(409).json({ ok: false, error: e.message })
     }
+    // 계약 §5: 클라이언트에는 내부 에러 메시지(e.message)를 노출하지 않는다.
+    return res.status(500).json({ ok: false, error: '요청 처리 중 오류가 발생했습니다.' })
+  }
 
-    reservation.store = req.store // notifyQueueTurn/알림톡에서 #{매장명}으로 쓰기 위해 붙여둔다
-
-    try {
-      await solapi.sendReservationAlimtalk({
-        phone,
-        carNumber,
-        queueNumber: reservation.queueNumber,
-        peopleAhead,
-        serviceType,
-        storeName: req.store.name,
-        storeId,
-        reservationId: reservation.id,
-      })
-    } catch (notifyError) {
-      logger.error('예약 접수 알림 발송 실패', {
-        reservationId: reservation.id,
-        storeId,
-        error: notifyError.message,
-      })
-      // 접수 안내 알림 발송에 실패해도 손님은 여전히 대기중이므로 status는 바꾸지 않는다.
-    }
-
+  if (duplicate) {
     return res.json({
       ok: true,
       id: reservation.id,
@@ -341,19 +524,49 @@ app.post('/api/reservations', reservationLimiter, requireStore, async (req, res)
       peopleAhead,
       serviceType: reservation.serviceType,
       status: reservation.status,
+      serviceDate: reservation.serviceDate,
+      duplicate: true,
     })
-  } catch (e) {
-    logger.error('reservation error', { storeId: req.store?.id, error: e.message, code: e.code })
-    if (e?.code === 'IDEMPOTENCY_KEY_CONFLICT') {
-      return res.status(409).json({ ok: false, error: e.message })
-    }
-    return res.status(500).json({ ok: false, error: e.message })
   }
-})
 
-// 매장에서 다음 대기 고객을 호출한다 (관리자 전용). 대기중인 첫 건에 알림톡 발송.
+  reservation.store = req.store // notifyQueueTurn/알림톡에서 #{매장명}으로 쓰기 위해 붙여둔다
+
+  try {
+    await solapi.sendReservationAlimtalk({
+      phone,
+      carNumber,
+      queueNumber: reservation.queueNumber,
+      peopleAhead,
+      serviceType,
+      storeName: req.store.name,
+      storeId,
+      reservationId: reservation.id,
+    })
+  } catch (notifyError) {
+    logger.error('예약 접수 알림 발송 실패', {
+      reservationId: reservation.id,
+      storeId,
+      error: notifyError.message,
+    })
+    // 접수 안내 알림 발송에 실패해도 손님은 여전히 대기중이므로 status는 바꾸지 않는다.
+  }
+
+  return res.json({
+    ok: true,
+    id: reservation.id,
+    queueNumber: reservation.queueNumber,
+    peopleAhead,
+    serviceType: reservation.serviceType,
+    status: reservation.status,
+    serviceDate: reservation.serviceDate,
+  })
+}))
+
+// 매장에서 다음 대기 고객을 호출한다 (관리자 전용). 오늘(serviceDate) 접수분 중 대기중인 첫 건
+// (queueNumber 오름차순)에만 알림톡을 발송한다 — 어제 마감 이후 그대로 남아있던 waiting 건이
+// 실수로 다시 호출되는 걸 막기 위해 getNextWaitingReservation이 day-scope를 강제한다(계약 §3.6).
 // hq_admin은 ?storeId=를 지정해야 하고, store_admin은 자기 매장으로 자동 고정된다.
-app.post('/api/queue/call-next', requireAuth, async (req, res) => {
+app.post('/api/queue/call-next', requireAuth, asyncHandler(async (req, res) => {
   const storeId = resolveScopedStoreId(req)
   if (!storeId) {
     return res.status(400).json({ ok: false, error: 'storeId가 필요합니다.' })
@@ -366,11 +579,11 @@ app.post('/api/queue/call-next', requireAuth, async (req, res) => {
   const outcome = await notifyQueueTurn(reservation)
 
   return res.json({ ok: true, id: reservation.id, queueNumber: reservation.queueNumber, status: reservation.status, alreadyProcessed: !outcome.changed })
-})
+}))
 
 // 특정 예약을 대기열 순서와 무관하게 바로 호출한다 (관리자 전용).
 // 테스트로 만든 예약을 확인하거나, 예외적으로 순서를 건너뛰어야 할 때 쓴다.
-app.post('/api/reservations/:id/call', requireAuth, async (req, res) => {
+app.post('/api/reservations/:id/call', requireAuth, asyncHandler(async (req, res) => {
   const reservation = await getReservation(req.params.id)
   if (!reservation) {
     return res.status(404).json({ ok: false, error: '예약을 찾을 수 없습니다.' })
@@ -386,10 +599,50 @@ app.post('/api/reservations/:id/call', requireAuth, async (req, res) => {
   const outcome = await notifyQueueTurn(reservation)
 
   return res.json({ ok: true, id: reservation.id, queueNumber: reservation.queueNumber, status: reservation.status, alreadyProcessed: !outcome.changed })
-})
+}))
+
+// 손님 취소/노쇼 처리 (관리자 전용, 계약 §3.9 신규). waiting|called|notify_failed만 취소 가능.
+app.post('/api/reservations/:id/cancel', requireAuth, asyncHandler(async (req, res) => {
+  const existing = await getReservation(req.params.id)
+  if (!existing) {
+    return res.status(404).json({ ok: false, error: '예약을 찾을 수 없습니다.' })
+  }
+  if (!assertOwnsReservation(req, res, existing)) return
+  if (existing.status === 'cancelled') {
+    return res.json({ ok: true, id: existing.id, status: 'cancelled', alreadyCancelled: true })
+  }
+  if (existing.status === 'completed') {
+    return res.status(409).json({ ok: false, error: '이미 정비완료된 예약입니다.' })
+  }
+  const reservation = await markReservationCancelled(req.params.id)
+  if (!reservation) {
+    return res.status(409).json({ ok: false, error: '취소할 수 없는 상태의 예약입니다.' })
+  }
+  return res.json({ ok: true, id: reservation.id, status: reservation.status })
+}))
+
+// 순서 안내 알림톡 재발송 (관리자 전용, 계약 §3.10 신규). notify_failed 상태만 허용.
+// 성공하면 called로 되돌리고, 실패해도(HTTP 200으로) notify_failed를 유지한 채 sent:false로 알린다 —
+// 관리자가 "재발송이 요청 자체는 처리됐는데 이번에도 안 갔다"를 구분할 수 있어야 하기 때문이다.
+app.post('/api/reservations/:id/retry-notify', requireAuth, asyncHandler(async (req, res) => {
+  const existing = await getReservation(req.params.id)
+  if (!existing) {
+    return res.status(404).json({ ok: false, error: '예약을 찾을 수 없습니다.' })
+  }
+  if (!assertOwnsReservation(req, res, existing)) return
+  if (existing.status !== 'notify_failed') {
+    return res.status(409).json({ ok: false, error: '알림실패 상태의 예약만 재발송할 수 있습니다.' })
+  }
+  const reservation = await markReservationCalledFromNotifyFailed(existing.id)
+  if (!reservation) {
+    return res.status(409).json({ ok: false, error: '알림실패 상태의 예약만 재발송할 수 있습니다.' })
+  }
+  const outcome = await sendQueueTurnAndSync(reservation)
+  return res.json({ ok: true, id: reservation.id, status: outcome.status, sent: outcome.sent })
+}))
 
 // 예약을 삭제한다 (관리자 전용). 테스트 데이터 정리나 손님 취소 처리용.
-app.delete('/api/reservations/:id', requireAuth, async (req, res) => {
+app.delete('/api/reservations/:id', requireAuth, asyncHandler(async (req, res) => {
   const reservation = await getReservation(req.params.id)
   if (!reservation) {
     return res.status(404).json({ ok: false, error: '예약을 찾을 수 없습니다.' })
@@ -397,11 +650,11 @@ app.delete('/api/reservations/:id', requireAuth, async (req, res) => {
   if (!assertOwnsReservation(req, res, reservation)) return
   await deleteReservation(req.params.id)
   return res.json({ ok: true })
-})
+}))
 
 // 정비가 끝났음을 표시한다 (관리자 전용). 이걸 눌러야 이 손님이 "앞에 있는 사람" 계산에서 빠져서
 // 다음 예약의 대기인원 안내가 한 명 줄어든다.
-app.post('/api/reservations/:id/complete', requireAuth, async (req, res) => {
+app.post('/api/reservations/:id/complete', requireAuth, asyncHandler(async (req, res) => {
   const existing = await getReservation(req.params.id)
   if (!existing) {
     return res.status(404).json({ ok: false, error: '예약을 찾을 수 없습니다.' })
@@ -415,28 +668,47 @@ app.post('/api/reservations/:id/complete', requireAuth, async (req, res) => {
     return res.status(409).json({ ok: false, error: '호출완료 또는 알림실패 상태의 예약만 완료할 수 있습니다.' })
   }
   return res.json({ ok: true, id: reservation.id, status: reservation.status })
-})
+}))
 
-// 예약 목록 (관리자 화면용, 최신순). hq_admin은 ?storeId=로 특정 매장 필터/생략시 전체,
-// store_admin은 항상 자기 매장으로 고정된다.
-app.get('/api/reservations', requireAuth, async (req, res) => {
+// 예약 목록 (관리자 화면용). hq_admin은 ?storeId=로 특정 매장 필터/생략시 전체,
+// store_admin은 항상 자기 매장으로 고정된다. 페이지네이션 + 필터를 전부 DB에 위임한다(계약 §3.3) —
+// 정렬은 서버가 createdAt desc로 고정해서 내려주므로 클라이언트가 다시 뒤집을 필요가 없다
+// (예전엔 여기서 .reverse()를 했는데, 그러려면 매번 전체 로우를 메모리로 가져와야 했다).
+app.get('/api/reservations', adminCors, requireAuth, asyncHandler(async (req, res) => {
   const storeId = resolveScopedStoreId(req)
-  const all = (await listReservations(storeId)).reverse()
-  return res.json({ ok: true, count: all.length, reservations: all })
-})
+  const date = parseKstDate(req.query.date)
+  const statuses = parseStatusFilter(req.query.status, RESERVATION_STATUSES)
+  const limit = parseLimit(req.query.limit)
+  const offset = parseOffset(req.query.offset)
+  const { total, items } = await listReservationsPage({ storeId, date, statuses, limit, offset })
+  return res.json({ ok: true, count: items.length, total, hasMore: offset + items.length < total, reservations: items })
+}))
 
-// 알림톡 발송 실패 건 확인용 (임시).
-app.get('/api/reservations/failed', requireAuth, async (req, res) => {
+// 알림톡 발송 실패 건 확인용. status는 쿼리와 무관하게 항상 notify_failed로 고정한다(계약 §3.4).
+app.get('/api/reservations/failed', requireAuth, asyncHandler(async (req, res) => {
   const storeId = resolveScopedStoreId(req)
-  const failed = (await listReservations(storeId)).filter((r) => r.status === 'notify_failed')
-  return res.json({ ok: true, count: failed.length, reservations: failed })
-})
+  const date = parseKstDate(req.query.date)
+  const limit = parseLimit(req.query.limit)
+  const offset = parseOffset(req.query.offset)
+  const { total, items } = await listReservationsPage({ storeId, date, statuses: ['notify_failed'], limit, offset })
+  return res.json({ ok: true, count: items.length, total, hasMore: offset + items.length < total, reservations: items })
+}))
 
 // --- 토스 POS 탭앱(대기열 관리) 전용 엔드포인트 ---
-// 관리자 로그인(JWT) 없이 merchantId만으로 동작한다 — POS 탭앱은 매장 단말기 안에서
-// posPluginSdk.merchant.getMerchant()로 받은 merchantId를 자동으로 실어 보내므로,
-// 이미 공개 예약/결제 API가 쓰는 것과 같은 신뢰 모델(requireStore)을 그대로 재사용한다.
-// 대기중/호출됨/알림실패 상태만 보여준다(정비완료 건은 대기열에서 빠짐).
+// 계약 §2.2: merchantId가 아니라 X-Store-Token(requireStoreToken)으로 인증한다.
+// GET /api/pos/queue는 5초 폴링 대상이라 DB 기반 PostgresRateLimitStore 대신 express-rate-limit
+// 기본 메모리 스토어를 쓴다(계약 §9) — 이미 토큰 인증이 붙어 있어 인스턴스별 한도로 충분하고,
+// 폴링마다 DB round-trip을 추가로 만들 이유가 없다.
+const posQueueReadLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { ok: false, error: '요청이 너무 많습니다. 잠시 후 다시 시도해주세요.' },
+})
+
+// 호출/완료/취소처럼 상태를 바꾸는 POS 라우트는 폴링만큼 빈도가 높지 않고, 매장 전체(여러 탭앱
+// 인스턴스가 있을 수 있음) 기준의 정확한 한도가 더 의미 있어서 기존처럼 DB 기반 스토어를 유지한다.
 const posLimiter = rateLimit({
   windowMs: 60 * 1000,
   limit: 60,
@@ -446,20 +718,34 @@ const posLimiter = rateLimit({
   message: { ok: false, error: '요청이 너무 많습니다. 잠시 후 다시 시도해주세요.' },
 })
 
-app.get('/api/pos/queue', posLimiter, requireStore, async (req, res) => {
-  const all = await listReservations(req.store.id)
-  const active = all
-    .filter((r) => r.status !== 'completed')
-    .sort((a, b) => a.queueNumber - b.queueNumber)
-  return res.json({ ok: true, reservations: active })
-})
+// 오늘(KST) serviceDate + 아직 끝나지 않은 예약만, queueNumber 오름차순으로 보여준다(계약 §3.13).
+app.get('/api/pos/queue', posQueueReadLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  const serviceDate = kstDateString()
+  const reservations = await listActiveQueueForStore(req.store.id, serviceDate)
+  return res.json({
+    ok: true,
+    serviceDate,
+    storeName: req.store.name,
+    reservations: reservations.map((r) => ({
+      id: r.id,
+      queueNumber: r.queueNumber,
+      carNumber: r.carNumber,
+      serviceType: r.serviceType,
+      status: r.status,
+      phoneMasked: maskPhone(r.phone),
+      createdAt: r.createdAt,
+    })),
+  })
+}))
 
 // 특정 손님을 호출한다. POS 탭앱 쪽에서 "이 번호를 탭하면 바로 호출"이 되지 않도록
 // 반드시 명시적인 확인 동작(예: 2단계 확인 버튼) 뒤에만 이 엔드포인트를 호출해야 한다 —
 // 서버는 그 UX를 강제할 수 없으므로 프론트(탭앱) 쪽 책임이다.
-app.post('/api/pos/queue/:id/call', posLimiter, requireStore, async (req, res) => {
+// 해당 매장 + 오늘 serviceDate의 예약만 대상으로 한다(계약 §3.14) — 아니면 404.
+app.post('/api/pos/queue/:id/call', posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  const serviceDate = kstDateString()
   const reservation = await getReservation(req.params.id)
-  if (!reservation || reservation.storeId !== req.store.id) {
+  if (!reservation || reservation.storeId !== req.store.id || reservation.serviceDate !== serviceDate) {
     return res.status(404).json({ ok: false, error: '예약을 찾을 수 없습니다.' })
   }
   if (reservation.status !== 'waiting') {
@@ -470,11 +756,13 @@ app.post('/api/pos/queue/:id/call', posLimiter, requireStore, async (req, res) =
   }
   const outcome = await notifyQueueTurn(reservation)
   return res.json({ ok: true, id: reservation.id, status: reservation.status, alreadyProcessed: !outcome.changed })
-})
+}))
 
-app.post('/api/pos/queue/:id/complete', posLimiter, requireStore, async (req, res) => {
+// 해당 매장 + 오늘 serviceDate만 (계약 §3.15).
+app.post('/api/pos/queue/:id/complete', posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  const serviceDate = kstDateString()
   const existing = await getReservation(req.params.id)
-  if (!existing || existing.storeId !== req.store.id) {
+  if (!existing || existing.storeId !== req.store.id || existing.serviceDate !== serviceDate) {
     return res.status(404).json({ ok: false, error: '예약을 찾을 수 없습니다.' })
   }
   const reservation = await markReservationCompleted(req.params.id)
@@ -485,33 +773,65 @@ app.post('/api/pos/queue/:id/complete', posLimiter, requireStore, async (req, re
     return res.status(409).json({ ok: false, error: '호출완료 또는 알림실패 상태의 예약만 완료할 수 있습니다.' })
   }
   return res.json({ ok: true, id: reservation.id, status: reservation.status })
-})
+}))
+
+// 노쇼 손님을 대기열에서 빼는 용도 (계약 §3.16 신규). 형제 라우트(call/complete)와 동일하게
+// 해당 매장 + 오늘 serviceDate로 범위를 제한한다.
+app.post('/api/pos/queue/:id/cancel', posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  const serviceDate = kstDateString()
+  const existing = await getReservation(req.params.id)
+  if (!existing || existing.storeId !== req.store.id || existing.serviceDate !== serviceDate) {
+    return res.status(404).json({ ok: false, error: '예약을 찾을 수 없습니다.' })
+  }
+  if (existing.status === 'cancelled') {
+    return res.json({ ok: true, id: existing.id, status: 'cancelled', alreadyProcessed: true })
+  }
+  if (existing.status === 'completed') {
+    return res.status(409).json({ ok: false, error: '이미 정비완료된 예약입니다.' })
+  }
+  const reservation = await markReservationCancelled(req.params.id)
+  if (!reservation) {
+    return res.status(409).json({ ok: false, error: '취소할 수 없는 상태의 예약입니다.' })
+  }
+  return res.json({ ok: true, id: reservation.id, status: reservation.status })
+}))
 
 // --- 결제 (전자영수증 + 3개월 후 프로모션) ---
 // paymentKey(토스프론트 sdk.payment.requestPayment 호출 시 발급한 값)를 함께 보내면
 // 같은 결제건에 대해 클라이언트가 재시도해도 영수증이 중복 발송되지 않는다.
-app.post('/api/payments', paymentLimiter, requireStore, async (req, res) => {
+app.post('/api/payments', publicCors, paymentLimiter, requireStore, asyncHandler(async (req, res) => {
+  const storeId = req.store.id
+  const paymentKey = String(req.body?.paymentKey ?? '').trim() || null
+  const phone = String(req.body?.phone ?? '').replace(/-/g, '').trim()
+  const carNumberRaw = String(req.body?.carNumber ?? '').trim()
+  const amountRaw = req.body?.amount
+
+  if (!PHONE_RE.test(phone)) {
+    return res.status(400).json({ ok: false, error: '전화번호 형식이 올바르지 않습니다.' })
+  }
+  if (carNumberRaw && !CAR_NUMBER_RE.test(carNumberRaw)) {
+    return res.status(400).json({ ok: false, error: '차량번호 형식이 올바르지 않습니다. 예) 12가3456' })
+  }
+  let amount = null
+  if (amountRaw !== undefined && amountRaw !== null && amountRaw !== '') {
+    amount = Number(amountRaw)
+    // amount 컬럼은 Postgres Int(int4)다. 예전엔 Number.isFinite만 확인해서 소수점이 있는 값이나
+    // 2^31을 넘는 값이 그대로 통과해 실제 INSERT 시점에야 예외가 났다 — 손님은 이미 결제를 마친
+    // 뒤라 이 시점의 500은 매우 곤란하다(계약 §3.2). Number.isSafeInteger + 범위 체크로 미리 막는다.
+    if (!Number.isSafeInteger(amount) || amount < 0 || amount > 100000000) {
+      return res.status(400).json({ ok: false, error: '결제금액이 올바르지 않습니다.' })
+    }
+  }
+
+  if (req.body?.privacyConsent !== true) {
+    return res.status(400).json({ ok: false, error: '개인정보 수집·이용에 동의해주세요.' })
+  }
+  const consentAt = new Date()
+  const privacyConsentAt = consentAt
+  const marketingConsentAt = req.body?.marketingConsent === true ? consentAt : null
+
+  let payment
   try {
-    const storeId = req.store.id
-    const paymentKey = String(req.body?.paymentKey ?? '').trim() || null
-    const phone = String(req.body?.phone ?? '').replace(/-/g, '').trim()
-    const carNumberRaw = String(req.body?.carNumber ?? '').trim()
-    const amountRaw = req.body?.amount
-
-    if (!PHONE_RE.test(phone)) {
-      return res.status(400).json({ ok: false, error: '전화번호 형식이 올바르지 않습니다.' })
-    }
-    if (carNumberRaw && !CAR_NUMBER_RE.test(carNumberRaw)) {
-      return res.status(400).json({ ok: false, error: '차량번호 형식이 올바르지 않습니다. 예) 12가3456' })
-    }
-    let amount = null
-    if (amountRaw !== undefined && amountRaw !== null && amountRaw !== '') {
-      amount = Number(amountRaw)
-      if (!Number.isFinite(amount) || amount < 0) {
-        return res.status(400).json({ ok: false, error: '결제금액이 올바르지 않습니다.' })
-      }
-    }
-
     const existing = await findPaymentByKey(paymentKey)
     if (existing) {
       return res.json({ ok: true, id: existing.id, carNumber: existing.carNumber, serviceType: existing.serviceType })
@@ -524,57 +844,102 @@ app.post('/api/payments', paymentLimiter, requireStore, async (req, res) => {
     const carNumber = linkedReservation?.carNumber || carNumberRaw || null
     const serviceType = linkedReservation?.serviceType || null
 
-    const payment = await createPayment({ storeId, paymentKey, carNumber, serviceType, phone, amount })
-
-    try {
-      await solapi.sendReceiptAlimtalk({
-        phone,
-        carNumber: payment.carNumber,
-        serviceType: payment.serviceType,
-        amount: payment.amount,
-        storeName: req.store.name,
-        storeId,
-        paymentId: payment.id,
-      })
-      await markPaymentStatus(payment.id, 'receipt_sent')
-    } catch (notifyError) {
-      logger.error('전자영수증 발송 실패', {
-        paymentId: payment.id,
-        storeId,
-        error: notifyError.message,
-      })
-      await markPaymentStatus(payment.id, 'receipt_failed')
-      // 영수증 발송에 실패해도 결제/DB 적재 자체는 성공으로 처리한다
-    }
-
-    return res.json({ ok: true, id: payment.id, carNumber: payment.carNumber, serviceType: payment.serviceType })
+    payment = await createPayment({ storeId, paymentKey, carNumber, serviceType, phone, amount, privacyConsentAt, marketingConsentAt })
   } catch (e) {
-    logger.error('payment error', { storeId: req.store?.id, error: e.message, code: e.code })
-    return res.status(500).json({ ok: false, error: e.message })
+    logger.error('payment error', { storeId, error: e.message, code: e.code })
+    return res.status(500).json({ ok: false, error: '요청 처리 중 오류가 발생했습니다.' })
   }
-})
 
-// 결제 목록 (관리자 화면용, 최신순). hq_admin은 ?storeId=로 필터/생략시 전체, store_admin은 자기 매장 고정.
-app.get('/api/payments', requireAuth, async (req, res) => {
-  const storeId = resolveScopedStoreId(req)
-  const all = (await listPayments(storeId)).reverse()
-  return res.json({ ok: true, count: all.length, payments: all })
-})
+  try {
+    await solapi.sendReceiptAlimtalk({
+      phone,
+      carNumber: payment.carNumber,
+      serviceType: payment.serviceType,
+      amount: payment.amount,
+      storeName: req.store.name,
+      storeId,
+      paymentId: payment.id,
+    })
+    await markPaymentStatus(payment.id, 'receipt_sent')
+  } catch (notifyError) {
+    logger.error('전자영수증 발송 실패', {
+      paymentId: payment.id,
+      storeId,
+      error: notifyError.message,
+    })
+    await markPaymentStatus(payment.id, 'receipt_failed')
+    // 영수증 발송에 실패해도 결제/DB 적재 자체는 성공으로 처리한다
+  }
 
-app.get('/api/payments/failed', requireAuth, async (req, res) => {
+  return res.json({ ok: true, id: payment.id, carNumber: payment.carNumber, serviceType: payment.serviceType })
+}))
+
+// 결제 목록 (관리자 화면용). date는 createdAt의 KST 날짜 기준(계약 §3.5) — Payment에는 serviceDate가
+// 없으므로 kstDateRangeUtc로 하루 범위(UTC)를 계산해 createdAt 인덱스를 그대로 태운다.
+app.get('/api/payments', adminCors, requireAuth, asyncHandler(async (req, res) => {
   const storeId = resolveScopedStoreId(req)
-  const failed = (await listPayments(storeId)).filter((p) => p.status === 'receipt_failed')
-  return res.json({ ok: true, count: failed.length, payments: failed })
-})
+  const date = parseKstDate(req.query.date)
+  const statuses = parseStatusFilter(req.query.status, PAYMENT_STATUSES)
+  const limit = parseLimit(req.query.limit)
+  const offset = parseOffset(req.query.offset)
+  const range = date ? kstDateRangeUtc(date) : null
+  const { total, items } = await listPaymentsPage({ storeId, dateStart: range?.start, dateEnd: range?.end, statuses, limit, offset })
+  return res.json({ ok: true, count: items.length, total, hasMore: offset + items.length < total, payments: items })
+}))
+
+app.get('/api/payments/failed', requireAuth, asyncHandler(async (req, res) => {
+  const storeId = resolveScopedStoreId(req)
+  const date = parseKstDate(req.query.date)
+  const limit = parseLimit(req.query.limit)
+  const offset = parseOffset(req.query.offset)
+  const range = date ? kstDateRangeUtc(date) : null
+  const { total, items } = await listPaymentsPage({ storeId, dateStart: range?.start, dateEnd: range?.end, statuses: ['receipt_failed'], limit, offset })
+  return res.json({ ok: true, count: items.length, total, hasMore: offset + items.length < total, payments: items })
+}))
+
+// 전자영수증 재발송 (관리자 전용, 계약 §3.11 신규). receipt_failed 상태만 허용.
+app.post('/api/payments/:id/retry-receipt', requireAuth, asyncHandler(async (req, res) => {
+  const existing = await getPayment(req.params.id)
+  if (!existing) {
+    return res.status(404).json({ ok: false, error: '결제를 찾을 수 없습니다.' })
+  }
+  if (!assertOwnsPayment(req, res, existing)) return
+  if (existing.status !== 'receipt_failed') {
+    return res.status(409).json({ ok: false, error: '영수증 발송 실패 상태의 결제만 재발송할 수 있습니다.' })
+  }
+  // markPaymentReceiptRetrying이 receipt_failed -> receipt_sent 전이를 원자적으로 낙관 처리한다
+  // (notifyQueueTurn/markReservationCalled와 같은 패턴) — 관리자 두 명이 거의 동시에 재발송
+  // 버튼을 눌러도 solapi 호출은 한 번만 나간다. 실패하면 markPaymentStatus로 되돌린다.
+  const claimed = await markPaymentReceiptRetrying(existing.id)
+  if (!claimed) {
+    return res.status(409).json({ ok: false, error: '영수증 발송 실패 상태의 결제만 재발송할 수 있습니다.' })
+  }
+  try {
+    await solapi.sendReceiptAlimtalk({
+      phone: claimed.phone,
+      carNumber: claimed.carNumber,
+      serviceType: claimed.serviceType,
+      amount: claimed.amount,
+      storeName: claimed.store?.name,
+      storeId: claimed.storeId,
+      paymentId: claimed.id,
+    })
+    return res.json({ ok: true, id: claimed.id, status: 'receipt_sent', sent: true })
+  } catch (notifyError) {
+    logger.error('전자영수증 재발송 실패', { paymentId: claimed.id, storeId: claimed.storeId, error: notifyError.message })
+    await markPaymentStatus(claimed.id, 'receipt_failed')
+    return res.json({ ok: true, id: claimed.id, status: 'receipt_failed', sent: false })
+  }
+}))
 
 // --- 가맹점(매장) 관리 (본사 관리자 전용) ---
 // 토스플레이스 개발자센터에서 발급된 merchant.id를 우리 store 레코드와 매핑해 등록한다.
 // 등록해야만 그 매장의 플러그인에서 온 예약/결제 요청이 통과된다 (requireStore 참고).
-app.get('/api/admin/stores', requireAuth, requireRole('hq_admin'), async (req, res) => {
+app.get('/api/admin/stores', requireAuth, requireRole('hq_admin'), asyncHandler(async (req, res) => {
   return res.json({ ok: true, stores: await listStores() })
-})
+}))
 
-app.post('/api/admin/stores', requireAuth, requireRole('hq_admin'), async (req, res) => {
+app.post('/api/admin/stores', requireAuth, requireRole('hq_admin'), asyncHandler(async (req, res) => {
   const merchantId = String(req.body?.merchantId ?? '').trim()
   const name = String(req.body?.name ?? '').trim()
   const businessNumber = String(req.body?.businessNumber ?? '').trim()
@@ -589,13 +954,14 @@ app.post('/api/admin/stores', requireAuth, requireRole('hq_admin'), async (req, 
     return res.status(409).json({ ok: false, error: '이미 등록된 merchantId입니다.' })
   }
 
+  // posToken은 createStore 내부에서 crypto.randomBytes(32)로 자동 생성된다(계약 §3.18).
   const store = await createStore({ merchantId, name, businessNumber })
   return res.json({ ok: true, store })
-})
+}))
 
 // Design Ref: Phase 4 대량 온보딩. body: { stores: [{ merchantId, name, businessNumber? }, ...] }
 // 항목별로 성공/실패를 나눠서 돌려준다 — 하나가 중복 merchantId라고 전체가 실패하지 않는다.
-app.post('/api/admin/stores/bulk', requireAuth, requireRole('hq_admin'), async (req, res) => {
+app.post('/api/admin/stores/bulk', requireAuth, requireRole('hq_admin'), asyncHandler(async (req, res) => {
   const items = Array.isArray(req.body?.stores) ? req.body.stores : null
   if (!items || !items.length) {
     return res.status(400).json({ ok: false, error: 'stores 배열이 필요합니다.' })
@@ -607,22 +973,91 @@ app.post('/api/admin/stores/bulk', requireAuth, requireRole('hq_admin'), async (
   const results = await bulkCreateStores(items)
   const successCount = results.filter((r) => r.ok).length
   return res.json({ ok: true, successCount, failCount: results.length - successCount, results })
-})
+}))
+
+// POS 토큰 회전 (본사 전용, 계약 §3.20 신규). 토큰 유출이 의심될 때 예전 토큰을 즉시 무효화하고
+// 새 토큰을 발급한다 — 매장 단말기는 새 토큰을 다시 입력받아야 한다(계약 §12).
+app.post('/api/admin/stores/:id/pos-token', requireAuth, requireRole('hq_admin'), asyncHandler(async (req, res) => {
+  const store = await rotatePosToken(req.params.id)
+  if (!store) {
+    return res.status(404).json({ ok: false, error: '매장을 찾을 수 없습니다.' })
+  }
+  return res.json({ ok: true, storeId: store.id, posToken: store.posToken })
+}))
 
 // --- 토스플레이스 결제 웹훅 (Phase 4, 백업 경로) ---
 // payment.html이 결제 성공 후 클라이언트에서 직접 POST /api/payments를 호출하는 게 기본 경로다.
 // 이 웹훅은 그 호출이 네트워크 문제 등으로 유실됐을 때를 대비한 보완 장치다.
-// ⚠️ 실제 등록은 개발자센터에서 자체 설정이 안 되고 developer-support@tossplace.com에 문의해야 한다.
+// ⚠️ TOSS_WEBHOOK_SECRET은 "토스페이먼츠 시크릿 키"(live_sk_.../test_sk_...)가 아니다. 이 프로젝트가
+// 연동하는 곳은 토스페이먼츠(PG)가 아니라 토스플레이스(단말기/POS)이고, 이 값은 토스플레이스가 우리
+// 서버로 보내는 웹훅의 HMAC 서명 검증에만 쓰인다. 개발자센터 -> 내 애플리케이션 -> OpenAPI -> 웹훅
+// 메뉴에서 직접 설정하며, 거기 넣은 값과 이 환경변수 값이 같아야 검증이 통과한다.
+// (예전 주석엔 "개발자센터에서 설정 불가, 메일 문의 필요"라고 적혀 있었으나 현재 문서 기준으로는 자체 설정 가능하다.)
 //
 // 2026-07-30 재검토(https://docs.tossplace.com/reference/open-api/webhook.html,
 // https://docs.tossplace.com/reference/open-api/payment.html)로 서명/페이로드 구조를 다음과 같이 확인·수정함:
 // - 서명: HMAC-SHA256(key=TOSS_WEBHOOK_SECRET, message=`${x-toss-timestamp}.${원본 raw body}`),
 //   hex 인코딩 후 `v1=` 접두사. x-toss-timestamp가 현재 시각과 너무 다르면 거부해야 한다.
 // - payload: `{ id, type, createdAt, merchantId, app, data: { payment: {...} } }` 형태
-//   (이전엔 `eventType`/`data.paymentKey`로 잘못 파싱하고 있었음).
+//   (이전엔 `eventType`/`data.paymentKey`로 잘못 파싱하고 있었음). merchantId는 최상위(body.merchantId)에도
+//   실릴 수 있어 data.payment.merchantId를 우선하고 없으면 최상위 값을 쓴다(계약 §3.23-2).
 // - ⚠️ 미확정 전제: client가 생성해 sdk.payment.requestPayment()에 넘긴 `paymentKey`는
 //   웹훅 payment.orderId와 1:1로 대응한다고 간주한다. 실제 결제 1~2건으로 배포 후 검증이 필요하다.
-app.post('/api/webhooks/toss/payment', async (req, res) => {
+async function processWebhookPayment(body, webhookId) {
+  const eventType = body?.type
+  const payment = body?.data?.payment || {}
+  const merchantId = payment.merchantId ?? body?.merchantId
+
+  if (eventType === 'payment.payment.approved.v1') {
+    const paymentKey = String(payment.orderId ?? '').trim() || null
+    const existing = await findPaymentByKey(paymentKey)
+    if (existing) {
+      console.log(`[webhook] 결제 승인 수신: 이미 기록된 결제 paymentKey=${paymentKey}`)
+      return
+    }
+    if (!paymentKey) {
+      logger.warn('[webhook] 결제 승인 수신: orderId가 없어 결제 레코드를 만들 수 없습니다.', { webhookId })
+      return
+    }
+    const store = await findStoreByMerchantId(merchantId)
+    if (!store) {
+      logger.warn('[webhook] 등록되지 않은 merchantId로 결제 반영을 건너뜁니다.', { webhookId, merchantId, paymentKey })
+      return
+    }
+    const amountRaw = payment.amount === undefined || payment.amount === null || payment.amount === '' ? null : Number(payment.amount)
+    const amount = Number.isSafeInteger(amountRaw) && amountRaw >= 0 && amountRaw <= 100000000 ? amountRaw : null
+    const recorded = await createPayment({
+      storeId: store.id,
+      paymentKey,
+      carNumber: null,
+      serviceType: null,
+      phone: null,
+      amount,
+    })
+    console.log(`[webhook] 결제 승인 백업 기록 생성: payment id=${recorded.id}, paymentKey=${paymentKey}`)
+    return
+  }
+
+  if (eventType === 'payment.payment.cancelled.v1') {
+    const paymentKey = String(payment.orderId ?? '').trim() || null
+    const existing = await findPaymentByKey(paymentKey)
+    if (!existing) {
+      logger.warn('[webhook] 결제 취소 수신: 매칭되는 결제가 없습니다.', { webhookId, merchantId, paymentKey })
+      return
+    }
+    const cancelled = await markPaymentStatus(existing.id, 'cancelled')
+    if (cancelled) {
+      logger.warn('[webhook] 결제 취소 반영', { webhookId, paymentId: existing.id, paymentKey })
+    } else {
+      logger.warn('[webhook] 결제 취소 수신: 상태 반영에 실패했습니다.', { webhookId, paymentId: existing.id, paymentKey })
+    }
+    return
+  }
+
+  console.log('[webhook] 처리 대상 아닌 이벤트:', eventType)
+}
+
+app.post('/api/webhooks/toss/payment', asyncHandler(async (req, res) => {
   const webhookId = req.get('x-toss-webhook-id')
   const signature = req.get('x-toss-signature')
   const timestamp = req.get('x-toss-timestamp')
@@ -636,7 +1071,6 @@ app.post('/api/webhooks/toss/payment', async (req, res) => {
     if (!timestamp || !signature) {
       return res.status(400).json({ ok: false, error: 'x-toss-timestamp/x-toss-signature 헤더가 없습니다.' })
     }
-    const crypto = require('node:crypto')
     const FIVE_MIN_MS = 5 * 60 * 1000
     const tsMs = Number(timestamp)
     if (!Number.isFinite(tsMs) || Math.abs(Date.now() - tsMs) > FIVE_MIN_MS) {
@@ -666,107 +1100,33 @@ app.post('/api/webhooks/toss/payment', async (req, res) => {
     return res.json({ ok: true, skipped: 'duplicate' })
   }
 
-  // 웹훅은 빠르게 2xx를 돌려줘야 토스가 재시도를 안 한다 — 무거운 처리는 응답 이후로 미룬다.
-  res.json({ ok: true })
-
+  // ⚠️ 순서 변경(계약 §3.23-3): 예전엔 여기서 바로 res.json({ok:true})을 보내고 본 처리를 응답
+  // 뒤로 미뤘는데, Cloud Run은 응답을 보낸 뒤 그 인스턴스의 CPU를 스로틀링(사실상 정지)한다 —
+  // 응답 후 await가 실행 중간에 멈춰버려 결제 반영이 유실될 수 있었다. 그래서 본 처리를 반드시
+  // 응답 *이전*에 끝내고, 처리 중 에러가 나면 이미 기록해둔 WebhookEvent를 지워서 토스가
+  // 재시도하도록 500을 돌려준다(재시도 없이 200을 주면 그 결제 건은 영영 반영되지 않는다).
   try {
-    const eventType = req.body?.type
-    const payment = req.body?.data?.payment || {}
-    if (eventType === 'payment.payment.approved.v1') {
-      // 미확정 전제이며 실결제 1~2건으로 검증 필요: payment.orderId를 paymentKey로 간주한다.
-      const paymentKey = String(payment.orderId ?? '').trim() || null
-      const existing = await findPaymentByKey(paymentKey)
-      if (existing) {
-        console.log(`[webhook] 결제 승인 수신: 이미 기록된 결제 paymentKey=${paymentKey}`)
-      } else if (!paymentKey) {
-        logger.warn('[webhook] 결제 승인 수신: orderId가 없어 결제 레코드를 만들 수 없습니다.', { webhookId })
-      } else {
-        const store = await findStoreByMerchantId(payment.merchantId)
-        if (!store) {
-          logger.warn('[webhook] 등록되지 않은 merchantId로 결제 반영을 건너뜁니다.', {
-            webhookId,
-            merchantId: payment.merchantId,
-            paymentKey,
-          })
-        } else {
-          const amount =
-            payment.amount === undefined || payment.amount === null || payment.amount === ''
-              ? null
-              : Number(payment.amount)
-          const recorded = await createPayment({
-            storeId: store.id,
-            paymentKey,
-            carNumber: null,
-            serviceType: null,
-            phone: null,
-            amount: Number.isSafeInteger(amount) && amount >= 0 ? amount : null,
-          })
-          console.log(`[webhook] 결제 승인 백업 기록 생성: payment id=${recorded.id}, paymentKey=${paymentKey}`)
-        }
-      }
-    } else if (eventType === 'payment.payment.cancelled.v1') {
-      const paymentKey = String(payment.orderId ?? '').trim() || null
-      const existing = await findPaymentByKey(paymentKey)
-      if (existing) {
-        const cancelled = await markPaymentStatus(existing.id, 'cancelled')
-        if (cancelled) {
-          logger.warn('[webhook] 결제 취소 반영', { webhookId, paymentId: existing.id, paymentKey })
-        } else {
-          logger.warn('[webhook] 결제 취소 수신: 상태 반영에 실패했습니다.', {
-            webhookId,
-            paymentId: existing.id,
-            paymentKey,
-          })
-        }
-      } else {
-        logger.warn('[webhook] 결제 취소 수신: 매칭되는 결제가 없습니다.', {
-          webhookId,
-          merchantId: payment.merchantId,
-          paymentKey,
-        })
-      }
-    } else {
-      console.log('[webhook] 처리 대상 아닌 이벤트:', eventType)
-    }
+    await processWebhookPayment(req.body, webhookId)
   } catch (e) {
-    logger.error('[webhook] 처리 중 오류', { webhookId, error: e.message, eventType: req.body?.type })
+    logger.error('[webhook] 처리 중 오류 — 재시도를 위해 이벤트 기록을 되돌립니다.', {
+      webhookId,
+      error: e.message,
+      eventType: req.body?.type,
+    })
+    await prisma.webhookEvent.delete({ where: { id: webhookId } }).catch(() => {})
+    return res.status(500).json({ ok: false, error: '웹훅 처리 중 오류가 발생했습니다.' })
   }
-})
 
-async function sendDuePromotions() {
-  const due = await claimDuePromotions()
-  let sent = 0
-  let failed = 0
-  for (const payment of due) {
-    try {
-      await solapi.sendPromoAlimtalk({
-        phone: payment.phone,
-        carNumber: payment.carNumber,
-        storeName: payment.store?.name,
-        storeId: payment.storeId,
-        paymentId: payment.id,
-      })
-      if (await markPromoSent(payment.id)) sent += 1
-    } catch (notifyError) {
-      failed += 1
-      logger.error('프로모션 알림톡 발송 실패', {
-        paymentId: payment.id,
-        storeId: payment.storeId,
-        error: notifyError.message,
-      })
-      await releasePromoClaim(payment.id)
-    }
-  }
-  return { claimed: due.length, sent, failed }
-}
+  return res.json({ ok: true })
+}))
 
+// --- 내부 배치 작업 (Cloud Scheduler 전용) ---
 function requirePromotionJobAuth(req, res, next) {
   const expected = process.env.PROMOTION_JOB_TOKEN
   const supplied = req.get('x-promotion-job-token') || ''
   if (!expected) {
     return res.status(503).json({ ok: false, error: '프로모션 작업 인증이 설정되지 않았습니다.' })
   }
-  const crypto = require('node:crypto')
   const expectedBuf = Buffer.from(expected)
   const suppliedBuf = Buffer.from(supplied)
   if (expectedBuf.length !== suppliedBuf.length || !crypto.timingSafeEqual(expectedBuf, suppliedBuf)) {
@@ -775,9 +1135,70 @@ function requirePromotionJobAuth(req, res, next) {
   return next()
 }
 
+const PROMO_BATCH_SIZE = 100
+const PROMO_TIME_BUDGET_MS = 50 * 1000
+const DEFAULT_PROMO_MAX_PER_RUN = 2000
+
+// claimDuePromotions(limit=100)을 예전엔 하루 한 번 딱 한 번만 호출해서, 하루 대상자가 100명을
+// 넘으면 그 초과분은 영원히 밀렸다(다음 실행도 어차피 앞의 100명만 다시 훑고 지나감 — claim이
+// 성공한 애들은 promoSent라 다시 안 걸리지만, 애초에 100건 상한 자체가 하루 최대 발송량을
+// 고정해버리는 구조였다). 여기서는 claim이 빈손으로 올 때까지, 또는 PROMO_MAX_PER_RUN(기본 2000건)
+// 상한이나 50초 시간 예산에 걸릴 때까지 반복한다(계약 §3.24) — Cloud Scheduler가 무한정 기다려주지
+// 않으므로 시간 예산은 꼭 필요하다.
+async function sendDuePromotions() {
+  const configuredMax = Number(process.env.PROMO_MAX_PER_RUN)
+  const maxPerRun = Number.isFinite(configuredMax) && configuredMax > 0 ? configuredMax : DEFAULT_PROMO_MAX_PER_RUN
+  const startedAt = Date.now()
+
+  let claimed = 0
+  let sent = 0
+  let failed = 0
+  let batches = 0
+  let exhausted = false
+
+  while (true) {
+    if (claimed >= maxPerRun || Date.now() - startedAt >= PROMO_TIME_BUDGET_MS) {
+      exhausted = true
+      break
+    }
+
+    const batchLimit = Math.min(PROMO_BATCH_SIZE, maxPerRun - claimed)
+    const due = await claimDuePromotions(batchLimit)
+    batches += 1
+    if (!due.length) break // 더 이상 대상이 없다 = 자연 종료(exhausted=false)
+
+    for (const payment of due) {
+      try {
+        await solapi.sendPromoAlimtalk({
+          phone: payment.phone,
+          carNumber: payment.carNumber,
+          storeName: payment.store?.name,
+          storeId: payment.storeId,
+          paymentId: payment.id,
+        })
+        if (await markPromoSent(payment.id)) sent += 1
+      } catch (notifyError) {
+        failed += 1
+        logger.error('프로모션 알림톡 발송 실패', {
+          paymentId: payment.id,
+          storeId: payment.storeId,
+          error: notifyError.message,
+        })
+        await releasePromoClaim(payment.id)
+      }
+    }
+    claimed += due.length
+
+    // claim 가능한 건이 요청한 batchLimit보다 적게 나왔다 = 지금 시점에 더 밀린 대상이 없다는 뜻.
+    if (due.length < batchLimit) break
+  }
+
+  return { claimed, sent, failed, batches, exhausted }
+}
+
 // Cloud Scheduler가 매일 오전 10시(KST)에 호출한다. Cloud Run 인스턴스마다 cron을 띄우지
 // 않고, 공유 claim + promoSent 조건으로 동일 작업의 재전송을 막는다.
-app.post('/internal/jobs/send-promotions', requirePromotionJobAuth, async (req, res) => {
+app.post('/internal/jobs/send-promotions', requirePromotionJobAuth, asyncHandler(async (req, res) => {
   try {
     const result = await sendDuePromotions()
     return res.json({ ok: true, ...result })
@@ -785,17 +1206,71 @@ app.post('/internal/jobs/send-promotions', requirePromotionJobAuth, async (req, 
     logger.error('[promotion-job] 처리 실패', { job: 'send-promotions', error: error.message })
     return res.status(500).json({ ok: false, error: '프로모션 작업 처리에 실패했습니다.' })
   }
-})
+}))
+
+// 개인정보 보관기간 경과 건 파기(익명화) (계약 §3.25 신규). PROMOTION_JOB_TOKEN을 그대로
+// 재사용한다 — 둘 다 "Cloud Scheduler가 부르는 내부 배치 작업"이라는 같은 신뢰 경계이기 때문이다.
+app.post('/internal/jobs/purge-expired', requirePromotionJobAuth, asyncHandler(async (req, res) => {
+  try {
+    const result = await purgeExpiredPersonalData()
+    return res.json({ ok: true, ...result })
+  } catch (error) {
+    logger.error('[purge-job] 처리 실패', { job: 'purge-expired', error: error.message })
+    return res.status(500).json({ ok: false, error: '개인정보 파기 작업 처리에 실패했습니다.' })
+  }
+}))
 
 // Cloud Run 공개 도메인에서는 /healthz가 Google 엣지 경로로 예약되어 있어
 // Express까지 도달하지 않을 수 있으므로 별도 경로를 사용한다.
+// liveness probe: DB 접근 없이 프로세스가 요청을 받을 수 있는지만 본다(기존 유지).
 app.get('/health', (req, res) => res.send('ok'))
 
+// readiness probe(계약 §3.26 신규): DB까지 실제로 붙는지 확인한다. Cloud Run/로드밸런서가 이걸로
+// "트래픽을 받을 준비가 됐는지"를 판단하므로, DB 커넥션이 끊긴 인스턴스는 여기서 503을 내서
+// 트래픽 라우팅 대상에서 빠지게 한다(liveness만 보면 "떠있지만 DB가 안 붙는" 상태를 못 거른다).
+app.get('/health/ready', asyncHandler(async (req, res) => {
+  try {
+    await prisma.$queryRaw`SELECT 1`
+    return res.json({ ok: true })
+  } catch (e) {
+    logger.error('[health] readiness 체크 실패', { error: e.message })
+    return res.status(503).json({ ok: false })
+  }
+}))
+
+// --- 404 + 에러 핸들러 (계약 §5) ---
+// 모든 라우트 등록 뒤에 둬야 Express가 매칭 실패/에러를 이 두 핸들러로 떨어뜨린다.
+app.use((req, res) => {
+  res.status(404).json({ ok: false, error: '요청하신 경로를 찾을 수 없습니다.' })
+})
+
+// 4개 인자(err 포함)를 받는 함수만 Express가 에러 핸들러로 인식한다 — asyncHandler가 next(err)로
+// 넘긴 에러가 결국 여기로 모인다. 클라이언트에는 고정 문구만 내려주고 상세(스택 등)는 로그에만 남긴다.
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  logger.error('처리되지 않은 요청 오류', {
+    path: req.path,
+    method: req.method,
+    error: err?.message,
+    stack: err?.stack,
+  })
+  if (err?.code === 'IDEMPOTENCY_KEY_CONFLICT') {
+    return res.status(409).json({ ok: false, error: err.message })
+  }
+  if (res.headersSent) {
+    return next(err)
+  }
+  return res.status(500).json({ ok: false, error: '요청 처리 중 오류가 발생했습니다.' })
+})
+
 const PORT = process.env.PORT || 3000
+let httpServer = null
+
 function startServer() {
   return Promise.all([ensureDefaultStore(), ensureDefaultHqAdmin()])
     .then(() => {
-      app.listen(PORT, () => console.log(`쉐보레 토스플러그인 서버 실행 중: http://localhost:${PORT}`))
+      httpServer = app.listen(PORT, () => console.log(`쉐보레 토스플러그인 서버 실행 중: http://localhost:${PORT}`))
+      return httpServer
     })
     .catch((e) => {
       logger.error('부팅 시드 실패', { phase: 'bootstrap', error: e.message })
@@ -803,8 +1278,60 @@ function startServer() {
     })
 }
 
+// --- Graceful shutdown (계약 §6) ---
+// SIGTERM/SIGINT 수신 시: 새 연결을 막고(server.close) 기존 요청이 끝나길 기다린 뒤 DB 커넥션을
+// 정리하고 종료한다. Cloud Run 등은 컨테이너 교체 시 SIGTERM을 보내고 짧은 유예 시간만 주므로,
+// 그 안에 못 끝내면 10초 타이머가 강제로 exit(1)한다(무한 대기로 배포가 멈추는 걸 막기 위함).
+let shuttingDown = false
+function shutdown(signal) {
+  if (shuttingDown) return
+  shuttingDown = true
+  logger.info('종료 신호 수신, graceful shutdown 시작', { signal })
+
+  const forceExitTimer = setTimeout(() => {
+    logger.error('10초 안에 정상 종료하지 못해 강제 종료합니다.', { signal })
+    process.exit(1)
+  }, 10000)
+  forceExitTimer.unref()
+
+  const closeServer = httpServer
+    ? new Promise((resolve) => httpServer.close(() => resolve()))
+    : Promise.resolve()
+
+  closeServer
+    .then(() => prisma.$disconnect())
+    .then(() => {
+      clearTimeout(forceExitTimer)
+      process.exit(0)
+    })
+    .catch((e) => {
+      logger.error('graceful shutdown 중 오류', { error: e.message })
+      process.exit(1)
+    })
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'))
+process.on('SIGINT', () => shutdown('SIGINT'))
+
+// --- 프로세스 레벨 안전망 (계약 §5) ---
+// asyncHandler가 라우트 안에서 일어난 에러는 다 잡아주지만, 그 바깥(타이머, 라이브러리 내부 콜백 등)
+// 에서 놓친 rejection까지 완벽히 막을 순 없다. 여기서 한 번 더 로그만 남기고 프로세스는 죽이지
+// 않는다 — 예: notifyQueueTurn류 함수 하나에서 놓친 reject 때문에 매장 전체 서비스가 재시작되는
+// 사고가 벌어지면 안 된다.
+process.on('unhandledRejection', (reason) => {
+  logger.error('처리되지 않은 Promise 거부', { error: reason?.message || String(reason), stack: reason?.stack })
+})
+
+// uncaughtException은 Node 공식 문서가 권고하는 대로 다르게 다룬다 — 이 시점엔 프로세스 상태가
+// 이미 오염됐을 수 있어(예: 잠긴 리소스, 깨진 클로저 상태) 계속 실행하지 않고 graceful shutdown 후
+// 종료한다. unhandledRejection보다 한 단계 더 심각한 신호로 취급한다.
+process.on('uncaughtException', (err) => {
+  logger.error('처리되지 않은 예외', { error: err.message, stack: err.stack })
+  shutdown('uncaughtException')
+})
+
 if (require.main === module) {
   startServer()
 }
 
-module.exports = { app, sendDuePromotions }
+module.exports = { app, sendDuePromotions, purgeExpiredPersonalData }

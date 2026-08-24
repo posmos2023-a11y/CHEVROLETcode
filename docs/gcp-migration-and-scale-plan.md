@@ -236,7 +236,7 @@ GCP 이전 전에 API base URL을 한 곳의 환경별 설정으로 분리한다
 
 - GCP 프로젝트: `tossplugincar-dev`, 리전: `asia-northeast3`
 - Cloud SQL: `chevrolet-postgres` / 데이터베이스 `chevrolet` / 앱 사용자 `chevrolet_app`
-- Cloud Run 서비스: `https://chevrolet-api-amib56yomq-du.a.run.app`
+- Cloud Run 서비스: `https://chevrolet-api-813801981857.asia-northeast3.run.app`
 - 초기 Cloud Run 설정: 최소 1, 최대 5 인스턴스, 동시성 20, 1 vCPU, 512MiB
 - Cloud Scheduler: `chevrolet-promotion-daily`, 매일 10:00 `Asia/Seoul`
 - Auth Proxy를 통한 `prisma migrate deploy`와 `prisma migrate status` 검증 완료

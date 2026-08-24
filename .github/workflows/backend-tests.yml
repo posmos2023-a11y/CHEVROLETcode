@@ -30,6 +30,11 @@ jobs:
       - name: Install dependencies
         working-directory: backend
         run: npm ci
+      # backend/test/api.test.js가 자체적으로 process.env.NODE_ENV = 'test'와
+      # JWT_SECRET/TOSS_WEBHOOK_SECRET을 스크립트 안에서 세팅하므로, production 전용 부팅 가드
+      # (§10: JWT_SECRET/ADMIN_BOOTSTRAP_*/TOSS_WEBHOOK_SECRET 필수)는 테스트 중 발동하지 않는다.
+      # ADMIN_ALLOWED_ORIGINS/DATA_RETENTION_DAYS/PROMO_*/RUN_MIGRATIONS_ON_BOOT는 미설정 시
+      # 경고 로그만 남기거나 기본값으로 동작하도록 설계돼 있어 CI에서 별도로 채울 필요가 없다.
       - name: Apply test migrations
         working-directory: backend
         env:
@@ -40,3 +45,41 @@ jobs:
         env:
           DATABASE_URL: postgresql://postgres:devpass@localhost:5432/devdb?schema=public
         run: npm test
+
+  syntax-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      # 이 프로젝트에는 린터가 없으므로, 최소한 모든 서버 소스 파일이 파싱 가능한지(문법 오류가
+      # 없는지)만이라도 커밋마다 값싸게 확인한다. 런타임 동작은 검증하지 않는다.
+      - name: node --check backend server sources
+        run: |
+          set -e
+          node --check backend/server.js
+          for f in backend/src/*.js; do
+            echo "checking $f"
+            node --check "$f"
+          done
+          node --check backend/public/reservation.js
+
+  pos-plugin-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: pos-plugin/package-lock.json
+      # POS 탭앱은 esbuild로 번들되는 실제 배포 산출물(dist/)인데 지금까지 CI에서 빌드를
+      # 검증한 적이 없었다. package.json을 못 건드리므로 npm script를 새로 추가하는 대신
+      # 여기서 직접 npm ci && npm run build를 돌려 커밋마다 컴파일 가능함을 보증한다.
+      - name: Install dependencies
+        working-directory: pos-plugin
+        run: npm ci
+      - name: Build POS plugin bundle
+        working-directory: pos-plugin
+        run: npm run build

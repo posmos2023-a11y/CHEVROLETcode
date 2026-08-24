@@ -22,6 +22,10 @@ front-plugin/
   settings.html            # 템플릿이 요구하는 표준 파일(설정 없음 안내만 표시)
   sdk.js                    # 로컬 브라우저 미리보기 전용 오버라이드
                             # (sdk.app.getMerchant/getSerialNumber가 없을 때만 테스트값 채움)
+  api-config.js              # window.CHEVROLET_API_BASE_URL 설정. 로컬/백엔드 미리보기에서는 같은
+                            # origin(빈 문자열)을 쓰고, 실제 배포 ZIP에서는 package.ps1/package.sh가
+                            # __CHEVROLET_API_BASE_URL__ placeholder를 CHEVROLET_API_BASE_URL 값으로 치환
+  package.ps1, package.sh    # 배포용 ZIP 생성 스크립트(Windows/그 외 OS, npm run zip은 package.ps1만 호출)
 ```
 
 ## 백엔드와의 연동
@@ -54,6 +58,23 @@ cd front-plugin
 # bash: CHEVROLET_API_BASE_URL=https://<cloud-run-url> npm run zip
 # PowerShell: $env:CHEVROLET_API_BASE_URL='https://<cloud-run-url>'; npm run zip
 ```
+
+`npm run zip`은 `package.json`의 스크립트라서 내부적으로 `package.ps1`(PowerShell)을 호출합니다.
+PowerShell이 없는 환경(Linux/CI/macOS)에서는 같은 일을 하는 `package.sh`를 직접 실행하세요 — 두
+스크립트는 동작이 완전히 동일합니다(`__CHEVROLET_API_BASE_URL__` 치환 포함).
+
+```bash
+cd front-plugin
+CHEVROLET_API_BASE_URL="https://<cloud-run-url>" ./package.sh
+```
+
+`zip` 명령이 있으면 그것을 쓰고, 없으면 `bsdtar -a -cf`로 대체합니다(최신 Linux 배포판과 Windows 10+에는
+기본 포함). 둘 다 없으면 무엇을 설치해야 하는지 알려주는 에러 메시지와 함께 실패합니다.
+
+> `package.json`의 `zip` 스크립트는 아직 `package.ps1`만 가리킵니다. `npm run zip`을 Linux/CI에서도
+> 쓰게 하려면 OS를 감지해 두 스크립트 중 하나를 고르도록 `package.json`을 고쳐야 하지만, 지금은
+> `package.json`을 건드리지 않기로 하고 `package.sh`를 직접 호출하는 방식으로만 문서화해뒀습니다.
+> `npm run zip:sh` 같은 별도 스크립트 추가는 다음 변경에서 검토하세요.
 
 생성 파일: `chevrolet-front-plugin.zip`
 

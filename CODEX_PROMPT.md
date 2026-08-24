@@ -19,7 +19,7 @@
 
 - GCP 프로젝트: `tossplugincar-dev`, 리전: `asia-northeast3`
 - Cloud SQL: `chevrolet-postgres` (PostgreSQL 16, db-f1-micro)
-- Cloud Run 서비스: `chevrolet-api` (`https://chevrolet-api-amib56yomq-du.a.run.app`), 전체 공개(allUsers invoker)
+- Cloud Run 서비스: `chevrolet-api` (`https://chevrolet-api-813801981857.asia-northeast3.run.app`), 전체 공개(allUsers invoker)
 - Cloud Scheduler: `chevrolet-promotion-daily` (매일 10:00 Asia/Seoul)
 - Secret Manager: `DATABASE_URL`, `JWT_SECRET`, `ADMIN_BOOTSTRAP_EMAIL`, `ADMIN_BOOTSTRAP_PASSWORD`,
   `PROMOTION_JOB_TOKEN`, `TOSS_WEBHOOK_SECRET` 등록 완료. **SOLAPI_* 키는 아직 미등록.**
@@ -46,7 +46,7 @@
 
 ### 2. `/healthz` 엔드포인트가 공개 Cloud Run URL에서 도달 불가
 
-`curl https://chevrolet-api-amib56yomq-du.a.run.app/healthz` 및 프로젝트 번호 기반 URL 둘 다에서
+`curl https://chevrolet-api-813801981857.asia-northeast3.run.app/healthz` 및 프로젝트 번호 기반 URL 둘 다에서
 Google 엣지 단계의 일반 404 페이지가 응답되고 ([backend/server.js:715](backend/server.js:715)의
 Express 핸들러까지 도달하지 못함 — 응답에 `x-powered-by: Express` 헤더가 없음), 반면
 `/`, `/api/nonexistent-xyz` 같은 다른 경로는 정상적으로 Express까지 도달해 Express 자체 404를 반환한다.

@@ -6,6 +6,7 @@
 // `npx prisma migrate dev`를 다시 실행하면 된다 (docs/multi-store-architecture-review.md 참고).
 
 const { PrismaClient } = require('@prisma/client')
+const crypto = require('node:crypto')
 const { hashPassword } = require('./auth')
 
 const prisma = new PrismaClient()
@@ -20,6 +21,19 @@ function kstDayStartUtc(dateStr) {
   return new Date(`${dateStr}T00:00:00+09:00`)
 }
 
+// Payment에는 serviceDate 컬럼이 없어서(결제는 예약과 달리 "당일 접수" 개념이 없음) 날짜로
+// 필터링하려면 createdAt을 KST 기준 하루 범위(UTC 두 시점)로 변환해야 한다. Prisma의 `gte`/`lt`
+// 범위 비교로 넘기면 DB 인덱스를 그대로 탈 수 있어(함수 변환 없이) storeId+createdAt 인덱스가 먹는다.
+function kstDateRangeUtc(dateStr) {
+  const start = kstDayStartUtc(dateStr)
+  const end = new Date(start.getTime() + 24 * 60 * 60 * 1000)
+  return { start, end }
+}
+
+// 정비가 끝났거나(completed) 취소된(cancelled) 예약은 "지금 대기열에 남아있는 손님" 계산에서
+// 항상 제외한다. peopleAhead 계산과 POS 대기열 조회가 이 규칙을 공유한다.
+const CLOSED_RESERVATION_STATUSES = ['completed', 'cancelled']
+
 // Plan SC: FR-07 — 최초 부팅 시 본사(hq_admin) 계정이 하나도 없으면 자동 생성한다.
 // 비밀번호는 ADMIN_BOOTSTRAP_PASSWORD가 있으면 그 값을, 없으면 무작위로 생성해 콘솔에 한 번만 출력한다.
 async function ensureDefaultHqAdmin() {
@@ -31,7 +45,7 @@ async function ensureDefaultHqAdmin() {
   }
 
   const email = process.env.ADMIN_BOOTSTRAP_EMAIL || 'admin@local'
-  const password = process.env.ADMIN_BOOTSTRAP_PASSWORD || require('node:crypto').randomBytes(9).toString('base64url')
+  const password = process.env.ADMIN_BOOTSTRAP_PASSWORD || crypto.randomBytes(9).toString('base64url')
   const passwordHash = await hashPassword(password)
 
   await prisma.adminUser.create({
@@ -62,11 +76,49 @@ function createAdminUser({ email, passwordHash, role, storeId }) {
   return prisma.adminUser.create({ data: { email, passwordHash, role, storeId: storeId || null } })
 }
 
+// 로그인 성공 시 lastLoginAt을 갱신하는 김에 계정 잠금 카운터도 함께 초기화한다(§3.22).
+// 실패가 몇 번 쌓여 있었더라도 결국 올바른 비밀번호로 들어오면 그 이력은 더 이상 의미가 없다.
 async function markAdminLogin(id) {
   try {
-    return await prisma.adminUser.update({ where: { id }, data: { lastLoginAt: new Date() } })
+    return await prisma.adminUser.update({
+      where: { id },
+      data: { lastLoginAt: new Date(), failedLoginCount: 0, lockedUntil: null },
+    })
   } catch {
     return null
+  }
+}
+
+const MAX_FAILED_LOGIN_ATTEMPTS = 5
+const LOCKOUT_DURATION_MS = 15 * 60 * 1000
+
+// 로그인 비밀번호가 틀렸을 때 호출한다. 5회가 누적되면 15분 잠금을 건다.
+// 존재하지 않는 이메일은 이 함수를 아예 타지 않는다(server.js가 findAdminUserByEmail로 계정을
+// 먼저 찾은 뒤에만 호출) — 그래야 "계정이 있는데 잠겼다(423)"와 "계정이 없다(401)"를 구분하지 않고
+// 없는 계정은 항상 기존과 동일한 401만 돌려줘서 계정 존재 여부가 새어나가지 않는다.
+async function recordFailedLogin(id) {
+  try {
+    const current = await prisma.adminUser.findUnique({ where: { id } })
+    if (!current) return
+
+    // 잠금이 이미 풀린 뒤의 실패는 카운터를 0부터 다시 센다.
+    // 단순 increment만 하면 failedLoginCount가 5에 머물러 있어서, 15분 잠금이 풀린 직후
+    // 비밀번호를 한 번만 잘못 쳐도 곧바로 6이 되어 또 15분간 잠기는 문제가 생긴다
+    // (정상 사용자가 오타 한 번에 계속 묶이는 상황). 잠금은 "짧은 시간에 5회"를 막기 위한
+    // 것이지 "한 번 잠긴 계정을 계속 잠가두기" 위한 게 아니다.
+    const lockExpired = current.lockedUntil ? current.lockedUntil.getTime() <= Date.now() : false
+    const nextCount = (lockExpired ? 0 : current.failedLoginCount) + 1
+    const locking = nextCount >= MAX_FAILED_LOGIN_ATTEMPTS
+
+    await prisma.adminUser.update({
+      where: { id },
+      data: {
+        failedLoginCount: nextCount,
+        lockedUntil: locking ? new Date(Date.now() + LOCKOUT_DURATION_MS) : null,
+      },
+    })
+  } catch {
+    // 잠금 카운터 갱신이 실패해도 로그인 실패 응답 자체(401)는 정상적으로 나가야 하므로 삼킨다.
   }
 }
 
@@ -81,13 +133,24 @@ async function ensureDefaultStore() {
   await prisma.store.upsert({
     where: { merchantId: '0' },
     update: {},
-    create: { merchantId: '0', name: '쉐보레 대리점 (테스트)', businessNumber: '0000000000' },
+    create: { merchantId: '0', name: '쉐보레 대리점 (테스트)', businessNumber: '0000000000', posToken: generatePosToken() },
   })
 }
 
-function createStore({ merchantId, name, businessNumber }) {
+// POS 탭앱 인증 토큰(64자 hex). crypto.randomBytes(32)는 브라우저가 아닌 서버(Node)에서만
+// 돌기 때문에 예측 불가능성이 필요한 이 토큰 발급에 적합하다(Math.random 금지).
+function generatePosToken() {
+  return crypto.randomBytes(32).toString('hex')
+}
+
+function createStore({ merchantId, name, businessNumber, posToken }) {
   return prisma.store.create({
-    data: { merchantId: String(merchantId), name, businessNumber: businessNumber || null },
+    data: {
+      merchantId: String(merchantId),
+      name,
+      businessNumber: businessNumber || null,
+      posToken: posToken || generatePosToken(),
+    },
   })
 }
 
@@ -126,12 +189,40 @@ function findStoreByMerchantId(merchantId) {
   return prisma.store.findUnique({ where: { merchantId: String(merchantId) } })
 }
 
-// 매장·날짜별 원자적 채번 + "앞에 몇 명 있는지" 계산 + 예약 생성을 하나의 트랜잭션으로 묶는다.
-// 예전엔 server.js가 (인원수 조회) -> (예약 생성)을 별도 호출로 나눠서 했는데, 그 사이에 다른 요청이
-// 끼어들면 두 손님이 동시에 "앞에 아무도 없음(peopleAhead=0)"으로 계산되어 둘 다 순서 호출 알림톡을
-// 받는 경쟁 상태가 있었다. SQLite/Prisma 트랜잭션 안에서 카운트→채번→생성을 순서대로 묶으면
-// 같은 트랜잭션이 끝나기 전까지 다른 트랜잭션이 끼어들 수 없어 안전해진다.
-async function createReservation({ storeId, carNumber, phone, serviceType, idempotencyKey }) {
+// POS 탭앱 인증(§2.2). X-Store-Token 헤더 값으로 매장을 찾는다 — merchantId와 달리 이 토큰은
+// 추측이 사실상 불가능해야 하므로(64자 hex, crypto.randomBytes(32)) 그 자체가 인증 수단이 된다.
+function findStoreByPosToken(posToken) {
+  if (!posToken) return null
+  return prisma.store.findUnique({ where: { posToken } })
+}
+
+// hq_admin이 "토큰이 유출된 것 같다" 등의 이유로 특정 매장의 POS 토큰을 회전(재발급)할 때 쓴다.
+// 예전 토큰은 즉시 무효화된다 — 매장 단말기는 새 토큰을 다시 입력받아야 한다(§3.20, §12).
+async function rotatePosToken(storeId) {
+  try {
+    return await prisma.store.update({
+      where: { id: storeId },
+      data: { posToken: generatePosToken() },
+    })
+  } catch {
+    return null
+  }
+}
+
+// 매장·날짜별 대기번호 채번을 원자적 UPSERT(INSERT ... ON CONFLICT ... DO UPDATE) 한 문장으로 처리한다.
+// ⚠️ 예전 comment는 "이 함수 전체가 하나의 Prisma $transaction 안에 있으니 채번도 안전하게
+// 직렬화된다"고 적혀 있었는데, 이는 틀린 설명이다 — Postgres의 기본 격리수준인 READ COMMITTED에서는
+// 트랜잭션 내부의 일반 SELECT/count()가 다른 트랜잭션의 동시 실행을 막지 않는다(아무것도 잠그지 않는다).
+// 실제로 오늘 첫 두 손님이 거의 동시에 접수하면, 두 트랜잭션 모두 "이 매장·오늘 날짜의 카운터가 아직
+// 없음"을 보고 각자 counter=1로 새로 만들려다 하나가 QueueCounter의 unique(storeId,date) 제약(P2002)에
+// 걸려 그대로 500을 손님에게 돌려주는 버그가 있었다(예전 findUnique -> create/update 2단계 방식).
+// 그래서 카운터 증가는 "먼저 읽고 나중에 쓰는" 방식 대신, DB가 보장하는 단일 원자적 문장으로 바꿨다 —
+// INSERT ... ON CONFLICT DO UPDATE는 실행되는 동안 해당 (storeId,date) 행에 row-level lock을 잡기
+// 때문에, 동시에 들어온 두 요청이 진짜로 순서대로(하나가 커밋된 뒤 다른 하나가 그 값을 보고 +1) 처리되어
+// 서로 다른 queueNumber를 받는다. 반면 peopleAhead(대기인원 안내)는 이런 정확한 직렬화가 필요 없는
+// "손님에게 보여주는 대략적인 안내"일 뿐이라 count()를 그대로 둬도 문제없다 — 최악의 경우 대기인원
+// 안내가 한두 명 오차 나는 정도이고, 실제 대기 순서(queueNumber)는 항상 정확하다.
+async function createReservation({ storeId, carNumber, phone, serviceType, idempotencyKey, privacyConsentAt, marketingConsentAt }) {
   const today = kstDateString()
   try {
     return await prisma.$transaction(async (tx) => {
@@ -146,7 +237,8 @@ async function createReservation({ storeId, carNumber, phone, serviceType, idemp
           const peopleAhead = await tx.reservation.count({
             where: {
               storeId,
-              status: { not: 'completed' },
+              serviceDate: existing.serviceDate,
+              status: { notIn: CLOSED_RESERVATION_STATUSES },
               createdAt: { lt: existing.createdAt },
             },
           })
@@ -154,19 +246,19 @@ async function createReservation({ storeId, carNumber, phone, serviceType, idemp
         }
       }
 
-      const peopleAhead = await tx.reservation.count({
-        where: { storeId, status: { not: 'completed' } },
-      })
+      const counterRows = await tx.$queryRaw`
+        INSERT INTO "QueueCounter" ("id", "storeId", "date", "counter")
+        VALUES (${crypto.randomUUID()}, ${storeId}, ${today}, 1)
+        ON CONFLICT ("storeId", "date") DO UPDATE
+        SET "counter" = "QueueCounter"."counter" + 1
+        RETURNING "counter"
+      `
+      const queueNumber = Number(counterRows[0].counter)
 
-      const existingCounter = await tx.queueCounter.findUnique({
-        where: { storeId_date: { storeId, date: today } },
+      // 오늘(serviceDate) + 아직 끝나지 않은(완료/취소 제외) 예약 수 = 이 손님 앞에 몇 명이 있는지.
+      const peopleAhead = await tx.reservation.count({
+        where: { storeId, serviceDate: today, status: { notIn: CLOSED_RESERVATION_STATUSES } },
       })
-      const queueNumber = existingCounter
-        ? (await tx.queueCounter.update({
-            where: { id: existingCounter.id },
-            data: { counter: { increment: 1 } },
-          })).counter
-        : (await tx.queueCounter.create({ data: { storeId, date: today, counter: 1 } })).counter
 
       const reservation = await tx.reservation.create({
         data: {
@@ -175,8 +267,11 @@ async function createReservation({ storeId, carNumber, phone, serviceType, idemp
           phone,
           serviceType,
           queueNumber,
+          serviceDate: today,
           idempotencyKey: idempotencyKey || null,
           status: 'waiting',
+          privacyConsentAt: privacyConsentAt || null,
+          marketingConsentAt: marketingConsentAt || null,
         },
       })
 
@@ -191,7 +286,8 @@ async function createReservation({ storeId, carNumber, phone, serviceType, idemp
         const peopleAhead = await prisma.reservation.count({
           where: {
             storeId,
-            status: { not: 'completed' },
+            serviceDate: existing.serviceDate,
+            status: { notIn: CLOSED_RESERVATION_STATUSES },
             createdAt: { lt: existing.createdAt },
           },
         })
@@ -203,6 +299,9 @@ async function createReservation({ storeId, carNumber, phone, serviceType, idemp
 }
 
 // storeId를 안 넘기면(관리자 "전체 매장 보기") 전체를 반환한다.
+// ⚠️ 관리자 목록 화면(GET /api/reservations 등)은 더 이상 이 함수를 쓰지 않는다 — 전체를 메모리로
+// 가져와 JS에서 필터링/역순 처리하면 매장·기간이 늘어날수록 응답이 느려지고 메모리를 낭비하기 때문에
+// listReservationsPage로 교체했다(§6 페이지네이션). 이 함수는 기존 export 시그니처 보존을 위해 남겨둔다.
 function listReservations(storeId) {
   return prisma.reservation.findMany({
     where: storeId ? { storeId } : undefined,
@@ -210,11 +309,53 @@ function listReservations(storeId) {
   })
 }
 
+// 예약 목록(관리자 화면) 페이지네이션 + 필터. count/필터/정렬을 전부 DB(Prisma)에 위임해서
+// 매장이 많아지거나 기간이 길어져도 매 요청마다 전체 로우를 애플리케이션 메모리로 끌어오지 않는다.
+async function listReservationsPage({ storeId, date, statuses, limit, offset }) {
+  const where = {
+    ...(storeId ? { storeId } : {}),
+    ...(date ? { serviceDate: date } : {}),
+    ...(statuses && statuses.length ? { status: { in: statuses } } : {}),
+  }
+  const [total, items] = await Promise.all([
+    prisma.reservation.count({ where }),
+    prisma.reservation.findMany({ where, orderBy: { createdAt: 'desc' }, take: limit, skip: offset }),
+  ])
+  return { total, items }
+}
+
+// 결제 목록(관리자 화면) 페이지네이션 + 필터. Payment는 serviceDate가 없어서 date 필터는
+// createdAt을 KST 하루 범위(dateStart~dateEnd, kstDateRangeUtc)로 변환해 넘겨받는다.
+async function listPaymentsPage({ storeId, dateStart, dateEnd, statuses, limit, offset }) {
+  const where = {
+    ...(storeId ? { storeId } : {}),
+    ...(dateStart && dateEnd ? { createdAt: { gte: dateStart, lt: dateEnd } } : {}),
+    ...(statuses && statuses.length ? { status: { in: statuses } } : {}),
+  }
+  const [total, items] = await Promise.all([
+    prisma.payment.count({ where }),
+    prisma.payment.findMany({ where, orderBy: { createdAt: 'desc' }, take: limit, skip: offset }),
+  ])
+  return { total, items }
+}
+
+// POS 탭앱 대기열 조회 전용(§3.13). 오늘(KST) serviceDate + 아직 끝나지 않은(완료/취소 제외) 예약만,
+// queueNumber 오름차순으로 돌려준다. 어제 마감된 대기열이 오늘 POS 화면에 남아있으면 안 되므로
+// 반드시 day-scope를 서버가 강제한다(POS 탭앱이 보내는 값을 신뢰하지 않는다).
+function listActiveQueueForStore(storeId, serviceDate) {
+  return prisma.reservation.findMany({
+    where: { storeId, serviceDate, status: { notIn: CLOSED_RESERVATION_STATUSES } },
+    orderBy: { queueNumber: 'asc' },
+  })
+}
+
 // store를 함께 로드해 알림톡 발송 시 #{매장명}을 채울 수 있게 한다 (Phase 4).
+// call-next(§3.6)는 오늘 접수분만 호출해야 한다 — 어제 마감 시간을 넘겨 그대로 남아있던 waiting
+// 건이 실수로(혹은 자정 넘어 재시작 후) 다시 호출되는 걸 막기 위해 serviceDate로 day-scope한다.
 function getNextWaitingReservation(storeId) {
   return prisma.reservation.findFirst({
-    where: { storeId, status: 'waiting' },
-    orderBy: { createdAt: 'asc' },
+    where: { storeId, status: 'waiting', serviceDate: kstDateString() },
+    orderBy: { queueNumber: 'asc' },
     include: { store: true },
   })
 }
@@ -236,6 +377,23 @@ async function markReservationCalled(id) {
   try {
     const result = await prisma.reservation.updateMany({
       where: { id, status: 'waiting' },
+      data: { status: 'called', calledAt: new Date() },
+    })
+    if (!result.count) return null
+    return prisma.reservation.findUnique({ where: { id }, include: { store: true } })
+  } catch {
+    return null
+  }
+}
+
+// 알림톡 재발송(§3.10)에서만 쓰인다. notify_failed 상태에서만 called로 되돌릴 수 있다 — 이 원자적
+// updateMany 자체가 "재발송 시도를 시작했다"는 낙관적 잠금 역할을 한다: 관리자 두 명이 거의 동시에
+// 재발송 버튼을 눌러도 where절의 status='notify_failed' 조건을 통과하는 건 하나뿐이라 알림톡이
+// 중복 발송되지 않는다(발송이 실패하면 markReservationNotifyFailed로 다시 되돌린다).
+async function markReservationCalledFromNotifyFailed(id) {
+  try {
+    const result = await prisma.reservation.updateMany({
+      where: { id, status: 'notify_failed' },
       data: { status: 'called', calledAt: new Date() },
     })
     if (!result.count) return null
@@ -272,9 +430,45 @@ async function markReservationNotifyFailed(id) {
   }
 }
 
+// 손님 취소/노쇼 처리(§3.9, §3.16 공용). waiting|called|notify_failed 상태에서만 cancelled로
+// 전이할 수 있다 — completed는 이미 정비가 끝난 건이라 취소 대상이 아니다(호출부에서 별도 409 처리).
+async function markReservationCancelled(id) {
+  try {
+    const result = await prisma.reservation.updateMany({
+      where: { id, status: { in: ['waiting', 'called', 'notify_failed'] } },
+      data: { status: 'cancelled' },
+    })
+    if (!result.count) return null
+    return prisma.reservation.findUnique({ where: { id }, include: { store: true } })
+  } catch {
+    return null
+  }
+}
+
 async function markPaymentStatus(id, status) {
   try {
     return await prisma.payment.update({ where: { id }, data: { status } })
+  } catch {
+    return null
+  }
+}
+
+function getPayment(id) {
+  return prisma.payment.findUnique({ where: { id }, include: { store: true } })
+}
+
+// 전자영수증 재발송(§3.11). receipt_failed 상태에서만 낙관적으로 receipt_sent로 먼저 바꾼다 —
+// markReservationCalledFromNotifyFailed와 같은 이유로, 이 원자적 updateMany가 곧 "재발송 시도
+// 시작"의 낙관적 잠금이다. solapi 호출이 실패하면 호출부(server.js)가 다시 receipt_failed로
+// 되돌린다(markPaymentStatus 재사용).
+async function markPaymentReceiptRetrying(id) {
+  try {
+    const result = await prisma.payment.updateMany({
+      where: { id, status: 'receipt_failed' },
+      data: { status: 'receipt_sent' },
+    })
+    if (!result.count) return null
+    return prisma.payment.findUnique({ where: { id }, include: { store: true } })
   } catch {
     return null
   }
@@ -305,7 +499,7 @@ function findPaymentByKey(paymentKey) {
   return prisma.payment.findUnique({ where: { paymentKey } })
 }
 
-function createPayment({ storeId, paymentKey, carNumber, serviceType, phone, amount }) {
+function createPayment({ storeId, paymentKey, carNumber, serviceType, phone, amount, privacyConsentAt, marketingConsentAt }) {
   return prisma.payment.create({
     data: {
       storeId,
@@ -316,11 +510,15 @@ function createPayment({ storeId, paymentKey, carNumber, serviceType, phone, amo
       amount: amount ?? null,
       status: 'requested',
       promoAt: new Date(Date.now() + THREE_MONTHS_MS),
+      privacyConsentAt: privacyConsentAt || null,
+      marketingConsentAt: marketingConsentAt || null,
     },
   })
 }
 
 // storeId를 안 넘기면(관리자 "전체 매장 보기") 전체를 반환한다.
+// ⚠️ listReservations와 같은 이유로 관리자 목록 화면은 더 이상 이 함수를 쓰지 않는다(listPaymentsPage
+// 사용). 기존 export 시그니처 보존을 위해 남겨둔다.
 function listPayments(storeId) {
   return prisma.payment.findMany({
     where: storeId ? { storeId } : undefined,
@@ -333,6 +531,8 @@ function listPayments(storeId) {
 // 인스턴스가 동시에 처리하지 않게 한다. 프로세스가 죽어 claim만 남은 건은 10분 후
 // 다시 claim할 수 있다(외부 API 호출 직후 프로세스가 죽는 경우의 완전한 exactly-once는
 // 알림 제공자 idempotency 키가 없으면 보장할 수 없으므로, 성공 후 promoSent를 최종 기준으로 둔다).
+// §4: 광고성 정보 수신에 동의(marketingConsentAt IS NOT NULL)한 결제만 대상으로 한다 — 동의 없이
+// 광고 알림톡을 보내면 정보통신망법 위반이다.
 async function claimDuePromotions(limit = 100) {
   const now = new Date()
   const staleBefore = new Date(now.getTime() - 10 * 60 * 1000)
@@ -341,6 +541,7 @@ async function claimDuePromotions(limit = 100) {
       promoSent: false,
       promoAt: { lte: now },
       phone: { not: null, notIn: [''] },
+      marketingConsentAt: { not: null },
       OR: [{ promoClaimedAt: null }, { promoClaimedAt: { lt: staleBefore } }],
     },
     orderBy: { promoAt: 'asc' },
@@ -402,8 +603,71 @@ async function recordWebhookEventOnce(webhookId, eventType) {
   }
 }
 
+const DEFAULT_DATA_RETENTION_DAYS = 1095
+const PURGE_BATCH_SIZE = 1000
+const PURGE_MAX_ITERATIONS = 10
+// Reservation.phone은 NOT NULL 컬럼이라(예약 화면은 항상 전화번호를 받는다) null로 지울 수 없다 —
+// 식별 불가능한 더미값으로 대체한다. Payment.phone은 nullable이라 그냥 null로 지운다.
+const ANONYMIZED_RESERVATION_PHONE = '0100000000'
+const ANONYMIZED_CAR_NUMBER = '삭제됨'
+
+async function purgeExpiredReservations(cutoff) {
+  let total = 0
+  for (let i = 0; i < PURGE_MAX_ITERATIONS; i += 1) {
+    const targets = await prisma.reservation.findMany({
+      where: { createdAt: { lt: cutoff }, anonymizedAt: null },
+      select: { id: true },
+      take: PURGE_BATCH_SIZE,
+    })
+    if (!targets.length) break
+    const result = await prisma.reservation.updateMany({
+      where: { id: { in: targets.map((t) => t.id) } },
+      data: { phone: ANONYMIZED_RESERVATION_PHONE, carNumber: ANONYMIZED_CAR_NUMBER, anonymizedAt: new Date() },
+    })
+    total += result.count
+    if (targets.length < PURGE_BATCH_SIZE) break
+  }
+  return total
+}
+
+async function purgeExpiredPayments(cutoff) {
+  let total = 0
+  for (let i = 0; i < PURGE_MAX_ITERATIONS; i += 1) {
+    const targets = await prisma.payment.findMany({
+      where: { createdAt: { lt: cutoff }, anonymizedAt: null },
+      select: { id: true },
+      take: PURGE_BATCH_SIZE,
+    })
+    if (!targets.length) break
+    const result = await prisma.payment.updateMany({
+      where: { id: { in: targets.map((t) => t.id) } },
+      data: { phone: null, carNumber: ANONYMIZED_CAR_NUMBER, anonymizedAt: new Date() },
+    })
+    total += result.count
+    if (targets.length < PURGE_BATCH_SIZE) break
+  }
+  return total
+}
+
+// 개인정보 보관기간(기본 3년, DATA_RETENTION_DAYS) 경과 건을 물리 삭제 대신 "익명화"한다.
+// 레코드 자체를 지우면 매장별 매출/방문 통계가 깨지므로, 개인정보(전화번호/차량번호)만 식별
+// 불가능한 값으로 덮어써서 개인정보보호법상 파기 의무를 이행한다. 한 번에 최대 1000건씩, 최대
+// 10회(=최대 1만 건) 반복한다 — 대상이 그보다 많으면 다음 스케줄 실행에서 나머지를 처리한다
+// (배치 잡 하나가 너무 오래 걸려 Cloud Scheduler의 타임아웃에 걸리는 걸 막기 위함).
+async function purgeExpiredPersonalData(retentionDays) {
+  const days = Number.isFinite(retentionDays) && retentionDays > 0
+    ? retentionDays
+    : (Number(process.env.DATA_RETENTION_DAYS) || DEFAULT_DATA_RETENTION_DAYS)
+  const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000)
+  const reservations = await purgeExpiredReservations(cutoff)
+  const payments = await purgeExpiredPayments(cutoff)
+  return { reservations, payments }
+}
+
 module.exports = {
   prisma,
+  kstDateString,
+  kstDateRangeUtc,
   ensureDefaultStore,
   ensureDefaultHqAdmin,
   bulkCreateStores,
@@ -412,24 +676,35 @@ module.exports = {
   getAdminUser,
   createAdminUser,
   markAdminLogin,
+  recordFailedLogin,
   createStore,
   listStores,
   getStore,
   findStoreByMerchantId,
+  findStoreByPosToken,
+  rotatePosToken,
   createReservation,
   listReservations,
+  listReservationsPage,
+  listActiveQueueForStore,
   getNextWaitingReservation,
   getReservation,
   deleteReservation,
   markReservationCalled,
+  markReservationCalledFromNotifyFailed,
   markReservationCompleted,
   markReservationNotifyFailed,
+  markReservationCancelled,
   findLatestReservationByPhone,
   createPayment,
   findPaymentByKey,
+  getPayment,
   markPaymentStatus,
+  markPaymentReceiptRetrying,
   listPayments,
+  listPaymentsPage,
   claimDuePromotions,
   markPromoSent,
   releasePromoClaim,
+  purgeExpiredPersonalData,
 }
