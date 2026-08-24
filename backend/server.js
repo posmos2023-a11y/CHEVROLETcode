@@ -719,8 +719,32 @@ const posLimiter = rateLimit({
   message: { ok: false, error: '요청이 너무 많습니다. 잠시 후 다시 시도해주세요.' },
 })
 
+// X-Store-Token 무차별 대입 방어 (validatePosToken 위 주석 참고).
+// 관리자가 짧은 토큰(최소 4자)을 지정할 수 있게 하면서도 안전하려면, 토큰 추측 시도 자체를
+// 막아야 한다. 그래서 "토큰이 틀린 요청(401)"만 세어 IP당 15분에 10회로 제한한다.
+//
+// 두 옵션 조합이 핵심이다:
+//   - skipSuccessfulRequests: 정상 요청은 카운트에서 되돌린다(decrement). POS 탭앱은 5초마다
+//     폴링하므로, 성공까지 세면 정상 매장이 몇 분 만에 스스로 잠긴다.
+//   - requestWasSuccessful: 기본값은 "4xx/5xx면 실패"라서 404(없는 예약 조작)나 409(상태 충돌)
+//     같은 정상 운영 중 발생하는 응답까지 실패로 세어 직원이 잠긴다. 401(토큰 불일치)만
+//     실패로 취급하도록 명시한다.
+//
+// 인스턴스별 메모리가 아니라 DB 스토어를 쓰는 이유: Cloud Run이 인스턴스를 최대 20개까지
+// 띄우므로 메모리 기준이면 공격자가 사실상 20배의 시도 기회를 얻는다.
+const posAuthLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  skipSuccessfulRequests: true,
+  requestWasSuccessful: (req, res) => res.statusCode !== 401,
+  store: new PostgresRateLimitStore(prisma, { prefix: 'pos-auth', windowMs: 15 * 60 * 1000 }),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { ok: false, error: '매장 인증 실패가 반복되어 일시적으로 차단되었습니다. 15분 후 다시 시도해주세요.' },
+})
+
 // 오늘(KST) serviceDate + 아직 끝나지 않은 예약만, queueNumber 오름차순으로 보여준다(계약 §3.13).
-app.get('/api/pos/queue', posQueueReadLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+app.get('/api/pos/queue', posQueueReadLimiter, posAuthLimiter, requireStoreToken, asyncHandler(async (req, res) => {
   const serviceDate = kstDateString()
   const reservations = await listActiveQueueForStore(req.store.id, serviceDate)
   return res.json({
@@ -743,7 +767,7 @@ app.get('/api/pos/queue', posQueueReadLimiter, requireStoreToken, asyncHandler(a
 // 반드시 명시적인 확인 동작(예: 2단계 확인 버튼) 뒤에만 이 엔드포인트를 호출해야 한다 —
 // 서버는 그 UX를 강제할 수 없으므로 프론트(탭앱) 쪽 책임이다.
 // 해당 매장 + 오늘 serviceDate의 예약만 대상으로 한다(계약 §3.14) — 아니면 404.
-app.post('/api/pos/queue/:id/call', posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+app.post('/api/pos/queue/:id/call', posLimiter, posAuthLimiter, requireStoreToken, asyncHandler(async (req, res) => {
   const serviceDate = kstDateString()
   const reservation = await getReservation(req.params.id)
   if (!reservation || reservation.storeId !== req.store.id || reservation.serviceDate !== serviceDate) {
@@ -760,7 +784,7 @@ app.post('/api/pos/queue/:id/call', posLimiter, requireStoreToken, asyncHandler(
 }))
 
 // 해당 매장 + 오늘 serviceDate만 (계약 §3.15).
-app.post('/api/pos/queue/:id/complete', posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+app.post('/api/pos/queue/:id/complete', posLimiter, posAuthLimiter, requireStoreToken, asyncHandler(async (req, res) => {
   const serviceDate = kstDateString()
   const existing = await getReservation(req.params.id)
   if (!existing || existing.storeId !== req.store.id || existing.serviceDate !== serviceDate) {
@@ -778,7 +802,7 @@ app.post('/api/pos/queue/:id/complete', posLimiter, requireStoreToken, asyncHand
 
 // 노쇼 손님을 대기열에서 빼는 용도 (계약 §3.16 신규). 형제 라우트(call/complete)와 동일하게
 // 해당 매장 + 오늘 serviceDate로 범위를 제한한다.
-app.post('/api/pos/queue/:id/cancel', posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+app.post('/api/pos/queue/:id/cancel', posLimiter, posAuthLimiter, requireStoreToken, asyncHandler(async (req, res) => {
   const serviceDate = kstDateString()
   const existing = await getReservation(req.params.id)
   if (!existing || existing.storeId !== req.store.id || existing.serviceDate !== serviceDate) {
@@ -986,7 +1010,18 @@ app.post('/api/admin/stores/bulk', requireAuth, requireRole('hq_admin'), asyncHa
 // 다만 이 토큰이 /api/pos/* 의 유일한 인증 수단이므로 아래 제약을 서버가 강제한다 —
 // 이걸 클라이언트 검증에만 맡기면 API를 직접 호출해 "1234" 같은 값을 넣을 수 있고, 그 순간
 // 이번에 막은 무인증 취약점으로 그대로 되돌아간다.
-const POS_TOKEN_MIN_LENGTH = 16
+// 최소 길이를 4자로 둔 이유와, 그래서 반드시 함께 있어야 하는 방어 장치:
+//
+// 4자(영문/숫자/-/_ 기준 64^4 ≈ 1,670만 가지)는 그 자체로는 절대 안전하지 않다. 게다가 실제로는
+// 무작위가 아니라 "1234", "1001", 매장 약칭 같은 값을 쓰게 되므로, 흔한 후보 수백 개만 돌려봐도
+// 뚫린다. 그런데도 짧은 값을 허용하는 건 POS 단말기에서 긴 문자열을 손으로 입력하는 게 현실적으로
+// 불가능해서다(운영이 불편하면 결국 토큰을 아무 데나 적어두게 되어 더 위험해진다).
+//
+// 그래서 "짧은 비밀번호 + 시도 횟수 제한"이라는 ATM PIN과 같은 모델을 쓴다. 아래 posAuthLimiter가
+// 토큰이 틀린 요청(401)만 세어서 IP당 15분에 10회로 막기 때문에, 4자라도 전수/사전 공격이
+// 현실적으로 불가능해진다. 둘 중 하나라도 빠지면 이번에 막은 무인증 취약점으로 되돌아간다 —
+// 길이 제한을 더 낮추거나 posAuthLimiter를 제거할 때는 반드시 같이 판단해야 한다.
+const POS_TOKEN_MIN_LENGTH = 4
 const POS_TOKEN_MAX_LENGTH = 128
 const POS_TOKEN_RE = /^[A-Za-z0-9_-]+$/
 
@@ -998,10 +1033,9 @@ function validatePosToken(raw) {
   if (!POS_TOKEN_RE.test(token)) {
     return { error: 'POS 토큰은 영문/숫자/하이픈(-)/밑줄(_)만 사용할 수 있습니다.' }
   }
-  // 같은 문자만 반복하거나(0000...) 서로 다른 문자가 너무 적으면 길이만 채운 것이라 사실상
-  // 추측 가능하다. 길이 검사만으로는 이런 값을 막을 수 없어서 최소 종류 수도 함께 본다.
-  if (new Set(token).size < 6) {
-    return { error: 'POS 토큰이 너무 단순합니다. 서로 다른 문자를 6종류 이상 사용해주세요.' }
+  // "1111", "0000"처럼 한 글자만 반복하는 값은 후보군이 64개뿐이라 시도 제한이 있어도 위험하다.
+  if (new Set(token).size < 2) {
+    return { error: 'POS 토큰이 너무 단순합니다. 같은 문자만 반복할 수 없습니다.' }
   }
   return { token }
 }

@@ -575,7 +575,7 @@ function posTokenRow(storeId, name, merchantId, posToken, canRegen) {
           단 이 값이 곧 POS API의 비밀번호이므로 서버가 길이/문자/단순함을 강제한다(400으로 거부).
         -->
         <div class="pos-token-set">
-          <input type="text" class="pos-token-input" placeholder="직접 지정 (16자 이상)" maxlength="128" autocomplete="off" spellcheck="false" />
+          <input type="text" class="pos-token-input" placeholder="직접 지정 (4자 이상)" maxlength="128" autocomplete="off" spellcheck="false" />
           <button class="row-btn pos-token-save" type="button">저장</button>
         </div>
       </div>` : ''}</td>
