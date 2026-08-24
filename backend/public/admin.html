@@ -195,6 +195,20 @@
   }
   #pos-token-body table { width: 100%; }
   #pos-token-body td { white-space: normal; }
+  .pos-token-actions { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+  .pos-token-set { display: flex; gap: 6px; align-items: center; }
+  .pos-token-input {
+    width: 190px;
+    padding: 6px 10px;
+    font-size: 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    background: var(--surface);
+    border: 1.5px solid transparent;
+    border-radius: 8px;
+    outline: none;
+    color: var(--ink);
+  }
+  .pos-token-input:focus { border-color: var(--blue); background: #fff; }
   .testform {
     background: #fff;
     border-radius: 16px;
@@ -552,7 +566,19 @@ function posTokenRow(storeId, name, merchantId, posToken, canRegen) {
       <button class="row-btn pos-token-toggle" type="button">보기</button>
       <button class="row-btn pos-token-copy" type="button">복사</button>
     </td>
-    <td>${canRegen ? '<button class="row-btn pos-token-regen" type="button">재발급</button>' : ''}</td>
+    <td>${canRegen ? `
+      <div class="pos-token-actions">
+        <button class="row-btn pos-token-regen" type="button">무작위 재발급</button>
+        <!--
+          직접 지정: 무작위 64자 hex는 안전하지만 POS 단말기에서 손으로 입력하기가 사실상 불가능해서,
+          매장에 불러주거나 적어 전달할 수 있는 값을 관리자가 정할 수 있게 한다.
+          단 이 값이 곧 POS API의 비밀번호이므로 서버가 길이/문자/단순함을 강제한다(400으로 거부).
+        -->
+        <div class="pos-token-set">
+          <input type="text" class="pos-token-input" placeholder="직접 지정 (16자 이상)" maxlength="128" autocomplete="off" spellcheck="false" />
+          <button class="row-btn pos-token-save" type="button">저장</button>
+        </div>
+      </div>` : ''}</td>
   </tr>`
 }
 
@@ -606,13 +632,27 @@ posTokenBody.addEventListener('click', async (e) => {
     return
   }
 
-  if (e.target.classList.contains('pos-token-regen')) {
-    if (!confirm('토큰을 재발급하면 기존 POS 단말기에 등록된 토큰은 즉시 무효화됩니다. POS 탭앱에서 토큰을 다시 입력해야 합니다. 계속할까요?')) return
+  // 무작위 재발급과 직접 지정은 같은 엔드포인트를 쓴다 — body에 posToken이 있으면 그 값으로,
+  // 없으면 서버가 무작위로 발급한다. 둘 다 기존 토큰을 즉시 무효화하므로 확인 문구는 공유한다.
+  const isRegen = e.target.classList.contains('pos-token-regen')
+  const isSave = e.target.classList.contains('pos-token-save')
+  if (isRegen || isSave) {
+    let customToken = null
+    if (isSave) {
+      const input = tr.querySelector('.pos-token-input')
+      customToken = (input?.value || '').trim()
+      if (!customToken) {
+        alert('지정할 토큰 값을 입력해주세요.')
+        return
+      }
+    }
+    if (!confirm('토큰을 바꾸면 기존 POS 단말기에 등록된 토큰은 즉시 무효화됩니다. POS 탭앱에서 토큰을 다시 입력해야 합니다. 계속할까요?')) return
     e.target.disabled = true
     try {
       const res = await fetch(`/api/admin/stores/${storeId}/pos-token`, {
         method: 'POST',
-        headers: { authorization: 'Bearer ' + token },
+        headers: { 'Content-Type': 'application/json', authorization: 'Bearer ' + token },
+        body: JSON.stringify(customToken ? { posToken: customToken } : {}),
       })
       const body = await res.json().catch(() => ({}))
       if (res.status === 401) {
@@ -621,11 +661,13 @@ posTokenBody.addEventListener('click', async (e) => {
         return
       }
       if (!res.ok || !body.ok) {
-        alert(body.error || '재발급에 실패했습니다.')
+        // 서버가 길이/문자/단순함 위반은 400, 다른 매장이 쓰는 값이면 409로 사유를 돌려준다.
+        alert(body.error || (isSave ? '토큰 지정에 실패했습니다.' : '재발급에 실패했습니다.'))
         return
       }
       const store = stores.find(s => s.id === storeId)
       if (store) store.posToken = body.posToken
+      if (myStoreInfo && myStoreInfo.id === storeId) myStoreInfo.posToken = body.posToken
       renderPosTokens()
     } catch (err) {
       alert('요청 중 오류가 발생했습니다.')

@@ -22,6 +22,7 @@ const {
   findStoreByMerchantId,
   findStoreByPosToken,
   rotatePosToken,
+  setPosToken,
   createReservation,
   listReservationsPage,
   listActiveQueueForStore,
@@ -977,8 +978,56 @@ app.post('/api/admin/stores/bulk', requireAuth, requireRole('hq_admin'), asyncHa
 
 // POS 토큰 회전 (본사 전용, 계약 §3.20 신규). 토큰 유출이 의심될 때 예전 토큰을 즉시 무효화하고
 // 새 토큰을 발급한다 — 매장 단말기는 새 토큰을 다시 입력받아야 한다(계약 §12).
+// POS 토큰 재발급/직접지정 (본사 전용).
+// body가 비어 있으면 무작위 64자 hex로 재발급하고, { posToken: "..." }를 주면 그 값으로 지정한다.
+// 직접 지정을 허용하는 이유: 무작위 64자는 안전하지만 매장 단말기에서 손으로 입력하기가 사실상
+// 불가능하다. 실제 운영에서는 관리자가 매장에 불러주거나 적어서 전달해야 해서, 입력 가능한
+// 길이의 값을 정할 수 있어야 한다.
+// 다만 이 토큰이 /api/pos/* 의 유일한 인증 수단이므로 아래 제약을 서버가 강제한다 —
+// 이걸 클라이언트 검증에만 맡기면 API를 직접 호출해 "1234" 같은 값을 넣을 수 있고, 그 순간
+// 이번에 막은 무인증 취약점으로 그대로 되돌아간다.
+const POS_TOKEN_MIN_LENGTH = 16
+const POS_TOKEN_MAX_LENGTH = 128
+const POS_TOKEN_RE = /^[A-Za-z0-9_-]+$/
+
+function validatePosToken(raw) {
+  const token = String(raw).trim()
+  if (token.length < POS_TOKEN_MIN_LENGTH || token.length > POS_TOKEN_MAX_LENGTH) {
+    return { error: `POS 토큰은 ${POS_TOKEN_MIN_LENGTH}자 이상 ${POS_TOKEN_MAX_LENGTH}자 이하여야 합니다.` }
+  }
+  if (!POS_TOKEN_RE.test(token)) {
+    return { error: 'POS 토큰은 영문/숫자/하이픈(-)/밑줄(_)만 사용할 수 있습니다.' }
+  }
+  // 같은 문자만 반복하거나(0000...) 서로 다른 문자가 너무 적으면 길이만 채운 것이라 사실상
+  // 추측 가능하다. 길이 검사만으로는 이런 값을 막을 수 없어서 최소 종류 수도 함께 본다.
+  if (new Set(token).size < 6) {
+    return { error: 'POS 토큰이 너무 단순합니다. 서로 다른 문자를 6종류 이상 사용해주세요.' }
+  }
+  return { token }
+}
+
 app.post('/api/admin/stores/:id/pos-token', requireAuth, requireRole('hq_admin'), asyncHandler(async (req, res) => {
-  const store = await rotatePosToken(req.params.id)
+  const raw = req.body?.posToken
+  const wantsCustom = raw !== undefined && raw !== null && String(raw).trim() !== ''
+
+  let store
+  if (wantsCustom) {
+    const { token, error } = validatePosToken(raw)
+    if (error) {
+      return res.status(400).json({ ok: false, error })
+    }
+    try {
+      store = await setPosToken(req.params.id, token)
+    } catch (e) {
+      if (e?.code === 'POS_TOKEN_TAKEN') {
+        return res.status(409).json({ ok: false, error: e.message })
+      }
+      throw e
+    }
+  } else {
+    store = await rotatePosToken(req.params.id)
+  }
+
   if (!store) {
     return res.status(404).json({ ok: false, error: '매장을 찾을 수 없습니다.' })
   }

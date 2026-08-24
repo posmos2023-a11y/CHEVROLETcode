@@ -209,6 +209,25 @@ async function rotatePosToken(storeId) {
   }
 }
 
+// 본사 관리자가 토큰 값을 직접 지정할 때 쓴다. 무작위 64자 hex는 안전하지만 POS 단말기에서
+// 손으로 입력하기가 사실상 불가능해서, 매장에 전달·입력하기 쉬운 값을 관리자가 정할 수 있게 한다.
+// 다만 이 토큰 자체가 /api/pos/* 의 유일한 인증 수단이라 짧거나 뻔한 값을 쓰면 원래 취약점으로
+// 되돌아간다 — 그래서 길이/문자 제약은 서버(validatePosToken)에서 강제한다.
+// 다른 매장이 이미 쓰는 값이면 unique 제약(P2002)에 걸리므로 호출부가 409로 변환할 수 있게
+// 코드를 붙여 던진다(조용히 null을 반환하면 "매장 없음"과 구분이 안 된다).
+async function setPosToken(storeId, posToken) {
+  try {
+    return await prisma.store.update({ where: { id: storeId }, data: { posToken } })
+  } catch (e) {
+    if (e?.code === 'P2002') {
+      const conflict = new Error('다른 매장이 이미 사용 중인 토큰입니다.')
+      conflict.code = 'POS_TOKEN_TAKEN'
+      throw conflict
+    }
+    return null
+  }
+}
+
 // 매장·날짜별 대기번호 채번을 원자적 UPSERT(INSERT ... ON CONFLICT ... DO UPDATE) 한 문장으로 처리한다.
 // ⚠️ 예전 comment는 "이 함수 전체가 하나의 Prisma $transaction 안에 있으니 채번도 안전하게
 // 직렬화된다"고 적혀 있었는데, 이는 틀린 설명이다 — Postgres의 기본 격리수준인 READ COMMITTED에서는
@@ -683,6 +702,7 @@ module.exports = {
   findStoreByMerchantId,
   findStoreByPosToken,
   rotatePosToken,
+  setPosToken,
   createReservation,
   listReservations,
   listReservationsPage,
