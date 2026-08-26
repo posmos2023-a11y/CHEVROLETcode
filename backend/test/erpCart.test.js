@@ -1613,3 +1613,47 @@ testSerial('개인정보 파기: 홍보 발송 기록의 전화번호도 지운�
   assert.equal(row.carNumber, null)
   assert.equal(row.anonymizedAt instanceof Date, true)
 })
+
+testSerial('POS 오늘 현황: 접수·완료·전산주문·결제액이 나온다', async () => {
+  // 매장 직원이 관리자 웹에 들어가지 않고 "오늘 몇 대 봤나"를 확인하는 화면의 데이터.
+  const store = await createStore('possummary')
+  const today = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10)
+  for (const [car, st, q] of [['12가3456', 'waiting', 1], ['34나5678', 'completed', 2]]) {
+    await prisma.reservation.create({
+      data: {
+        storeId: store.id, carNumber: car, phone: '01012345678', serviceType: '엔진오일',
+        queueNumber: q, serviceDate: today, status: st,
+        completedAt: st === 'completed' ? new Date() : null,
+      },
+    })
+  }
+  const body = validBody(store)
+  assert.equal((await postCart(body)).status, 201)
+  const cartId = (await getPosCarts(store)).body.carts[0].id
+  await consumeCart(store, cartId, { result: 'loaded' })
+  await request(app).post(`/api/pos/erp-carts/${cartId}/paid`).set('X-Store-Token', store.posToken).send({})
+
+  const res = await request(app).get('/api/pos/summary').set('X-Store-Token', store.posToken)
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal(res.body.serviceDate, today)
+  assert.equal(res.body.received, 2)
+  assert.equal(res.body.completed, 1)
+  assert.equal(res.body.erpCarts, 1)
+  assert.equal(res.body.erpCartsPaid, 1)
+  assert.equal(res.body.paidAmount, body.totalAmount)
+})
+
+testSerial('POS 오늘 현황: 다른 매장 숫자가 섞이지 않는다', async () => {
+  const storeA = await createStore('possummary-a')
+  const storeB = await createStore('possummary-b')
+  assert.equal((await postCart(validBody(storeA))).status, 201)
+
+  const res = await request(app).get('/api/pos/summary').set('X-Store-Token', storeB.posToken)
+  assert.equal(res.body.erpCarts, 0)
+  assert.equal(res.body.received, 0)
+})
+
+testSerial('POS 오늘 현황: 매장 토큰 없이는 볼 수 없다', async () => {
+  const res = await request(app).get('/api/pos/summary')
+  assert.equal(res.status, 401)
+})

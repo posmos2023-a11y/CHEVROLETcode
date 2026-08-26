@@ -67,6 +67,7 @@ const {
   markErpCartDismissed,
   markErpCartPaid,
   listErpCarts,
+  getPosDailySummary,
   findRepairHistoryByCarNumber,
   findMarketingContactByCarNumber,
   findLastPromoSend,
@@ -1795,6 +1796,15 @@ app.get('/api/erp/draft-orders/:referenceId', erpLimiter, requireErpToken, async
     createdAt: order.createdAt,
     paidAt: order.paidAt,
   })
+}))
+
+// 매장이 POS에서 보는 오늘 현황. 관리자 웹에 들어가지 않고도 "오늘 몇 대 봤나"를 확인한다.
+// 폴링(대기열)과 달리 화면을 열 때만 부르므로 부하가 없다.
+app.get('/api/pos/summary', posIpFloodLimiter, posQueueReadLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  const serviceDate = kstDateString()
+  const { start, end } = kstDateRangeUtc(serviceDate)
+  const summary = await getPosDailySummary(req.store.id, serviceDate, start, end)
+  return res.json({ ok: true, serviceDate, ...summary })
 }))
 
 // ── 수동 홍보 발송의 차단 조건 ────────────────────────────────────────────────

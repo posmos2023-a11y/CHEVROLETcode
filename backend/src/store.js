@@ -991,6 +991,33 @@ function recordPromoSend({ storeId, carNumber, phone, sentBy }) {
   })
 }
 
+// 매장이 POS에서 보는 오늘 현황. 관리자 웹의 getDailySummary와 목적이 다르다 —
+// 저쪽은 본사가 여러 매장을 비교하는 용도라 상태별로 잘게 쪼개져 있고, 여기는 매장 직원이
+// "오늘 몇 대 봤나"를 한눈에 보는 용도라 숫자 네 개면 충분하다.
+//
+// 예약은 serviceDate(접수일) 기준, 전산 주문은 createdAt 기준이다 — 두 모델의 "그 날" 기준이
+// 원래 다르다(getDailySummary도 같은 이유로 인자를 나눠 받는다).
+async function getPosDailySummary(storeId, serviceDate, dateStart, dateEnd) {
+  const reservationWhere = { storeId, serviceDate }
+  const cartWhere = { storeId, createdAt: { gte: dateStart, lt: dateEnd } }
+
+  const [received, completed, cartTotal, cartPaid, paidAmount] = await Promise.all([
+    prisma.reservation.count({ where: reservationWhere }),
+    prisma.reservation.count({ where: { ...reservationWhere, status: 'completed' } }),
+    prisma.erpCart.count({ where: cartWhere }),
+    prisma.erpCart.count({ where: { ...cartWhere, status: 'paid' } }),
+    prisma.erpCart.aggregate({ where: { ...cartWhere, status: 'paid' }, _sum: { totalAmount: true } }),
+  ])
+
+  return {
+    received,
+    completed,
+    erpCarts: cartTotal,
+    erpCartsPaid: cartPaid,
+    paidAmount: paidAmount._sum.totalAmount || 0,
+  }
+}
+
 // 차량번호로 그 차의 정비 이력을 찾는다. POS 탭앱에서 직원이 "이 차 지난번에 뭐 갈았지?"를
 // 확인하는 용도다.
 //
@@ -1368,6 +1395,7 @@ module.exports = {
   markErpCartDismissed,
   markErpCartPaid,
   listErpCarts,
+  getPosDailySummary,
   findRepairHistoryByCarNumber,
   findMarketingContactByCarNumber,
   findLastPromoSend,

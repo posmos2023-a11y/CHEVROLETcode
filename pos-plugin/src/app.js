@@ -5,6 +5,9 @@ import { initErpCarts, refreshErpCarts, applyErpCarts } from './erpCarts.js'
 // 차량번호로 지난 정비 내역을 보는 화면. 정비소에서 가장 자주 나오는 질문이라 대기 카드에서
 // 바로 열 수 있게 해뒀다.
 import { initHistory, openHistoryFor } from './history.js'
+// 좌측 메뉴와 화면 전환. 화면을 나누면 전산 주문이 메뉴 뒤로 숨는데, 그때 새 주문을
+// 놓치지 않게 배지와 토스트로 알리는 것도 이 모듈이 맡는다.
+import { initNav, switchTo, registerViewLoader, updateBadges, notifyNewErpCarts } from './nav.js'
 
 // 실제 토스POS 단말기 밖(로컬 브라우저)에서 미리 볼 때는 posPluginSdk가 부모 프레임(POS 앱)과
 // 통신하지 못해 응답이 오지 않는다. 백엔드가 제공하는 미리보기에서는 같은 origin을 사용하고,
@@ -106,6 +109,8 @@ function updateSummary(reservations) {
   const waiting = reservations.filter((reservation) => reservation.status === 'waiting')
   waitingCountEl.textContent = String(waiting.length)
   nextNumberEl.textContent = waiting.length ? `#${waiting[0].queueNumber}` : '—'
+  // 다른 화면을 보고 있어도 대기 인원이 메뉴에 보이게 한다.
+  updateBadges({ waiting: waiting.length })
 }
 
 function updateLastUpdated() {
@@ -301,6 +306,8 @@ function escapeHtml(s) {
 listEl.addEventListener('click', (e) => {
   const historyBtn = e.target.closest('button[data-history]')
   if (historyBtn) {
+    // 이력은 이제 별도 화면이다. 옮겨간 뒤 그 차량번호로 바로 조회한다.
+    switchTo('history')
     openHistoryFor(historyBtn.dataset.history)
     return
   }
@@ -340,6 +347,8 @@ async function loadQueue({ manual = false } = {}) {
     // 아직 그 필드를 안 주는 서버(배포 과도기)일 수도 있으므로, 없을 때만 옛 경로를 부른다.
     if (Array.isArray(body.erpCarts)) {
       applyErpCarts(body.erpCarts)
+      updateBadges({ erpCarts: body.erpCarts.length })
+      notifyNewErpCarts(body.erpCarts)
     } else {
       await refreshErpCarts()
     }
@@ -530,5 +539,61 @@ async function main() {
 // 막기 위해서다.
 initErpCarts({ apiGet, apiPost, notify, escapeHtml, onUnauthorized: handleUnauthorized })
 initHistory({ apiGet, apiPost, notify, escapeHtml, onUnauthorized: handleUnauthorized })
+initNav({ notify })
+
+// 오늘 현황은 폴링 대상이 아니다 — 화면을 열 때와 새로고침을 누를 때만 부른다.
+registerViewLoader('today', loadTodaySummary)
+registerViewLoader('settings', renderSettings)
+
+function todayCard(label, value, unit, note) {
+  return `
+    <div class="today-card">
+      <span class="today-label">${escapeHtml(label)}</span>
+      <strong class="today-value">${escapeHtml(String(value))}</strong>${unit ? `<span class="today-unit">${escapeHtml(unit)}</span>` : ''}
+      ${note ? `<span class="today-note">${escapeHtml(note)}</span>` : ''}
+    </div>
+  `
+}
+
+async function loadTodaySummary() {
+  const body = document.getElementById('today-body')
+  if (!body) return
+  body.innerHTML = '<div class="empty"><div class="empty-copy">불러오는 중...</div></div>'
+  try {
+    const { ok, status, body: res } = await apiGet('/api/pos/summary')
+    if (!ok) {
+      if (status === 401) {
+        handleUnauthorized(res.error)
+        return
+      }
+      body.innerHTML = `<div class="empty"><div class="empty-copy">${escapeHtml(res.error || '불러오지 못했습니다.')}</div></div>`
+      return
+    }
+    const dateEl = document.getElementById('today-date')
+    if (dateEl) dateEl.textContent = `${res.serviceDate} 기준`
+    body.innerHTML = [
+      todayCard('접수', res.received, '건', '오늘 들어온 예약'),
+      todayCard('정비완료', res.completed, '건', '처리를 마친 건'),
+      todayCard('전산 주문', res.erpCarts, '건', `그중 결제완료 ${res.erpCartsPaid}건`),
+      todayCard('결제 금액', Number(res.paidAmount).toLocaleString('ko-KR'), '원', '전산 주문 결제분'),
+    ].join('')
+  } catch {
+    body.innerHTML = '<div class="empty"><div class="empty-copy">네트워크 연결을 확인한 뒤 다시 시도해주세요.</div></div>'
+  }
+}
+
+function renderSettings() {
+  const storeEl = document.getElementById('settings-store')
+  const connEl = document.getElementById('settings-connection')
+  if (storeEl) storeEl.textContent = storeNameEl.textContent || '—'
+  if (connEl) {
+    const dot = connectionDotEl.className
+    connEl.textContent = dot.includes('error') ? '연결 안 됨'
+      : dot.includes('checking') ? '확인 중' : '정상'
+  }
+}
+
+const todayRefreshEl = document.getElementById('today-refresh')
+if (todayRefreshEl) todayRefreshEl.addEventListener('click', loadTodaySummary)
 
 main()

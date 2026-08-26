@@ -49,7 +49,7 @@
   }
 
   #app {
-    width: min(100%, 760px);
+    width: min(100%, 1080px);
     min-height: 100vh;
     margin: 0 auto;
     padding: 20px 18px 28px;
@@ -713,6 +713,156 @@
     cursor: pointer;
   }
 
+  /* ── 사이드바 레이아웃 ─────────────────────────────────────────────────
+     POS 단말기 크기가 매장마다 달라서 한쪽만 가정할 수 없다. 넓으면 좌측 메뉴,
+     좁으면(세로 태블릿 등) 가로 탭 줄로 바뀐다. */
+  .shell {
+    display: grid;
+    grid-template-columns: 168px minmax(0, 1fr);
+    gap: 18px;
+    align-items: start;
+  }
+
+  .sidenav {
+    display: grid;
+    gap: 6px;
+    position: sticky;
+    top: 20px;
+  }
+
+  .nav-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    /* 터치로 누르는 화면이라 손가락에 맞는 높이를 준다. */
+    min-height: 48px;
+    padding: 0 14px;
+    border: 1px solid transparent;
+    border-radius: 14px;
+    background: transparent;
+    color: var(--sub);
+    font-size: 14px;
+    font-weight: 700;
+    letter-spacing: -0.03em;
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .nav-item:active { transform: scale(0.98); }
+
+  .nav-item.is-active {
+    border-color: transparent;
+    background: var(--blue-soft);
+    color: var(--blue-strong);
+  }
+
+  .nav-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 22px;
+    height: 22px;
+    padding: 0 6px;
+    border-radius: 11px;
+    background: var(--line);
+    color: var(--sub);
+    font-size: 11px;
+    font-weight: 800;
+  }
+
+  /* 전산 주문 배지. 메뉴 뒤에 숨은 새 주문을 놓치지 않게 눈에 띄는 색을 쓴다. */
+  .nav-badge.accent { background: var(--blue); color: #fff; }
+
+  .view { display: none; }
+  .view.is-active { display: block; }
+
+  /* 좁은 화면: 좌측 메뉴를 상단 가로 탭으로 */
+  @media (max-width: 719px) {
+    .shell { grid-template-columns: minmax(0, 1fr); gap: 14px; }
+    .sidenav {
+      position: static;
+      display: flex;
+      gap: 6px;
+      overflow-x: auto;
+      padding-bottom: 4px;
+    }
+    .nav-item { flex: 0 0 auto; min-height: 44px; }
+  }
+
+  /* 오늘 현황 */
+  .today-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 10px;
+  }
+
+  .today-card {
+    padding: 18px;
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    background: var(--surface);
+    box-shadow: var(--shadow);
+  }
+
+  .today-label {
+    display: block;
+    margin-bottom: 10px;
+    color: var(--sub);
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+  }
+
+  .today-value { font-size: 30px; line-height: 1; letter-spacing: -0.05em; }
+  .today-unit { margin-left: 3px; font-size: 13px; font-weight: 700; }
+  .today-note { display: block; margin-top: 10px; color: var(--muted); font-size: 12px; }
+
+  /* 설정 */
+  .settings-card {
+    padding: 18px;
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    background: var(--surface);
+    box-shadow: var(--shadow);
+  }
+
+  .settings-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 11px 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .settings-key { color: var(--sub); font-size: 13px; font-weight: 600; }
+  .settings-value { font-size: 14px; font-weight: 700; letter-spacing: -0.03em; }
+
+  .settings-note {
+    margin-top: 14px;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.6;
+  }
+
+  .token-reset-button.wide {
+    width: 100%;
+    min-height: 46px;
+    margin-top: 12px;
+    border-radius: 13px;
+    font-size: 13px;
+  }
+
+  /* 뷰 안으로 들어온 이력 패널은 카드 테두리를 중복해서 두르지 않는다. */
+  #view-history .history-panel {
+    margin-top: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    box-shadow: none;
+  }
+
   .sr-only {
     position: absolute;
     width: 1px;
@@ -859,84 +1009,152 @@
       <header class="topbar">
         <div>
           <span class="eyebrow">매장 대기관리</span>
-          <h1>정비 대기열</h1>
+          <h1 id="view-title">정비 대기</h1>
         </div>
         <div class="store-status">
           <span class="connection-dot checking" id="connection-dot" aria-hidden="true"></span>
           <span id="store-name">매장 확인 중</span>
-          <button class="token-reset-button" id="token-reset-button" type="button">토큰 재설정</button>
         </div>
       </header>
 
-      <section class="summary" aria-label="대기열 요약">
-        <div class="summary-card primary">
-          <span class="summary-label">현재 대기</span>
-          <strong class="summary-value" id="waiting-count">0</strong><span class="summary-unit">명</span>
-          <span class="summary-note">아직 호출되지 않은 고객</span>
-        </div>
-        <div class="summary-card">
-          <span class="summary-label">다음 호출</span>
-          <strong class="summary-value" id="next-number">—</strong>
-          <span class="summary-note">가장 먼저 호출할 번호</span>
-        </div>
-      </section>
+      <div class="shell">
+        <!-- 좌측 메뉴. 화면이 좁으면(세로 태블릿 등) 가로 탭 줄로 바뀐다 — POS 단말기 크기가
+             매장마다 달라서 한쪽만 가정할 수 없다. -->
+        <nav class="sidenav" aria-label="화면 이동">
+          <button class="nav-item is-active" type="button" data-view="queue">
+            <span class="nav-label">정비 대기</span>
+            <span class="nav-badge" id="nav-badge-queue" hidden>0</span>
+          </button>
+          <button class="nav-item" type="button" data-view="erp">
+            <span class="nav-label">전산 주문</span>
+            <!-- 이 배지가 없으면 메뉴 뒤에 숨은 새 주문을 직원이 놓친다. -->
+            <span class="nav-badge accent" id="nav-badge-erp" hidden>0</span>
+          </button>
+          <button class="nav-item" type="button" data-view="history">
+            <span class="nav-label">정비 이력</span>
+          </button>
+          <button class="nav-item" type="button" data-view="today">
+            <span class="nav-label">오늘 현황</span>
+          </button>
+          <button class="nav-item" type="button" data-view="settings">
+            <span class="nav-label">설정</span>
+          </button>
+        </nav>
 
-      <section class="erp-cart-section" aria-labelledby="erp-cart-heading">
-        <div class="section-heading">
-          <div>
-            <h2 id="erp-cart-heading">전산 주문</h2>
-            <p>전산에서 담은 주문을 POS 장바구니로 옮깁니다</p>
+        <div class="view-area">
+          <section class="view is-active" id="view-queue">
+        <section class="summary" aria-label="대기열 요약">
+          <div class="summary-card primary">
+            <span class="summary-label">현재 대기</span>
+            <strong class="summary-value" id="waiting-count">0</strong><span class="summary-unit">명</span>
+            <span class="summary-note">아직 호출되지 않은 고객</span>
           </div>
-        </div>
-        <!-- 자바스크립트가 아직 첫 응답을 못 받았거나(로컬 미리보기에서 서버가 없는 경우 등)
-             JS 실행 전이라도 빈 상태가 보이도록 기본값을 정적으로 넣어둔다. 응답이 오면
-             renderErpCarts()가 그대로 덮어쓴다. -->
-        <div class="list" id="erp-cart-list">
-          <div class="empty">
-            <div class="empty-mark" aria-hidden="true">✓</div>
-            <div class="empty-title">전산에서 보낸 주문이 없습니다</div>
-            <div class="empty-copy">전산에서 물건을 담으면 이곳에 표시됩니다.</div>
+          <div class="summary-card">
+            <span class="summary-label">다음 호출</span>
+            <strong class="summary-value" id="next-number">—</strong>
+            <span class="summary-note">가장 먼저 호출할 번호</span>
           </div>
-        </div>
-      </section>
+        </section>
 
-      <section aria-labelledby="queue-heading">
-        <div class="section-heading">
-          <div>
-            <h2 id="queue-heading">대기 고객</h2>
-            <p id="last-updated">5초마다 자동 업데이트</p>
+        <section aria-labelledby="queue-heading">
+          <div class="section-heading">
+            <div>
+              <h2 id="queue-heading">대기 고객</h2>
+              <p id="last-updated">5초마다 자동 업데이트</p>
+            </div>
+            <div class="section-actions">
+              <!-- 대기열이 비어 있어도 이력을 볼 수 있어야 한다. 자주 찾는 건 오늘 손님이 아니라
+                   지난번에 왔던 차라, 카드에 달린 버튼만으로는 닿지 않는다. -->
+              <button class="history-open-button" id="history-open" type="button">정비 이력</button>
+              <button class="refresh-button" id="refresh-button" type="button" aria-label="대기열 새로고침">↻</button>
+            </div>
           </div>
-          <div class="section-actions">
-            <!-- 대기열이 비어 있어도 이력을 볼 수 있어야 한다. 자주 찾는 건 오늘 손님이 아니라
-                 지난번에 왔던 차라, 카드에 달린 버튼만으로는 닿지 않는다. -->
-            <button class="history-open-button" id="history-open" type="button">정비 이력</button>
-            <button class="refresh-button" id="refresh-button" type="button" aria-label="대기열 새로고침">↻</button>
-          </div>
-        </div>
-        <div class="list" id="list"></div>
-      </section>
+          <div class="list" id="list"></div>
+        </section>
 
-      <div class="hint">
-        <span class="hint-mark" aria-hidden="true">i</span>
-        <p>호출·완료·취소는 버튼을 한 번 누른 뒤 3초 안에 같은 버튼을 한 번 더 눌러 확정합니다. 취소는 노쇼 등으로 대기열에서 뺄 때 사용하며 되돌릴 수 없습니다.</p>
+        <div class="hint">
+          <span class="hint-mark" aria-hidden="true">i</span>
+          <p>호출·완료·취소는 버튼을 한 번 누른 뒤 3초 안에 같은 버튼을 한 번 더 눌러 확정합니다. 취소는 노쇼 등으로 대기열에서 뺄 때 사용하며 되돌릴 수 없습니다.</p>
+        </div>
+
+          </section>
+
+          <section class="view" id="view-erp">
+        <section class="erp-cart-section" aria-labelledby="erp-cart-heading">
+          <div class="section-heading">
+            <div>
+              <h2 id="erp-cart-heading">전산 주문</h2>
+              <p>전산에서 담은 주문을 POS 장바구니로 옮깁니다</p>
+            </div>
+          </div>
+          <!-- 자바스크립트가 아직 첫 응답을 못 받았거나(로컬 미리보기에서 서버가 없는 경우 등)
+               JS 실행 전이라도 빈 상태가 보이도록 기본값을 정적으로 넣어둔다. 응답이 오면
+               renderErpCarts()가 그대로 덮어쓴다. -->
+          <div class="list" id="erp-cart-list">
+            <div class="empty">
+              <div class="empty-mark" aria-hidden="true">✓</div>
+              <div class="empty-title">전산에서 보낸 주문이 없습니다</div>
+              <div class="empty-copy">전산에서 물건을 담으면 이곳에 표시됩니다.</div>
+            </div>
+          </div>
+        </section>
+
+          </section>
+
+          <section class="view" id="view-history">
+      <div class="history-panel" id="history-panel">
+        <form class="history-form" id="history-form">
+          <input type="text" id="history-input" placeholder="차량번호 (예: 12가3456)"
+                 maxlength="12" autocomplete="off" spellcheck="false" />
+          <button type="submit">조회</button>
+        </form>
+        <div class="history-body" id="history-body"></div>
+        <!-- 홍보 발송. 보낼 수 있을 때만 버튼이 뜨고, 아니면 이유가 뜬다. -->
+        <div class="history-promo" id="history-promo" hidden></div>
       </div>
 
+          </section>
+
+          <section class="view" id="view-today">
+            <div class="section-heading">
+              <div>
+                <h2>오늘 현황</h2>
+                <p id="today-date">—</p>
+              </div>
+              <button class="refresh-button" id="today-refresh" type="button" aria-label="새로고침">↻</button>
+            </div>
+            <div class="today-grid" id="today-body">
+              <div class="empty"><div class="empty-copy">불러오는 중...</div></div>
+            </div>
+          </section>
+
+          <section class="view" id="view-settings">
+            <div class="section-heading">
+              <div>
+                <h2>설정</h2>
+                <p>이 단말기의 매장 연결 정보입니다</p>
+              </div>
+            </div>
+            <div class="settings-card">
+              <div class="settings-row">
+                <span class="settings-key">매장</span>
+                <span class="settings-value" id="settings-store">—</span>
+              </div>
+              <div class="settings-row">
+                <span class="settings-key">연결 상태</span>
+                <span class="settings-value" id="settings-connection">확인 중</span>
+              </div>
+              <p class="settings-note">
+                토큰이 노출됐거나 담당자가 바뀌면 관리자 웹에서 재발급한 뒤 아래 버튼으로
+                이 단말기에 새 토큰을 다시 입력하세요.
+              </p>
+              <button class="token-reset-button wide" id="token-reset-button" type="button">토큰 재설정</button>
+            </div>
+          </section>
+        </div>
+      </div>
     </div>
-    <!-- 정비 이력. 평소에는 숨어 있고, 대기 카드의 [이력]을 누르거나 직접 검색할 때만 뜬다. -->
-    <section class="history-panel" id="history-panel" hidden>
-      <div class="history-head">
-        <h2>정비 이력</h2>
-        <button class="history-close" id="history-close" type="button" aria-label="닫기">✕</button>
-      </div>
-      <form class="history-form" id="history-form">
-        <input type="text" id="history-input" placeholder="차량번호 (예: 12가3456)"
-               maxlength="12" autocomplete="off" spellcheck="false" />
-        <button type="submit">조회</button>
-      </form>
-      <div class="history-body" id="history-body"></div>
-      <!-- 홍보 발송. 보낼 수 있을 때만 버튼이 뜨고, 아니면 이유가 뜬다. -->
-      <div class="history-promo" id="history-promo" hidden></div>
-    </section>
+
 
     <p class="sr-only" id="page-status" role="status" aria-live="polite"></p>
   </main>
