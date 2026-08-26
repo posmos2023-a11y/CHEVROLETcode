@@ -348,17 +348,31 @@ async function runLoadCartToPos(cart) {
       // 실패는 "담기 자체는 성공"으로 서버에 보고하고, 직원에게는 결제를 직접 눌러야 한다고
       // 안내한다. 서버 계약상 result는 loaded/failed 둘뿐이라 "부분 성공"을 표현할 방법이
       // 없다는 한계는 있다.
-      await reportConsume(cart.id, { result: 'loaded' })
+      const reported = await reportConsume(cart.id, { result: 'loaded' })
       rememberLoadedCart(cart.id)
-      removeCartFromView(cart.id)
+      if (reported.ok) removeCartFromView(cart.id)
       deps.notify('error', `담기는 완료됐지만 결제 화면 자동 실행에 실패했습니다. 직접 결제를 눌러주세요. (${payError.message || payError})`)
       return
     }
 
-    await reportConsume(cart.id, { result: 'loaded' })
+    const reported = await reportConsume(cart.id, { result: 'loaded' })
     // 결제가 끝났을 때 어느 건인지 알아야 하므로 기억해 둔다(initPaymentWatch 주석 참고).
     rememberLoadedCart(cart.id)
-    // 성공하면 다음 폴링(5초)을 기다리지 않고 즉시 화면에서 지운다 — 그 사이 직원이 같은
+
+    if (!reported.ok) {
+      // ⚠️ 품목은 POS에 담겼는데 그 사실을 서버가 모른다. 서버에는 아직 pending이라 이 카드는
+      // 다음 폴링이나 재시작 뒤에 되살아난다. 여기서 화면에서만 지우면 직원은 끝난 줄 알고,
+      // 나중에 되살아난 카드를 다시 눌러 같은 품목을 또 담게 된다 — 이미 결제했다면 이중 결제다.
+      // 그래서 카드를 남겨두고, 무엇이 일어났는지 그대로 알린다.
+      deps.notify(
+        'error',
+        '담기는 됐지만 서버에 알리지 못했습니다. 이 주문은 목록에 남습니다 — ' +
+        '[주문] 탭에 이미 담겨 있으니 다시 누르지 마시고, 결제 후 [지우기]로 정리해주세요.'
+      )
+      return
+    }
+
+    // 성공하면 다음 폴링을 기다리지 않고 즉시 화면에서 지운다 — 그 사이 직원이 같은
     // 카드를 다시 눌러 중복으로 담는 것을 막기 위해서다.
     removeCartFromView(cart.id)
     deps.notify('success', cart.autoPay ? '담고 결제를 시작했습니다.' : 'POS 장바구니에 담았습니다.')
@@ -379,7 +393,13 @@ async function handleLoadFailure(cart, error, addedKeys) {
       console.error('[erp-cart] 되돌리기 실패 — POS 장바구니를 직접 확인해주세요.', key)
     }
   }
-  await reportConsume(cart.id, { result: 'failed', errorMessage: error?.message || String(error) })
+  const reported = await reportConsume(cart.id, { result: 'failed', errorMessage: error?.message || String(error) })
+  if (!reported.ok) {
+    // 보고가 닿지 않았으면 서버는 여전히 pending이다. 카드를 지우면 되살아나서 직원이
+    // 혼란스러우므로 그대로 두고, 되돌리기는 이미 했으니 다시 눌러도 안전하다.
+    deps.notify('error', `POS에 담지 못했습니다: ${error?.message || error}`)
+    return
+  }
   // 실패를 보고한 순간 서버에서 이 장바구니는 failed로 끝난 상태다. 그런데도 카드를 남겨두고
   // 버튼을 되살리면, 직원이 다시 눌렀을 때 POS에는 품목이 또 담기지만 서버는 이미 종료된 건이라
   // alreadyProcessed로 흘려버린다 — 전산에는 계속 "실패"로 보이는데 실제로는 결제가 일어나는
