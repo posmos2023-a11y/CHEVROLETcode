@@ -46,6 +46,7 @@ DEFAULT_STORE_CODE = "CHV-001"
 ENV_BASE_URL = "CHEVROLET_API_BASE_URL"
 ENV_ERP_TOKEN = "CHEVROLET_ERP_TOKEN"
 ENV_STORE_CODE = "CHEVROLET_STORE_CODE"
+ENV_BUSINESS_NUMBER = "CHEVROLET_BUSINESS_NUMBER"
 
 
 def _ensure_config_file_exists():
@@ -62,15 +63,19 @@ def _ensure_config_file_exists():
     parser["api"].setdefault("base_url", DEFAULT_BASE_URL)
     parser["api"].setdefault("erp_token", "")
     parser["api"].setdefault("store_code", DEFAULT_STORE_CODE)
+    # 사업자등록번호는 선택값이라 기본은 빈 문자열이다. 채워두면 서버가 이 값으로 매장을
+    # 찾아 매장코드를 자동으로 연결해준다(연동 요청서 §4.3).
+    parser["api"].setdefault("business_number", "")
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         parser.write(f)
 
 
 class Config:
-    def __init__(self, base_url, erp_token, store_code):
+    def __init__(self, base_url, erp_token, store_code, business_number=""):
         self.base_url = base_url
         self.erp_token = erp_token
         self.store_code = store_code
+        self.business_number = business_number
 
 
 def load_config():
@@ -89,9 +94,16 @@ def load_config():
 
     base_url = os.environ.get(ENV_BASE_URL, base_url)
     erp_token = os.environ.get(ENV_ERP_TOKEN, erp_token)
+    business_number = section.get("business_number", "") if section else ""
     store_code = os.environ.get(ENV_STORE_CODE, store_code)
+    business_number = os.environ.get(ENV_BUSINESS_NUMBER, business_number)
 
-    return Config(base_url=base_url.strip(), erp_token=erp_token.strip(), store_code=store_code.strip())
+    return Config(
+        base_url=base_url.strip(),
+        erp_token=erp_token.strip(),
+        store_code=store_code.strip(),
+        business_number=business_number.strip(),
+    )
 
 
 def save_config(config):
@@ -104,6 +116,7 @@ def save_config(config):
         "base_url": config.base_url,
         "erp_token": config.erp_token,
         "store_code": config.store_code,
+        "business_number": config.business_number or "",
     }
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         parser.write(f)

@@ -14,8 +14,7 @@ QThread.moveToThread로 옮기는 표준 패턴을 쓴다. QRunnable 대신 이 
 있는 편이 정지 신호(stop) 처리가 더 명확하기 때문.
 """
 
-import random
-import string
+import secrets
 import time
 from datetime import datetime
 
@@ -30,13 +29,17 @@ class ApiError(Exception):
 
 
 def make_reference_id():
-    """ERP-YYYYMMDD-HHMMSS-<3자리 난수> 형식. 밀리초까지 안 쓰는 이유는
-    사람이 상태줄에서 눈으로 읽고 알아볼 수 있는 형태를 유지하기 위해서고,
-    3자리 난수는 같은 초에 두 번 전송해도(더블클릭 등) referenceId가
-    겹치지 않게 하는 안전장치."""
+    """ERP-YYYYMMDD-HHMMSS-<6자리 hex> 형식.
+
+    앞부분을 시각으로 두는 건 사람이 상태줄에서 눈으로 읽고 알아보기 위해서다.
+    뒤에 난수를 붙이는 건 같은 초에 두 번 보내도 겹치지 않게 하기 위한 것인데,
+    처음엔 3자리 숫자(1/1000)를 썼다. 그 정도로는 부족하다 — 겹치면 서버가
+    멱등 처리로 duplicate를 돌려주고, 두 번째 주문은 **아무 데도 만들어지지
+    않은 채 사라진다.** 직원은 보냈다고 믿는데 POS에는 안 뜬다.
+    돈이 걸린 경로라 조용한 실패를 남기지 않도록 1/16,777,216으로 낮춘다.
+    (random 대신 secrets를 쓰는 건 예측 가능한 시드로 값이 겹치는 걸 막기 위함.)"""
     now = datetime.now()
-    suffix = "".join(random.choices(string.digits, k=3))
-    return now.strftime("ERP-%Y%m%d-%H%M%S-") + suffix
+    return now.strftime("ERP-%Y%m%d-%H%M%S-") + secrets.token_hex(3).upper()
 
 
 class ApiClient:

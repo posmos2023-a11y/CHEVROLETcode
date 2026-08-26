@@ -124,8 +124,17 @@ class Cart:
             parts.append(f"{customer_name}님")
         return " ".join(parts)
 
-    def to_api_payload(self, store_code, reference_id, memo, auto_pay):
-        return {
+    def to_api_payload(self, store_code, reference_id, memo, auto_pay,
+                       business_number=None, car_number=None):
+        """연동 요청서 §4.2의 바디를 만든다.
+
+        carNumber와 businessNumber는 memo와 **따로** 보낸다. memo에도 같은 값이 들어가지만
+        그건 사람이 POS 화면에서 읽는 용도라 자유 문자열이고, 서버가 기계적으로 쓸 수 없다:
+        - businessNumber -> 전산 매장코드를 자동으로 연결하는 데 쓴다
+        - carNumber      -> 그날 대기 중인 예약 손님과 잇는 데 쓴다
+        빈 값이면 키 자체를 넣지 않는다 — 서버가 "빈 문자열"과 "안 보냄"을 다르게 다룰 이유가
+        없고, 불필요한 키를 줄이는 편이 요청을 읽기 쉽다."""
+        payload = {
             "storeCode": store_code,
             "referenceId": reference_id,
             "items": [line.to_api_item() for line in self._lines],
@@ -133,3 +142,8 @@ class Cart:
             "memo": memo,
             "autoPay": auto_pay,
         }
+        if business_number:
+            payload["businessNumber"] = business_number
+        if car_number:
+            payload["carNumber"] = car_number
+        return payload

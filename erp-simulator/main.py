@@ -79,16 +79,22 @@ class SettingsDialog(QDialog):
         self.token_edit = QLineEdit(cfg.erp_token)
         self.token_edit.setEchoMode(QLineEdit.Password)
         self.store_code_edit = QLineEdit(cfg.store_code)
+        self.business_number_edit = QLineEdit(cfg.business_number)
+        self.business_number_edit.setPlaceholderText("123-45-67890 (선택)")
 
         form = QFormLayout()
         form.setSpacing(12)
         form.addRow("API 서버 주소", self.base_url_edit)
         form.addRow("ERP 토큰", self.token_edit)
         form.addRow("매장코드", self.store_code_edit)
+        form.addRow("사업자번호", self.business_number_edit)
 
         note = QLabel(
             "환경변수(CHEVROLET_API_BASE_URL / CHEVROLET_ERP_TOKEN / "
-            "CHEVROLET_STORE_CODE)가 설정되어 있으면 여기 값보다 우선 적용됩니다."
+            "CHEVROLET_STORE_CODE / CHEVROLET_BUSINESS_NUMBER)가 설정되어 있으면 "
+            "여기 값보다 우선 적용됩니다. "
+            "사업자번호를 채워두면 서버가 이 값으로 매장을 찾아 매장코드를 자동으로 "
+            "연결합니다 — 매장코드가 아직 등록되지 않았어도 첫 전송에서 이어집니다."
         )
         note.setWordWrap(True)
         note.setObjectName("HintLabel")
@@ -116,6 +122,7 @@ class SettingsDialog(QDialog):
         self._cfg.base_url = self.base_url_edit.text().strip() or config_module.DEFAULT_BASE_URL
         self._cfg.erp_token = self.token_edit.text().strip()
         self._cfg.store_code = self.store_code_edit.text().strip() or config_module.DEFAULT_STORE_CODE
+        self._cfg.business_number = self.business_number_edit.text().strip()
         config_module.save_config(self._cfg)
         self.accept()
 
@@ -552,6 +559,10 @@ class MainWindow(QMainWindow):
             reference_id=reference_id,
             memo=memo,
             auto_pay=self.auto_pay_checkbox.isChecked(),
+            # memo에도 같은 값이 들어가지만 그건 사람이 POS 화면에서 읽는 용도다. 서버가
+            # 기계적으로 쓰려면 별도 필드여야 한다(연동 요청서 §4.3).
+            business_number=self.cfg.business_number,
+            car_number=self.plate_edit.text().strip(),
         )
 
         # 새로 보내는 순간 직전 건의 복원 제안은 의미가 없다(보관본은 아래에서 새로 덮인다).
@@ -580,6 +591,19 @@ class MainWindow(QMainWindow):
 
         if not result.get("ok", True):
             self._on_send_failed(result.get("error") or "알 수 없는 오류가 발생했습니다.")
+            return
+
+        # duplicate는 "이 referenceId는 이미 접수돼 있다"는 뜻이다. 이 앱은 전송할 때마다
+        # referenceId를 새로 만들고 자동 재시도도 하지 않으므로, 첫 전송에 duplicate가 왔다면
+        # 주문번호가 다른 건과 겹쳤다는 뜻이다. 그 경우 **이번 장바구니는 어디에도 만들어지지
+        # 않는다.** 성공으로 삼키고 장바구니를 비우면 직원은 보냈다고 믿는데 POS엔 안 뜬다 —
+        # 돈이 걸린 경로라 조용히 넘기지 않고, 장바구니를 그대로 둔 채 다시 누르게 한다.
+        if result.get("duplicate"):
+            self._update_send_button_enabled()
+            self._set_status(
+                "❌ 주문번호가 중복됐습니다. 전송되지 않았으니 [POS로 전송]을 한 번 더 눌러주세요.",
+                STATUS_COLOR_ERROR,
+            )
             return
 
         # 비우기 직전에 보낸 내용을 그대로 보관한다. POS가 담기에 실패하면 그 건은 서버에서
