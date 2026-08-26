@@ -173,17 +173,72 @@ async function probeCatalog() {
   }
 }
 
-// ── 3) 현재 장바구니 상태 확인 ────────────────────────────────────
+// ── 3) 현재 장바구니 덤프 ─────────────────────────────────────────
+// 여기가 핵심 진단이다. [주문] 탭에서 POS로 직접 담은 항목을 이걸로 덤프하면,
+// **포스가 스스로 만든 정상 lineItem의 정확한 모양**을 볼 수 있다. 우리가 만든 것과 비교하면
+// 어느 필드가 다른지 추측 없이 확정된다.
+// 로그가 길어지므로 한 줄에 다 넣지 않고 키 단위로 잘라서 찍는다(작은 화면에서 읽으려고).
+// ③에서 덤프한 항목 하나를 보관해 두고 ⑥에서 그대로 되담는 데 쓴다.
+let lastDumpedLineItem = null
+
+function dumpObject(label, value, depth = 0) {
+  const pad = '  '.repeat(depth)
+  if (value === null || typeof value !== 'object') {
+    log(`${pad}${label}: ${show(value)}`)
+    return
+  }
+  if (Array.isArray(value)) {
+    if (value.length === 0) {
+      log(`${pad}${label}: []`)
+      return
+    }
+    log(`${pad}${label}: [${value.length}]`)
+    value.forEach((v, i) => dumpObject(String(i), v, depth + 1))
+    return
+  }
+  log(`${pad}${label}:`)
+  for (const [k, v] of Object.entries(value)) dumpObject(k, v, depth + 1)
+}
+
 async function probeGet() {
-  log('③ 현재 장바구니 조회...')
+  log('③ 장바구니 덤프...')
   try {
     const current = await draftOrder.get()
-    const count = current?.lineItems?.length ?? 0
-    const total = current?.price?.orderPriceValue ?? 0
-    log(`   담긴 항목 ${count}개, 주문금액 ${Number(total).toLocaleString('ko-KR')}원`, count ? 'ok' : 'info')
-    for (const li of current?.lineItems ?? []) {
-      log(`     · ${li.item?.title} ×${li.quantity} — ${Number(li.itemPrice?.priceValue ?? 0).toLocaleString('ko-KR')}원`)
+    const items = current?.lineItems ?? []
+    log(`   항목 ${items.length}개, 주문금액 ${Number(current?.price?.orderPriceValue ?? 0).toLocaleString('ko-KR')}원`, items.length ? 'ok' : 'info')
+    if (items.length === 0) {
+      log('   → [주문] 탭에서 POS로 직접 상품을 담은 뒤 다시 눌러보세요.', 'info')
+      return
     }
+    items.forEach((li, i) => {
+      log(`── lineItem[${i}] ─────────────────`, 'ok')
+      dumpObject('lineItem', li)
+    })
+    // 항목 하나를 통째로 저장해 두면 ⑥에서 그대로 다시 담아볼 수 있다.
+    lastDumpedLineItem = items[items.length - 1]
+    log('   → ⑥으로 이 항목을 그대로 복제해 담아볼 수 있습니다.', 'info')
+  } catch (e) {
+    log(`❌ 실패: ${e?.message || show(e)}`, 'fail')
+  }
+}
+
+// ── 6) 포스가 만든 항목을 그대로 되담기 ───────────────────────────
+// ③으로 덤프한(=포스가 스스로 만든) 항목을 아무것도 바꾸지 않고 addLineItem에 그대로 넣는다.
+// 이것마저 [주문] 탭을 깨뜨리면 addLineItem 자체가 이 용도로 못 쓰는 것이고,
+// 정상이면 우리가 만든 객체의 어느 필드가 문제인지로 범위가 좁혀진다.
+async function probeReadd() {
+  log('⑥ ③에서 덤프한 항목 그대로 되담기...')
+  if (!lastDumpedLineItem) {
+    log('⚠️ 먼저 ③으로 덤프하세요.', 'fail')
+    return
+  }
+  try {
+    // key는 포스가 항목마다 새로 발급하므로 빼고 보낸다(스키마상 optional).
+    const { key, lineItemId, ...rest } = lastDumpedLineItem
+    log(`   보낼 값: ${show(rest)}`)
+    const result = await draftOrder.addLineItem(rest)
+    log(`✅ 담기 성공 — 항목 ${result?.lineItems?.length ?? '?'}개`, 'ok')
+    log('   → [주문] 탭이 정상인지 확인하세요.', 'ok')
   } catch (e) {
     log(`❌ 실패: ${e?.message || show(e)}`, 'fail')
   }
@@ -234,6 +289,7 @@ export function initDraftOrderProbe() {
   bind('probe-get', probeGet)
   bind('probe-clear', probeClear)
   bind('probe-pay', probeStartPayment)
+  bind('probe-readd', probeReadd)
 
-  log('검증 패널 준비됨. ④로 비운 뒤 ①부터 눌러보세요.')
+  log('검증 패널 준비됨. ④ 비우기 → [주문] 탭에서 직접 담기 → ③ 덤프 순서로 확인하세요.')
 }
