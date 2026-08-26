@@ -21,36 +21,40 @@ export function initErpCarts(injected) {
 }
 
 // ── lineItem 조립 — 딱 이 함수 하나에만 모은다 ──────────────────────────────
-// ⚠️ 아직 검증 중이다. addLineItem이 성공을 반환해도 POS [주문] 탭이 "일시적인 오류가
-// 발생했습니다"로 깨지는 문제가 실단말기에서 원인 진단 중이며, 아래 모양이 정답이라고
-// 단정할 수 없다. 확정 근거(zod 스키마 vs 포스가 실제로 읽는 필드의 차이)는
-// draftOrderProbe.js 파일 상단 주석에 정리돼 있으니 그쪽을 먼저 볼 것.
-// 진단 결과가 나오면 이 함수만 고치면 되도록, 다른 곳에서는 addLineItem에 넘길 객체를
+// 실단말기에서 POS가 **스스로 만든** 장바구니 항목을 덤프해서 확정한 모양이다
+// (draftOrderProbe.js의 ③ 장바구니 덤프). 그 결과:
+//
+//   문서(types/index.d.ts의 Pick, 런타임 zod 스키마)는 둘 다 실제보다 **좁다.**
+//   POS가 담은 item은 { id, title, category, options, code } 같은 5개짜리가 아니라
+//   카탈로그 원본 객체 통째였다 — merchantId, description, state, prices[], defaultPriceId,
+//   priceVariations, optionSets, color, imageUrl, labels, durationSeconds, metadata(거대)까지.
+//   category도 {id, title}이 아니라 merchantId/code/order/enabled/kioskOrder/createdAt/position
+//   등이 다 붙은 원본이었고, itemPrice에도 id/isDefault/state/barcode/isStockable/stockQuantity가
+//   더 있었다.
+//
+// 앞서 문서대로 필드를 깎아 보냈더니 addLineItem은 성공을 반환하는데 POS [주문] 탭이
+// "일시적인 오류"로 깨졌다 — 포스가 렌더링하면서 없는 필드를 참조했기 때문으로 보인다.
+// 그래서 **카탈로그 원본을 통째로 펼치고(...baseItem) 화면에 보이는 값만 갈아끼운다.**
+// 깎지 말 것 — 문서에 없는 필드라도 지우면 깨진다.
+//
+// 진단 결과가 바뀌면 이 함수만 고치면 되도록, 다른 곳에서는 addLineItem에 넘길 객체를
 // 직접 만들지 않는다.
 function buildLineItem({ baseItem, title, priceValue, quantity, memo }) {
-  const lineItem = {
-    item: {
-      id: baseItem.id,
-      title,
-      category: { id: baseItem.category.id, title: baseItem.category.title },
-      // 포스 본체가 이 값을 .map()하므로 반드시 배열이어야 한다(draftOrderProbe.js 주석 참고).
-      options: [],
-      type: 'ITEM',
-    },
-    itemPrice: {
-      isTaxFree: false,
-      priceType: 'FIXED',
-      priceUnit: 1,
-      priceValue,
-      title: '기본',
-    },
+  // getCatalogs()가 주는 가격 객체의 이름이 버전에 따라 price(단수)일 수도, prices(배열)일 수도
+  // 있어서 둘 다 받아준다 — 덤프에서는 배열(prices)로 나왔다.
+  const basePrice = baseItem.price || (Array.isArray(baseItem.prices) ? baseItem.prices[0] : null) || {}
+  return {
+    // 원본을 통째로 펼친 뒤 화면에 보이는 이름만 교체한다.
+    item: { ...baseItem, type: 'ITEM', title, options: baseItem.options ?? [] },
+    // 가격도 원본 구조를 그대로 두고 금액만 교체한다.
+    itemPrice: { ...basePrice, priceValue, title: basePrice.title ?? '기본' },
     discount: [],
+    // 덤프에서 memo는 undefined가 아니라 빈 문자열이었다 — 그 형태를 맞춘다.
+    memo: memo || '',
     optionChoices: [],
     quantity,
     diningOption: 'HERE',
   }
-  if (memo) lineItem.memo = memo
-  return lineItem
 }
 
 // 전산 품목은 POS 카탈로그에 등록돼 있지 않다. POS가 요구하는 item.id/category는 "이미 있는
