@@ -18,6 +18,7 @@ let deps = null
 
 export function initErpCarts(injected) {
   deps = injected
+  initPaymentWatch()
   if (!listEl) return
   listEl.addEventListener('click', handleListClick)
 }
@@ -197,6 +198,70 @@ function handleListClick(e) {
   loadCartToPos(cart)
 }
 
+// ── 결제 완료 감지 ──────────────────────────────────────────────────────────
+// POS에서 결제가 끝나면 posPluginSdk.payment.on('paid')가 불린다. 그때 "방금 담았던 전산 주문"이
+// 무엇이었는지 알아야 서버에 결제됐다고 알릴 수 있다.
+//
+// 담기와 결제 사이에 시간이 뜬다(직원이 카드를 받으러 가는 등). 그 사이 탭앱이 다시 로드될 수도
+// 있어서 메모리에만 두면 잃는다 — localStorage에 남긴다. 결제가 끝나면 지운다.
+//
+// 여러 건을 연달아 담고 한 번에 결제할 수도 있으므로 배열로 들고 있다가 전부 보고한다.
+const PENDING_PAID_KEY = 'chevrolet_erp_pending_paid'
+
+function loadPendingPaid() {
+  try {
+    const raw = localStorage.getItem(PENDING_PAID_KEY)
+    const parsed = raw ? JSON.parse(raw) : []
+    return Array.isArray(parsed) ? parsed : []
+  } catch {
+    return []
+  }
+}
+
+function savePendingPaid(ids) {
+  try {
+    if (ids.length) localStorage.setItem(PENDING_PAID_KEY, JSON.stringify(ids))
+    else localStorage.removeItem(PENDING_PAID_KEY)
+  } catch {
+    // 저장이 막힌 환경이면 결제 통보만 못 하고 나머지는 정상 동작한다(전산에는 loaded로 남는다).
+  }
+}
+
+function rememberLoadedCart(cartId) {
+  const ids = loadPendingPaid()
+  if (!ids.includes(cartId)) savePendingPaid([...ids, cartId])
+}
+
+// 결제 완료 통보. 실패해도 재시도하지 않는다 — 담기(consume)와 달리 이건 기록용이라,
+// 놓치면 전산에 loaded로 남을 뿐 중복 결제 같은 사고로는 이어지지 않는다.
+async function reportPaid(cartId, paymentId, orderId) {
+  try {
+    const { ok } = await deps.apiPost(`/api/pos/erp-carts/${cartId}/paid`, { paymentId, orderId })
+    return ok
+  } catch {
+    return false
+  }
+}
+
+function initPaymentWatch() {
+  try {
+    posPluginSdk.payment.on('paid', (paymentId, orderId) => {
+      const ids = loadPendingPaid()
+      if (!ids.length) return
+      // 먼저 지운다 — 통보가 실패해도 다음 결제 때 엉뚱한 건이 딸려가지 않게 한다.
+      savePendingPaid([])
+      Promise.all(ids.map((id) => reportPaid(id, paymentId, orderId)))
+        .then((results) => {
+          if (results.some(Boolean)) deps.notify('success', '결제 완료를 전산에 알렸습니다.')
+        })
+        .catch(() => {})
+    })
+  } catch (e) {
+    // SDK 버전에 따라 이 이벤트가 없을 수 있다. 없으면 결제 통보만 빠지고 나머지는 그대로 돈다.
+    console.error('[erp-cart] 결제 이벤트를 구독하지 못했습니다.', e?.message)
+  }
+}
+
 // consume이 서버에 닿지 못하면 그 장바구니는 계속 pending으로 남아, 다음 폴링이나 단말기 재시작
 // 뒤에 같은 카드가 되살아난다 — 이미 POS에 담아둔 걸 또 담게 되는 경로다. 일시적 네트워크
 // 오류가 흔한 매장 환경이라 한 번은 재시도하고, 그래도 실패하면 조용히 넘기지 않고 직원에게
@@ -280,12 +345,15 @@ async function runLoadCartToPos(cart) {
       // 안내한다. 서버 계약상 result는 loaded/failed 둘뿐이라 "부분 성공"을 표현할 방법이
       // 없다는 한계는 있다.
       await reportConsume(cart.id, { result: 'loaded' })
+      rememberLoadedCart(cart.id)
       removeCartFromView(cart.id)
       deps.notify('error', `담기는 완료됐지만 결제 화면 자동 실행에 실패했습니다. 직접 결제를 눌러주세요. (${payError.message || payError})`)
       return
     }
 
     await reportConsume(cart.id, { result: 'loaded' })
+    // 결제가 끝났을 때 어느 건인지 알아야 하므로 기억해 둔다(initPaymentWatch 주석 참고).
+    rememberLoadedCart(cart.id)
     // 성공하면 다음 폴링(5초)을 기다리지 않고 즉시 화면에서 지운다 — 그 사이 직원이 같은
     // 카드를 다시 눌러 중복으로 담는 것을 막기 위해서다.
     removeCartFromView(cart.id)

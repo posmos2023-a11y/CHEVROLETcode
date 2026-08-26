@@ -60,6 +60,8 @@ model Reservation {
   marketingConsentAt DateTime? // 광고성 정보 수신 동의 시각(선택) — null이면 프로모션 발송 대상에서 제외
   anonymizedAt       DateTime? // 보관기간(DATA_RETENTION_DAYS) 경과 후 파기(익명화) 시각
 
+  erpCarts ErpCart[]
+
   intakeNotifyStatus String? // null = 정상/미시도, 'failed' = 접수(대기번호) 알림톡 발송 실패. 성공 시엔
   // 아무것도 쓰지 않는다(null 유지) — 해피패스에 DB 쓰기를 늘리지 않기 위함(계약 v3 §1).
 
@@ -159,10 +161,26 @@ model ErpCart {
   totalAmount  Int
   memo         String?
   autoPay      Boolean   @default(true)
-  status       String    @default("pending") // pending | loaded | failed | dismissed | expired | cancelled
+  status       String    @default("pending") // pending | loaded | failed | dismissed | expired | cancelled | paid
   errorMessage String?
   createdAt    DateTime  @default(now())
   loadedAt     DateTime?
 
+  // 전산이 보낸 차량번호. memo에도 같은 값이 들어가지만 그건 사람이 POS 화면에서 읽는 자유
+  // 문자열이라 기계가 확실히 못 읽는다. 예약 손님과 잇는 데는 이 필드를 쓴다.
+  carNumber      String?
+  // 접수 당시 그날 대기 중이던 예약과 자동으로 이어진 결과. 확실할 때만(정확히 1건 일치) 붙인다 —
+  // 잘못 이으면 남의 정비 이력에 부품이 붙고 자동완료로 엉뚱한 손님이 대기열에서 사라진다.
+  reservationId  String?
+  reservation    Reservation? @relation(fields: [reservationId], references: [id])
+
+  // POS에서 실제 결제가 끝났을 때 채워진다. Payment 테이블에 넣지 않는 이유: 그쪽은 고객에게
+  // 개인정보·광고 수신 동의를 받은 흐름이고, 전산 결제는 POS에서 동의 없이 일어난다.
+  // 동의 없는 레코드를 그 파이프라인에 섞으면 프로모션 대상 판정이 흐려진다.
+  paidAt         DateTime?
+  tossPaymentId  String?
+  tossOrderId    String?
+
   @@index([storeId, status, createdAt])
+  @@index([storeId, carNumber])
 }

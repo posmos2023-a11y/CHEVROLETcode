@@ -96,6 +96,19 @@ const LOCKOUT_DURATION_MS = 15 * 60 * 1000
 // 존재하지 않는 이메일은 이 함수를 아예 타지 않는다(server.js가 findAdminUserByEmail로 계정을
 // 먼저 찾은 뒤에만 호출) — 그래야 "계정이 있는데 잠겼다(423)"와 "계정이 없다(401)"를 구분하지 않고
 // 없는 계정은 항상 기존과 동일한 401만 돌려줘서 계정 존재 여부가 새어나가지 않는다.
+// 로그인한 사람이 자기 비밀번호를 바꾼다. 잠금 카운터도 함께 푼다 — 실패가 쌓인 상태로
+// 비밀번호만 바꾸면 새 비밀번호로도 423에 막혀서 "바꿨는데 왜 안 되지"가 된다.
+async function changeAdminPassword(id, passwordHash) {
+  try {
+    return await prisma.adminUser.update({
+      where: { id },
+      data: { passwordHash, failedLoginCount: 0, lockedUntil: null },
+    })
+  } catch {
+    return null
+  }
+}
+
 async function recordFailedLogin(id) {
   try {
     const current = await prisma.adminUser.findUnique({ where: { id } })
@@ -804,7 +817,7 @@ function upsertErpOrder({ referenceId, storeId, tossOrderKey, tossOrderId, total
 // 초기화). 멱등 판단(cancelled가 아닌 기존 건은 손대지 않고 duplicate로 응답) 자체는
 // server.js가 findErpCartByReference로 먼저 조회해서 처리하고, 이 함수는 "없거나 cancelled일
 // 때만" 호출된다.
-function createErpCart({ storeId, referenceId, itemsJson, totalAmount, memo, autoPay }) {
+function createErpCart({ storeId, referenceId, itemsJson, totalAmount, memo, autoPay, carNumber, reservationId }) {
   const data = {
     storeId,
     itemsJson,
@@ -814,6 +827,12 @@ function createErpCart({ storeId, referenceId, itemsJson, totalAmount, memo, aut
     status: 'pending',
     errorMessage: null,
     loadedAt: null,
+    carNumber: carNumber ?? null,
+    reservationId: reservationId ?? null,
+    // 재전송(cancelled 뒤 같은 referenceId)일 때 이전 결제 흔적이 남지 않게 초기화한다.
+    paidAt: null,
+    tossPaymentId: null,
+    tossOrderId: null,
   }
   return prisma.erpCart.upsert({
     where: { referenceId },
@@ -860,6 +879,75 @@ async function markErpCartFailed(id, errorMessage) {
     data: { status: 'failed', errorMessage: errorMessage ?? null },
   })
   return result.count > 0
+}
+
+// 전산이 보낸 차량번호로 "그날 아직 진행 중인" 예약을 찾는다.
+//
+// 잘못 이으면 남의 정비 이력에 부품이 붙고, 결제 후 자동완료로 엉뚱한 손님이 대기열에서
+// 사라진다. 그래서 **정확히 1건일 때만** 잇고 애매하면 잇지 않는다(사람이 POS에서 확인하게 둔다).
+//
+// 범위를 좁히는 조건들:
+//   - 같은 매장 (다른 매장에 같은 차가 있어도 무관하다)
+//   - 오늘 접수분 (serviceDate) — 같은 차가 며칠 뒤 또 와도 옛 예약에 붙지 않는다
+//   - 아직 끝나지 않은 건 (completed/cancelled 제외) — 이미 끝난 정비에 새 주문이 붙으면 안 된다
+// 표기 흔들림(공백·하이픈)은 호출부가 정규화해서 넘긴다.
+async function findOpenReservationByCarNumber(storeId, carNumber, serviceDate) {
+  if (!carNumber) return null
+  const matches = await prisma.reservation.findMany({
+    where: {
+      storeId,
+      carNumber,
+      serviceDate,
+      status: { notIn: CLOSED_RESERVATION_STATUSES },
+    },
+    orderBy: { createdAt: 'desc' },
+    take: 2, // 2건만 가져오면 "정확히 1건인가"를 판정하기에 충분하다
+  })
+  return matches.length === 1 ? matches[0] : null
+}
+
+// 결제가 끝났을 때의 예약 완료 처리.
+//
+// 직원이 누르는 [완료](markReservationCompleted)는 called/notify_failed에서만 동작한다 —
+// "호출한 손님을 완료한다"는 뜻이라 그게 맞다. 하지만 결제는 호출을 안 눌러도 일어난다
+// (바쁘면 부르지 않고 그냥 처리한다). 결제가 끝났다는 건 정비가 끝났다는 뜻이므로 waiting도
+// 완료로 넘긴다. 이미 끝난(completed/cancelled) 건은 건드리지 않는다.
+async function completeReservationAfterPayment(id) {
+  const result = await prisma.reservation.updateMany({
+    where: { id, status: { in: ['waiting', 'called', 'notify_failed'] } },
+    data: { status: 'completed', completedAt: new Date() },
+  })
+  return result.count > 0
+}
+
+// POS에서 결제가 끝났다는 통보. loaded인 건만 paid로 넘긴다 — 담기지도 않은 건이 결제됐다고
+// 기록되면 안 된다. 다른 전이와 같은 이유로 원자적 updateMany를 쓴다.
+async function markErpCartPaid(id, { paymentId, orderId }) {
+  const result = await prisma.erpCart.updateMany({
+    where: { id, status: 'loaded' },
+    data: {
+      status: 'paid',
+      paidAt: new Date(),
+      tossPaymentId: paymentId ? String(paymentId).slice(0, 200) : null,
+      tossOrderId: orderId ? String(orderId).slice(0, 200) : null,
+    },
+  })
+  return result.count > 0
+}
+
+// 관리자 웹에서 전산 주문 이력을 보는 용도. 매장이 "전산에서 보냈는데 POS에 안 떴어요" 할 때
+// 본사가 확인할 방법이 지금까지 없었다 — 접수는 됐는지, POS가 가져갔는지, 실패했는지.
+// storeId가 없으면 전체(본사 관리자), 있으면 그 매장만 본다.
+async function listErpCarts({ storeId, status, limit = 50 }) {
+  return prisma.erpCart.findMany({
+    where: {
+      ...(storeId ? { storeId } : {}),
+      ...(status ? { status } : {}),
+    },
+    orderBy: { createdAt: 'desc' },
+    take: Math.min(Math.max(Number(limit) || 50, 1), 200),
+    include: { store: { select: { name: true, erpStoreCode: true } } },
+  })
 }
 
 // 매장 직원이 POS 화면에서 이 주문을 치웠을 때. 잘못 온 주문(다른 손님 것, 전산 오조작)을
@@ -1028,6 +1116,12 @@ async function getDailySummary({ storeId, date, dateStart, dateEnd }) {
     ...(dateStart && dateEnd ? { createdAt: { gte: dateStart, lt: dateEnd } } : {}),
   }
 
+  // 전산 주문은 접수 시각(createdAt) 기준으로 그날 것을 센다 — Payment와 같은 기준이다.
+  const erpCartWhere = {
+    ...(storeId ? { storeId } : {}),
+    ...(dateStart && dateEnd ? { createdAt: { gte: dateStart, lt: dateEnd } } : {}),
+  }
+
   const [
     reservationTotal,
     waiting,
@@ -1039,6 +1133,10 @@ async function getDailySummary({ storeId, date, dateStart, dateEnd }) {
     amountAgg,
     receiptFailed,
     intakeFailed,
+    erpCartTotal,
+    erpCartPaid,
+    erpCartPaidAmount,
+    erpCartUnhandled,
   ] = await Promise.all([
     prisma.reservation.count({ where: reservationWhere }),
     prisma.reservation.count({ where: { ...reservationWhere, status: 'waiting' } }),
@@ -1052,6 +1150,12 @@ async function getDailySummary({ storeId, date, dateStart, dateEnd }) {
     prisma.reservation.count({
       where: { ...reservationWhere, intakeNotifyStatus: 'failed', status: { notIn: CLOSED_RESERVATION_STATUSES } },
     }),
+    // 전산 주문은 Payment와 별개 채널이라(POS에서 동의 없이 결제된다) 따로 센다.
+    // 합쳐서 보여주면 "결제 몇 건"이 어느 경로인지 알 수 없어 대사가 안 된다.
+    prisma.erpCart.count({ where: erpCartWhere }),
+    prisma.erpCart.count({ where: { ...erpCartWhere, status: 'paid' } }),
+    prisma.erpCart.aggregate({ where: { ...erpCartWhere, status: 'paid' }, _sum: { totalAmount: true } }),
+    prisma.erpCart.count({ where: { ...erpCartWhere, status: { in: ['failed', 'expired', 'dismissed'] } } }),
   ])
 
   return {
@@ -1069,6 +1173,14 @@ async function getDailySummary({ storeId, date, dateStart, dateEnd }) {
       receiptFailed,
     },
     intakeFailed,
+    // 전산에서 온 주문. total 대비 paid가 낮으면 매장이 POS에서 처리하지 않고 있다는 뜻이라
+    // 운영에서 먼저 봐야 할 신호다.
+    erpCarts: {
+      total: erpCartTotal,
+      paid: erpCartPaid,
+      paidAmount: erpCartPaidAmount._sum.totalAmount || 0,
+      unhandled: erpCartUnhandled, // failed + expired + dismissed
+    },
   }
 }
 
@@ -1085,6 +1197,7 @@ module.exports = {
   createAdminUser,
   markAdminLogin,
   recordFailedLogin,
+  changeAdminPassword,
   createStore,
   listStores,
   getStore,
@@ -1135,6 +1248,10 @@ module.exports = {
   markErpCartLoaded,
   markErpCartFailed,
   markErpCartDismissed,
+  markErpCartPaid,
+  listErpCarts,
+  completeReservationAfterPayment,
+  findOpenReservationByCarNumber,
   expireStaleErpCarts,
   cancelErpCart,
 }

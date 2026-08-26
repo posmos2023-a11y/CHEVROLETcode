@@ -217,6 +217,14 @@
   .erp-code-set { display: flex; gap: 6px; align-items: center; }
   .erp-code-input { width: 130px; }
   .muted { color: var(--muted); }
+  .erp-cart-filter { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }
+  /* 상태를 한눈에 구분하려고 색을 나눈다 — 목록이 길어지면 글자만으로는 안 읽힌다. */
+  .erp-status { display: inline-block; padding: 2px 7px; border-radius: 6px; font-size: 11px; font-weight: 700; }
+  .erp-status.pending { background: #fff5dc; color: #8a6100; }
+  .erp-status.loaded { background: var(--blue-soft, #eaf3ff); color: #1b64da; }
+  .erp-status.paid { background: #e8f8f1; color: #008b5a; }
+  .erp-status.failed, .erp-status.expired { background: #fff0f1; color: #d93025; }
+  .erp-status.dismissed, .erp-status.cancelled { background: #eef0f2; color: var(--muted); }
   .pos-token-input {
     width: 190px;
     padding: 6px 10px;
@@ -316,6 +324,43 @@
       사업자번호를 함께 보내오면 서버가 매장을 찾아 코드를 자동으로 붙입니다.
     </p>
     <div id="pos-token-body"></div>
+  </details>
+
+  <details class="testform" id="password-panel">
+    <summary>내 비밀번호 변경</summary>
+    <p style="font-size:12px;color:var(--muted);margin:8px 2px 12px;">
+      비밀번호를 잊으면 스스로 복구할 방법이 없습니다(재설정 메일 기능이 없습니다).
+      정기적으로 바꾸시고, 잊지 않도록 안전한 곳에 보관하세요.
+    </p>
+    <div class="testform-body">
+      <input type="password" id="pw-current" placeholder="지금 쓰는 비밀번호" autocomplete="current-password" />
+      <input type="password" id="pw-new" placeholder="새 비밀번호 (8자 이상)" autocomplete="new-password" />
+      <input type="password" id="pw-new2" placeholder="새 비밀번호 확인" autocomplete="new-password" />
+      <button id="pw-save">변경</button>
+    </div>
+    <div id="pw-msg" style="font-size:12px;margin-top:8px;"></div>
+  </details>
+
+  <details class="testform" id="erp-cart-panel">
+    <summary>전산 주문 이력</summary>
+    <p style="font-size:12px;color:var(--muted);margin:8px 2px 12px;">
+      쉐보레 전산이 보낸 주문이 어디까지 갔는지 확인합니다. 매장이 "전산에서 보냈는데 POS에
+      안 떴어요"라고 할 때 접수는 됐는지, POS가 가져갔는지, 실패했는지를 여기서 봅니다.
+    </p>
+    <div class="erp-cart-filter">
+      <select id="erp-cart-status">
+        <option value="">전체 상태</option>
+        <option value="pending">대기중 (POS가 아직 안 가져감)</option>
+        <option value="loaded">담김</option>
+        <option value="paid">결제완료</option>
+        <option value="failed">담기 실패</option>
+        <option value="dismissed">매장이 지움</option>
+        <option value="expired">만료됨</option>
+        <option value="cancelled">전산이 취소</option>
+      </select>
+      <button class="row-btn" id="erp-cart-reload" type="button">조회</button>
+    </div>
+    <div id="erp-cart-body"></div>
   </details>
 
   <div class="callnext">
@@ -605,6 +650,121 @@ failedToggleBtn.addEventListener('click', () => {
   renderStatusOptions()
   loadAll({ mode: 'reset' })
 })
+
+// --- 내 비밀번호 변경 ---
+const pwMsg = document.getElementById('pw-msg')
+const pwSave = document.getElementById('pw-save')
+
+if (pwSave) {
+  pwSave.addEventListener('click', async () => {
+    const current = document.getElementById('pw-current').value
+    const next = document.getElementById('pw-new').value
+    const confirm2 = document.getElementById('pw-new2').value
+    pwMsg.style.color = 'var(--red, #d93025)'
+
+    // 오타로 자기 계정을 잠그는 사고를 막으려고 확인란을 둔다 — 재설정 경로가 없어서
+    // 새 비밀번호를 잘못 넣으면 DB를 직접 고쳐야 한다.
+    if (next !== confirm2) { pwMsg.textContent = '새 비밀번호가 서로 다릅니다.'; return }
+    if (next.length < 8) { pwMsg.textContent = '새 비밀번호는 8자 이상이어야 합니다.'; return }
+
+    pwSave.disabled = true
+    try {
+      const res = await fetch('/api/admin/password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', authorization: 'Bearer ' + token },
+        body: JSON.stringify({ currentPassword: current, newPassword: next }),
+      })
+      const body = await res.json().catch(() => ({}))
+      if (!res.ok || !body.ok) {
+        pwMsg.textContent = body.error || '변경하지 못했습니다.'
+        return
+      }
+      pwMsg.style.color = 'var(--green, #0f9d58)'
+      pwMsg.textContent = '변경했습니다. 다음 로그인부터 새 비밀번호를 쓰세요.'
+      document.getElementById('pw-current').value = ''
+      document.getElementById('pw-new').value = ''
+      document.getElementById('pw-new2').value = ''
+    } catch (err) {
+      pwMsg.textContent = '요청 중 오류가 발생했습니다.'
+    } finally {
+      pwSave.disabled = false
+    }
+  })
+}
+
+// --- 전산 주문 이력 ---
+// 펼쳤을 때만 불러온다. 목록이 길고 자주 볼 화면이 아니라 로그인할 때마다 받아올 이유가 없다.
+const erpCartBody = document.getElementById('erp-cart-body')
+const erpCartPanel = document.getElementById('erp-cart-panel')
+const erpCartStatus = document.getElementById('erp-cart-status')
+const erpCartReload = document.getElementById('erp-cart-reload')
+
+const ERP_STATUS_LABEL = {
+  pending: '대기중', loaded: '담김', paid: '결제완료',
+  failed: '담기 실패', dismissed: '매장이 지움', expired: '만료됨', cancelled: '전산이 취소',
+}
+
+function formatWhen(v) {
+  if (!v) return '-'
+  const d = new Date(v)
+  return `${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')} ` +
+         `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+}
+
+async function loadErpCarts() {
+  erpCartBody.innerHTML = '<div class="empty">불러오는 중...</div>'
+  const params = new URLSearchParams()
+  if (erpCartStatus.value) params.set('status', erpCartStatus.value)
+  // 본사 관리자가 상단에서 특정 매장을 고른 상태면 그 매장만 본다(currentStoreId, '' = 전체).
+  if (adminRole === 'hq_admin' && currentStoreId) params.set('storeId', currentStoreId)
+  try {
+    const res = await fetch(`/api/admin/erp-carts?${params.toString()}`, {
+      headers: { authorization: 'Bearer ' + token },
+    })
+    if (res.status === 401) {
+      clearSession()
+      showLogin('세션이 만료되었습니다. 다시 로그인해주세요.')
+      return
+    }
+    const body = await res.json().catch(() => ({}))
+    if (!res.ok || !body.ok) {
+      erpCartBody.innerHTML = `<div class="empty">${escapeHtml(body.error || '불러오지 못했습니다.')}</div>`
+      return
+    }
+    if (!body.carts.length) {
+      erpCartBody.innerHTML = '<div class="empty">해당하는 전산 주문이 없습니다.</div>'
+      return
+    }
+    erpCartBody.innerHTML = `<table>
+      <thead><tr>
+        <th>접수</th><th>참조번호</th><th>매장</th><th>차량</th>
+        <th>금액</th><th>상태</th><th>담김/결제</th>
+      </tr></thead>
+      <tbody>${body.carts.map((c) => `<tr>
+        <td>${escapeHtml(formatWhen(c.createdAt))}</td>
+        <td><code>${escapeHtml(c.referenceId)}</code><br>
+            <span class="muted">${c.itemCount}개 품목</span></td>
+        <td>${escapeHtml(c.storeName || '-')}<br>
+            <span class="muted">${escapeHtml(c.erpStoreCode || '')}</span></td>
+        <td>${escapeHtml(c.carNumber || '-')}
+            ${c.linkedReservation ? '<br><span class="muted">예약 연결됨</span>' : ''}</td>
+        <td>${Number(c.totalAmount).toLocaleString('ko-KR')}원</td>
+        <td><span class="erp-status ${escapeHtml(c.status)}">${escapeHtml(ERP_STATUS_LABEL[c.status] || c.status)}</span>
+            ${c.errorMessage ? `<br><span class="muted">${escapeHtml(c.errorMessage)}</span>` : ''}</td>
+        <td>${escapeHtml(formatWhen(c.loadedAt))}<br>
+            <span class="muted">${escapeHtml(formatWhen(c.paidAt))}</span></td>
+      </tr>`).join('')}</tbody>
+    </table>`
+  } catch (err) {
+    erpCartBody.innerHTML = '<div class="empty">요청 중 오류가 발생했습니다.</div>'
+  }
+}
+
+if (erpCartPanel) {
+  erpCartPanel.addEventListener('toggle', () => { if (erpCartPanel.open) loadErpCarts() })
+  erpCartReload.addEventListener('click', loadErpCarts)
+  erpCartStatus.addEventListener('change', loadErpCarts)
+}
 
 // --- POS 토큰 관리 (본사는 전체 매장, 매장관리자는 자기 매장만) ---
 function maskedToken() {

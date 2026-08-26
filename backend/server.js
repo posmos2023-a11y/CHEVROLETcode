@@ -16,6 +16,8 @@ const {
   createAdminUser,
   markAdminLogin,
   recordFailedLogin,
+  changeAdminPassword,
+  getAdminUser,
   createStore,
   listStores,
   getStore,
@@ -63,6 +65,10 @@ const {
   markErpCartLoaded,
   markErpCartFailed,
   markErpCartDismissed,
+  markErpCartPaid,
+  listErpCarts,
+  completeReservationAfterPayment,
+  findOpenReservationByCarNumber,
   cancelErpCart,
 } = require('./src/store')
 const { createTossDraftOrder } = require('./src/tossOrderClient')
@@ -200,6 +206,13 @@ app.use('/pos-plugin', express.static(path.join(__dirname, '..', 'pos-plugin', '
 const asyncHandler = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next)
 
 const CAR_NUMBER_RE = /^\d{2,3}[가-힣]\d{4}$/
+
+// 전산이 "12가 3456", "12-가-3456"처럼 보낼 수 있다. 예약 화면에서 손님이 입력한 값과 비교하려면
+// 표기를 하나로 맞춰야 한다 — 공백·하이픈만 걷어낸다(그 이상 손대면 다른 차를 같은 차로 볼 수 있다).
+function normalizeCarNumber(raw) {
+  const v = String(raw ?? '').replace(/[\s-]/g, '').trim()
+  return v || null
+}
 const PHONE_RE = /^01[0-9]{8,9}$/
 
 // 정비 항목 선택지. 토스프론트 플러그인의 reservation.html 선택 화면과 키/순서를 맞춰야 한다.
@@ -396,6 +409,45 @@ app.get('/api/admin/me', requireAuth, asyncHandler(async (req, res) => {
     store = await getStore(req.admin.storeId)
   }
   return res.json({ ok: true, id: req.admin.id, email: req.admin.email, role: req.admin.role, store })
+}))
+
+// 로그인한 사람이 자기 비밀번호를 바꾼다.
+//
+// 지금까지 비밀번호를 바꿀 방법이 아예 없었다. 잊으면 들어갈 길이 없어서 DB의 passwordHash를
+// 직접 갈아끼워야 했다(실제로 그렇게 복구했다). ADMIN_BOOTSTRAP_PASSWORD 시크릿을 바꾸고
+// 재배포해도 소용없다 — 그 값은 "관리자가 하나도 없을 때 처음 만들 값"이라, 이미 계정이 있으면
+// 부팅 코드가 그냥 지나간다.
+//
+// 잊은 경우까지 셀프로 풀어주려면 이메일 발송이나 마스터 비밀번호가 필요한데, 전자는 인프라가
+// 없고 후자는 GCP 콘솔 접근 권한이 곧 관리자 권한이 되는 문제가 있다. 그래서 여기서는
+// "기억하고 있을 때 바꿀 수 있게" 하는 것까지만 한다 — 정기 교체와 유출 시 대응은 이걸로 된다.
+app.post('/api/admin/password', requireAuth, adminLoginLimiter, asyncHandler(async (req, res) => {
+  const currentPassword = String(req.body?.currentPassword ?? '')
+  const newPassword = String(req.body?.newPassword ?? '')
+
+  if (newPassword.length < 8) {
+    return res.status(400).json({ ok: false, error: '새 비밀번호는 8자 이상이어야 합니다.' })
+  }
+  if (newPassword === currentPassword) {
+    return res.status(400).json({ ok: false, error: '지금 쓰는 비밀번호와 다른 값을 입력해주세요.' })
+  }
+
+  const admin = await getAdminUser(req.admin.id)
+  if (!admin) {
+    return res.status(404).json({ ok: false, error: '계정을 찾을 수 없습니다.' })
+  }
+  // 토큰만으로 바꾸게 하면, 자리를 비운 사이 열린 화면으로 남이 비밀번호를 갈아버릴 수 있다.
+  if (!(await verifyPassword(currentPassword, admin.passwordHash))) {
+    return res.status(401).json({ ok: false, error: '지금 쓰는 비밀번호가 올바르지 않습니다.' })
+  }
+
+  const updated = await changeAdminPassword(admin.id, await hashPassword(newPassword))
+  if (!updated) {
+    return res.status(500).json({ ok: false, error: '비밀번호를 변경하지 못했습니다.' })
+  }
+  // 기존 토큰은 그대로 유효하다(만료 12시간). 여기서 전부 무효화하려면 토큰 버전 관리가
+  // 필요한데, 자기 비밀번호를 스스로 바꾸는 흐름에서는 그만한 값이 없다.
+  return res.json({ ok: true })
 }))
 
 // 일별 요약 (관리자 전용, 계약 v3 §5.1 신규). hq_admin은 ?storeId=로 특정 매장 또는 전체(생략),
@@ -1330,6 +1382,41 @@ const BUSINESS_NUMBER_DIGITS = 10
 // 이미 등록된 매장의 사업자번호를 채우거나 고친다. 매장 등록 화면에서만 받고 있어서 기존
 // 매장은 손댈 방법이 없었는데, 전산 자동 연결(resolveErpStore)이 이 값을 기준으로 동작하므로
 // 뒤늦게라도 채울 통로가 필요하다.
+// 전산 주문 이력 조회. 매장이 "보냈는데 POS에 안 떴어요" 할 때 본사가 어디서 끊겼는지
+// 확인하는 통로다(접수는 됐는지, POS가 가져갔는지, 실패했는지).
+// store_admin은 자기 매장만 본다 — 다른 매장의 차량번호·품목이 보이면 안 된다.
+app.get('/api/admin/erp-carts', requireAuth, asyncHandler(async (req, res) => {
+  const storeId = req.admin.role === 'hq_admin'
+    ? (req.query.storeId ? String(req.query.storeId) : null)
+    : req.admin.storeId
+  const status = req.query.status ? String(req.query.status) : null
+
+  const rows = await listErpCarts({ storeId, status, limit: req.query.limit })
+  return res.json({
+    ok: true,
+    carts: rows.map((r) => {
+      let items = []
+      try { items = JSON.parse(r.itemsJson) } catch { /* 손상된 건은 품목만 빈 배열로 */ }
+      return {
+        id: r.id,
+        referenceId: r.referenceId,
+        storeName: r.store?.name || null,
+        erpStoreCode: r.store?.erpStoreCode || null,
+        status: r.status,
+        totalAmount: r.totalAmount,
+        memo: r.memo,
+        carNumber: r.carNumber,
+        linkedReservation: Boolean(r.reservationId),
+        itemCount: items.length,
+        errorMessage: r.errorMessage,
+        createdAt: r.createdAt,
+        loadedAt: r.loadedAt,
+        paidAt: r.paidAt,
+      }
+    }),
+  })
+}))
+
 app.post('/api/admin/stores/:id/business-number', requireAuth, requireRole('hq_admin'), asyncHandler(async (req, res) => {
   const raw = req.body?.businessNumber
   const wantsClear = raw === undefined || raw === null || String(raw).trim() === ''
@@ -1699,6 +1786,55 @@ app.get('/api/erp/draft-orders/:referenceId', erpLimiter, requireErpToken, async
   })
 }))
 
+// POS에서 결제가 실제로 끝났을 때 탭앱이 알려준다(posPluginSdk.payment.on('paid')).
+//
+// 이게 없으면 전산 주문은 "담김(loaded)"에서 멈춘다 — 전산은 결제가 됐는지 모르고, 우리 쪽
+// 집계에도 안 잡힌다. 토스 결제 웹훅으로 뒤늦게 맞추는 방법도 있지만 웹훅은 paymentKey만 주고
+// 그게 어느 장바구니 건인지 되짚을 방법이 없다(금액·시각으로 추정해야 한다). 반면 탭앱은
+// 자기가 방금 담은 주문이라는 걸 알고 있어서 확실하다.
+//
+// Payment 테이블에는 넣지 않는다 — 그쪽은 고객 동의를 받은 흐름이고 프로모션 대상 판정에 쓰인다.
+// 동의 없이 POS에서 일어난 결제를 섞으면 그 판정이 흐려진다(schema.prisma 주석 참고).
+app.post('/api/pos/erp-carts/:id/paid', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  const cart = await prisma.erpCart.findUnique({ where: { id: req.params.id } })
+  if (!cart || cart.storeId !== req.store.id) {
+    return res.status(404).json({ ok: false, error: '장바구니를 찾을 수 없습니다.' })
+  }
+  if (cart.status === 'paid') {
+    // 탭앱이 재시도했거나 단말기가 두 대다. 이미 기록된 건이면 그대로 알려준다.
+    return res.json({ ok: true, alreadyProcessed: true, status: 'paid' })
+  }
+  if (cart.status !== 'loaded') {
+    // 담기지도 않은 건이 결제됐다고 기록되면 안 된다.
+    return res.status(409).json({ ok: false, error: '담긴(loaded) 주문만 결제 완료로 기록할 수 있습니다.', status: cart.status })
+  }
+
+  const changed = await markErpCartPaid(cart.id, {
+    paymentId: req.body?.paymentId,
+    orderId: req.body?.orderId,
+  })
+  if (!changed) {
+    const latest = await prisma.erpCart.findUnique({ where: { id: cart.id } })
+    return res.json({ ok: true, alreadyProcessed: true, status: latest?.status })
+  }
+
+  // 예약이 이어져 있으면 정비완료까지 자동으로 처리한다 — 결제가 끝났다는 건 정비가 끝났다는
+  // 뜻이라, 직원이 [완료]를 또 누르게 할 이유가 없다. 이미 완료/취소된 예약이면 아무 일도
+  // 일어나지 않는다(completeReservationAfterPayment가 상태를 확인한다).
+  let reservationCompleted = false
+  if (cart.reservationId) {
+    try {
+      reservationCompleted = await completeReservationAfterPayment(cart.reservationId)
+    } catch (e) {
+      // 자동완료는 부가 기능이다. 여기서 실패해도 결제 기록 자체는 이미 남았으므로 500을
+      // 내지 않는다 — 직원이 대기열에서 직접 완료 처리하면 된다.
+      logger.error('[pos] 결제 후 예약 자동완료 실패', { cartId: cart.id, error: e.message })
+    }
+  }
+
+  return res.json({ ok: true, alreadyProcessed: false, status: 'paid', reservationCompleted })
+}))
+
 // --- 쉐보레 전산(ERP) "물건 담기" -> POS 플러그인 장바구니 중계 (POS-CART-BRIDGE §1) ---
 // 위 /api/erp/draft-orders(토스 Open API로 주문 자체를 생성)와는 완전히 별개의 새 경로다 -- 그
 // 경로로 만든 주문은 POS에서 결제할 수 없다는 게 실증됐다(docs/ERP연동-결제경로-조사결과.md).
@@ -1827,6 +1963,24 @@ app.post('/api/erp/carts', erpLimiter, requireErpToken, asyncHandler(async (req,
     return res.json({ ok: true, cartId: existing.id, referenceId, status: existing.status, duplicate: true })
   }
 
+  // 차량번호가 오면 그날 대기 중인 손님과 잇는다. 이어지면 결제가 끝났을 때 정비완료까지
+  // 자동으로 처리되고, 직원이 "이 주문이 누구 건지" 헷갈리지 않는다.
+  // 형식이 어긋나면(전산 표기가 다를 수 있다) 잇지 않고 저장만 한다 — 400으로 막으면 연동 자체가
+  // 끊기는데, 이 필드는 부가 기능이라 그만한 값이 없다.
+  const carNumber = normalizeCarNumber(req.body?.carNumber)
+  let reservationId = null
+  if (carNumber && CAR_NUMBER_RE.test(carNumber)) {
+    const reservation = await findOpenReservationByCarNumber(store.id, carNumber, kstDateString())
+    reservationId = reservation ? reservation.id : null
+    if (!reservation) {
+      // 못 이었다고 실패가 아니다(예약 없이 온 손님도 있다). 나중에 "왜 안 이어졌지"를
+      // 추적할 수 있게 남겨만 둔다.
+      logger.info('[erp] 차량번호와 일치하는 진행 중 예약이 없어 연결하지 않았습니다.', {
+        referenceId, storeId: store.id,
+      })
+    }
+  }
+
   const cart = await createErpCart({
     storeId: store.id,
     referenceId,
@@ -1834,8 +1988,10 @@ app.post('/api/erp/carts', erpLimiter, requireErpToken, asyncHandler(async (req,
     totalAmount,
     memo,
     autoPay,
+    carNumber,
+    reservationId,
   })
-  return res.status(201).json({ ok: true, cartId: cart.id, referenceId, status: cart.status })
+  return res.status(201).json({ ok: true, cartId: cart.id, referenceId, status: cart.status, linkedReservation: Boolean(reservationId) })
 }))
 
 // 전산이 담아둔 장바구니의 처리 상태(pending/loaded/failed/cancelled)를 재조회할 수 있게 한다.

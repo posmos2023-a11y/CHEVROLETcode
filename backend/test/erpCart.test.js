@@ -957,3 +957,339 @@ testSerial('개인정보 파기: 보관기간 안의 건은 memo를 지우지 �
   const stored = await prisma.erpCart.findUnique({ where: { referenceId: body.referenceId } })
   assert.equal(stored.memo, body.memo)
 })
+
+// --- 결제 완료 기록 + 예약 자동완료 ------------------------------------------
+// 이게 없으면 전산 주문은 "담김(loaded)"에서 멈춘다 — 전산은 결제가 됐는지 모르고 우리 집계에도
+// 안 잡힌다. POS 탭앱이 posPluginSdk.payment.on('paid')로 받아 서버에 알려준다.
+
+function markPaid(store, cartId, body) {
+  return request(app).post(`/api/pos/erp-carts/${cartId}/paid`).set('X-Store-Token', store.posToken).send(body || {})
+}
+
+async function loadedCart(label) {
+  const store = await createStore(label)
+  const body = validBody(store)
+  assert.equal((await postCart(body)).status, 201)
+  const cartId = (await getPosCarts(store)).body.carts[0].id
+  await consumeCart(store, cartId, { result: 'loaded' })
+  return { store, cartId, body }
+}
+
+testSerial('결제: loaded 건을 paid로 기록하고 결제 식별자를 남긴다', async () => {
+  const { store, cartId, body } = await loadedCart('paid-basic')
+  const res = await markPaid(store, cartId, { paymentId: 'pay_123', orderId: 'ord_456' })
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal(res.body.status, 'paid')
+
+  const stored = await prisma.erpCart.findUnique({ where: { id: cartId } })
+  assert.equal(stored.status, 'paid')
+  assert.equal(stored.tossPaymentId, 'pay_123')
+  assert.equal(stored.tossOrderId, 'ord_456')
+  assert.equal(stored.paidAt instanceof Date, true)
+
+  // 전산이 조회하면 결제됐음을 알 수 있어야 한다.
+  const erpView = await getCart(body.referenceId)
+  assert.equal(erpView.body.status, 'paid')
+})
+
+testSerial('결제: 담기지 않은(pending) 건은 결제로 기록할 수 없다', async () => {
+  const store = await createStore('paid-not-loaded')
+  assert.equal((await postCart(validBody(store))).status, 201)
+  const cartId = (await getPosCarts(store)).body.carts[0].id
+
+  const res = await markPaid(store, cartId, { paymentId: 'p' })
+  assert.equal(res.status, 409)
+  const stored = await prisma.erpCart.findUnique({ where: { id: cartId } })
+  assert.equal(stored.status, 'pending')
+})
+
+testSerial('결제: 두 번 보내도 안전하다(멱등)', async () => {
+  const { store, cartId } = await loadedCart('paid-idempotent')
+  assert.equal((await markPaid(store, cartId, { paymentId: 'p1' })).body.alreadyProcessed, false)
+  const second = await markPaid(store, cartId, { paymentId: 'p1' })
+  assert.equal(second.status, 200)
+  assert.equal(second.body.alreadyProcessed, true)
+})
+
+testSerial('결제: 다른 매장 토큰으로는 기록할 수 없다', async () => {
+  const { cartId } = await loadedCart('paid-owner')
+  const other = await createStore('paid-other')
+  const res = await markPaid(other, cartId, { paymentId: 'p' })
+  assert.equal(res.status, 404)
+})
+
+// --- 차량번호로 예약 연결 -----------------------------------------------------
+
+async function createReservationFor(store, carNumber, status) {
+  return prisma.reservation.create({
+    data: {
+      storeId: store.id,
+      carNumber,
+      phone: '01012345678',
+      serviceType: '엔진오일',
+      queueNumber: Math.floor(Math.random() * 9000) + 1000,
+      serviceDate: new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10),
+      status: status || 'waiting',
+    },
+  })
+}
+
+testSerial('예약 연결: 차량번호가 그날 대기 손님과 정확히 1건 일치하면 이어진다', async () => {
+  const store = await createStore('link-one')
+  const reservation = await createReservationFor(store, '12가3456')
+  const body = validBody(store, { carNumber: '12가3456' })
+  const res = await postCart(body)
+  assert.equal(res.status, 201)
+  assert.equal(res.body.linkedReservation, true)
+
+  const stored = await prisma.erpCart.findUnique({ where: { referenceId: body.referenceId } })
+  assert.equal(stored.reservationId, reservation.id)
+  assert.equal(stored.carNumber, '12가3456')
+})
+
+testSerial('예약 연결: 표기가 달라도(공백) 같은 차로 본다', async () => {
+  const store = await createStore('link-spaces')
+  const reservation = await createReservationFor(store, '12가3456')
+  const body = validBody(store, { carNumber: '12가 3456' })
+  assert.equal((await postCart(body)).body.linkedReservation, true)
+  const stored = await prisma.erpCart.findUnique({ where: { referenceId: body.referenceId } })
+  assert.equal(stored.reservationId, reservation.id)
+})
+
+testSerial('예약 연결: 같은 차량번호가 둘이면 잇지 않는다(애매하면 사람에게)', async () => {
+  const store = await createStore('link-ambiguous')
+  await createReservationFor(store, '99하9999')
+  await createReservationFor(store, '99하9999')
+  const body = validBody(store, { carNumber: '99하9999' })
+  assert.equal((await postCart(body)).body.linkedReservation, false)
+  const stored = await prisma.erpCart.findUnique({ where: { referenceId: body.referenceId } })
+  assert.equal(stored.reservationId, null)
+})
+
+testSerial('예약 연결: 이미 끝난 예약에는 잇지 않는다', async () => {
+  const store = await createStore('link-closed')
+  await createReservationFor(store, '11가1111', 'completed')
+  const body = validBody(store, { carNumber: '11가1111' })
+  assert.equal((await postCart(body)).body.linkedReservation, false)
+})
+
+testSerial('예약 연결: 다른 매장 예약에는 잇지 않는다', async () => {
+  const storeA = await createStore('link-store-a')
+  const storeB = await createStore('link-store-b')
+  await createReservationFor(storeA, '22나2222')
+  const body = validBody(storeB, { carNumber: '22나2222' })
+  assert.equal((await postCart(body)).body.linkedReservation, false)
+})
+
+testSerial('예약 연결: 차량번호를 안 보내도 접수는 정상 동작한다', async () => {
+  const store = await createStore('link-none')
+  const res = await postCart(validBody(store))
+  assert.equal(res.status, 201)
+  assert.equal(res.body.linkedReservation, false)
+})
+
+testSerial('예약 자동완료: 결제되면 이어진 예약이 완료로 바뀐다', async () => {
+  const store = await createStore('autocomplete')
+  const reservation = await createReservationFor(store, '33다3333', 'called')
+  const body = validBody(store, { carNumber: '33다3333' })
+  assert.equal((await postCart(body)).body.linkedReservation, true)
+
+  const cartId = (await getPosCarts(store)).body.carts[0].id
+  await consumeCart(store, cartId, { result: 'loaded' })
+  const res = await markPaid(store, cartId, { paymentId: 'p' })
+  assert.equal(res.body.reservationCompleted, true)
+
+  const after = await prisma.reservation.findUnique({ where: { id: reservation.id } })
+  assert.equal(after.status, 'completed')
+  assert.equal(after.completedAt instanceof Date, true)
+})
+
+testSerial('예약 자동완료: 호출 전(waiting)이어도 결제되면 완료된다', async () => {
+  // 직원이 [완료]를 누르는 경로는 호출한 건만 완료한다. 하지만 바쁘면 호출 없이 처리하기도 하고,
+  // 결제가 끝났다는 건 정비가 끝났다는 뜻이므로 waiting도 완료로 넘긴다.
+  const store = await createStore('autocomplete-waiting')
+  const reservation = await createReservationFor(store, '44라4444', 'waiting')
+  const body = validBody(store, { carNumber: '44라4444' })
+  assert.equal((await postCart(body)).body.linkedReservation, true)
+  const cartId = (await getPosCarts(store)).body.carts[0].id
+  await consumeCart(store, cartId, { result: 'loaded' })
+  assert.equal((await markPaid(store, cartId, {})).body.reservationCompleted, true)
+
+  const after = await prisma.reservation.findUnique({ where: { id: reservation.id } })
+  assert.equal(after.status, 'completed')
+})
+
+testSerial('예약 자동완료: 이어진 예약이 없으면 결제만 기록된다', async () => {
+  const { store, cartId } = await loadedCart('autocomplete-none')
+  const res = await markPaid(store, cartId, {})
+  assert.equal(res.body.status, 'paid')
+  assert.equal(res.body.reservationCompleted, false)
+})
+
+// --- 관리자 웹 전산 주문 이력 -------------------------------------------------
+// 매장이 "전산에서 보냈는데 POS에 안 떴어요" 할 때 본사가 어디서 끊겼는지 볼 통로가 없었다.
+
+function listAdminCarts(tok, query) {
+  const req = request(app).get('/api/admin/erp-carts' + (query || ''))
+  if (tok) req.set('authorization', `Bearer ${tok}`)
+  return req
+}
+
+testSerial('관리자 이력: 본사는 전체 매장의 전산 주문을 본다', async () => {
+  const storeA = await createStore('adminlist-a')
+  const storeB = await createStore('adminlist-b')
+  assert.equal((await postCart(validBody(storeA))).status, 201)
+  assert.equal((await postCart(validBody(storeB))).status, 201)
+
+  const res = await listAdminCarts(await hqToken())
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal(res.body.carts.length >= 2, true)
+  const names = res.body.carts.map((c) => c.storeName)
+  assert.equal(names.includes(storeA.name) && names.includes(storeB.name), true)
+})
+
+testSerial('관리자 이력: 상태로 걸러낼 수 있다', async () => {
+  const store = await createStore('adminlist-filter')
+  const body = validBody(store)
+  assert.equal((await postCart(body)).status, 201)
+  const cartId = (await getPosCarts(store)).body.carts[0].id
+  await consumeCart(store, cartId, { result: 'loaded' })
+
+  const pending = await listAdminCarts(await hqToken(), '?status=pending')
+  assert.equal(pending.body.carts.some((c) => c.referenceId === body.referenceId), false)
+
+  const loaded = await listAdminCarts(await hqToken(), '?status=loaded')
+  assert.equal(loaded.body.carts.some((c) => c.referenceId === body.referenceId), true)
+})
+
+testSerial('관리자 이력: 특정 매장만 골라 볼 수 있다', async () => {
+  const storeA = await createStore('adminlist-only-a')
+  const storeB = await createStore('adminlist-only-b')
+  const bodyA = validBody(storeA)
+  assert.equal((await postCart(bodyA)).status, 201)
+  assert.equal((await postCart(validBody(storeB))).status, 201)
+
+  const res = await listAdminCarts(await hqToken(), `?storeId=${storeA.id}`)
+  assert.equal(res.body.carts.every((c) => c.storeName === storeA.name), true)
+  assert.equal(res.body.carts.some((c) => c.referenceId === bodyA.referenceId), true)
+})
+
+testSerial('관리자 이력: 로그인하지 않으면 볼 수 없다', async () => {
+  const res = await listAdminCarts(null)
+  assert.equal(res.status, 401)
+})
+
+testSerial('관리자 이력: 응답에 품목 원문은 넣지 않고 개수만 준다', async () => {
+  // 목록 화면에 품목 전체를 실어보내면 응답이 커지고, 목록에서는 개수만 보면 충분하다.
+  const store = await createStore('adminlist-shape')
+  const body = validBody(store)
+  assert.equal((await postCart(body)).status, 201)
+
+  const res = await listAdminCarts(await hqToken(), `?storeId=${store.id}`)
+  const row = res.body.carts.find((c) => c.referenceId === body.referenceId)
+  assert.equal(row.itemCount, body.items.length)
+  assert.equal(row.itemsJson, undefined)
+  assert.equal(row.totalAmount, body.totalAmount)
+})
+
+// --- 일일 요약에 전산 주문 ----------------------------------------------------
+
+testSerial('일일 요약: 전산 주문 건수와 결제액이 함께 나온다', async () => {
+  const store = await createStore('summary-erp')
+  const body = validBody(store)
+  assert.equal((await postCart(body)).status, 201)
+  const cartId = (await getPosCarts(store)).body.carts[0].id
+  await consumeCart(store, cartId, { result: 'loaded' })
+  await request(app).post(`/api/pos/erp-carts/${cartId}/paid`).set('X-Store-Token', store.posToken).send({})
+
+  const res = await request(app)
+    .get('/api/admin/summary')
+    .set('authorization', `Bearer ${await hqToken()}`)
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  const erp = res.body.summary ? res.body.summary.erpCarts : res.body.erpCarts
+  assert.notEqual(erp, undefined, `요약에 erpCarts가 없습니다: ${JSON.stringify(res.body).slice(0, 300)}`)
+  assert.equal(erp.total >= 1, true)
+  assert.equal(erp.paid >= 1, true)
+  assert.equal(erp.paidAmount >= body.totalAmount, true)
+})
+
+// --- 관리자 비밀번호 변경 -----------------------------------------------------
+// 지금까지 바꿀 방법이 아예 없었다. 잊으면 DB의 passwordHash를 직접 갈아끼워야 했다.
+// (ADMIN_BOOTSTRAP_PASSWORD 시크릿을 바꾸고 재배포해도 소용없다 — 그 값은 "관리자가 하나도
+//  없을 때 처음 만들 값"이라 이미 계정이 있으면 부팅 코드가 그냥 지나간다.)
+
+const { hashPassword: hashPw } = require('../src/auth')
+
+async function adminWithPassword(password) {
+  const admin = await prisma.adminUser.create({
+    data: {
+      email: `${unique('pw')}@example.test`,
+      passwordHash: await hashPw(password),
+      role: 'hq_admin',
+      storeId: null,
+    },
+  })
+  return { admin, token: signAdminToken(admin) }
+}
+
+function changePw(tok, body) {
+  const req = request(app).post('/api/admin/password')
+  if (tok) req.set('authorization', `Bearer ${tok}`)
+  return req.send(body)
+}
+
+testSerial('비밀번호 변경: 현재 비밀번호가 맞으면 바뀌고, 새 값으로 로그인된다', async () => {
+  const { admin, token: tok } = await adminWithPassword('old-password-123')
+  const res = await changePw(tok, { currentPassword: 'old-password-123', newPassword: 'new-password-456' })
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+
+  const login = await request(app).post('/api/admin/login')
+    .send({ email: admin.email, password: 'new-password-456' })
+  assert.equal(login.status, 200, '새 비밀번호로 로그인되지 않습니다')
+
+  const oldLogin = await request(app).post('/api/admin/login')
+    .send({ email: admin.email, password: 'old-password-123' })
+  assert.equal(oldLogin.status === 200, false, '옛 비밀번호가 아직 통합니다')
+})
+
+testSerial('비밀번호 변경: 현재 비밀번호가 틀리면 거부한다', async () => {
+  // 토큰만으로 바꾸게 하면 자리를 비운 사이 열린 화면으로 남이 갈아버릴 수 있다.
+  const { admin, token: tok } = await adminWithPassword('old-password-123')
+  const res = await changePw(tok, { currentPassword: 'wrong-one', newPassword: 'new-password-456' })
+  assert.equal(res.status, 401)
+
+  const login = await request(app).post('/api/admin/login')
+    .send({ email: admin.email, password: 'old-password-123' })
+  assert.equal(login.status, 200, '비밀번호가 바뀌어버렸습니다')
+})
+
+testSerial('비밀번호 변경: 8자 미만은 거부한다', async () => {
+  const { token: tok } = await adminWithPassword('old-password-123')
+  const res = await changePw(tok, { currentPassword: 'old-password-123', newPassword: 'short' })
+  assert.equal(res.status, 400)
+})
+
+testSerial('비밀번호 변경: 같은 값으로는 바꿀 수 없다', async () => {
+  const { token: tok } = await adminWithPassword('old-password-123')
+  const res = await changePw(tok, { currentPassword: 'old-password-123', newPassword: 'old-password-123' })
+  assert.equal(res.status, 400)
+})
+
+testSerial('비밀번호 변경: 로그인하지 않으면 거부한다', async () => {
+  const res = await changePw(null, { currentPassword: 'x', newPassword: 'yyyyyyyy' })
+  assert.equal(res.status, 401)
+})
+
+testSerial('비밀번호 변경: 잠금 카운터도 함께 풀린다', async () => {
+  // 실패가 쌓인 상태로 비밀번호만 바꾸면 새 값으로도 잠금에 막혀 "바꿨는데 왜 안 되지"가 된다.
+  const { admin, token: tok } = await adminWithPassword('old-password-123')
+  await prisma.adminUser.update({
+    where: { id: admin.id },
+    data: { failedLoginCount: 4, lockedUntil: new Date(Date.now() + 10 * 60 * 1000) },
+  })
+
+  assert.equal((await changePw(tok, { currentPassword: 'old-password-123', newPassword: 'new-password-456' })).status, 200)
+  const after = await prisma.adminUser.findUnique({ where: { id: admin.id } })
+  assert.equal(after.failedLoginCount, 0)
+  assert.equal(after.lockedUntil, null)
+})
