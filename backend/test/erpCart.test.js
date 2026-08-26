@@ -43,6 +43,7 @@ process.env.TOSS_WEBHOOK_SECRET = ''
 const ERP_TOKEN = 'test-erp-cart-shared-token-0000'
 process.env.ERP_API_TOKEN = ERP_TOKEN
 
+const { hashPassword, signAdminToken } = require('../src/auth')
 const { prisma } = require('../src/store')
 const { app } = require('../server')
 
@@ -71,6 +72,20 @@ async function createStore(label, overrides = {}) {
       ...overrides,
     },
   })
+}
+
+// 본사 관리자 토큰. erpOrder.test.js와 같은 방식(직접 서명)으로 만든다 -- 로그인 API를 거치면
+// 레이트리밋(adminLoginLimiter)에 걸려 테스트가 순서에 따라 불안정해진다.
+async function hqToken() {
+  const admin = await prisma.adminUser.create({
+    data: {
+      email: `${unique('hq')}@example.test`,
+      passwordHash: await hashPassword('test-password-123'),
+      role: 'hq_admin',
+      storeId: null,
+    },
+  })
+  return signAdminToken(admin)
 }
 
 before(async () => {
@@ -469,4 +484,159 @@ testSerial('autoPay: null을 보내면 기본값 true가 된다', async () => {
 
   const stored = await prisma.erpCart.findUnique({ where: { referenceId: body.referenceId } })
   assert.equal(stored.autoPay, true)
+})
+
+// --- 사업자번호 자동 연결 ---------------------------------------------------
+// 전산 코드가 아직 등록되지 않은 매장이라도, 전산이 사업자번호를 함께 보내면 서버가 그걸로
+// 매장을 찾아 코드를 붙여준다. 잘못 이어지면 남의 매장으로 주문이 가고 결제까지 이어지므로
+// 경계 조건을 촘촘히 본다.
+
+async function createStoreWithBiz(label, businessNumber, overrides = {}) {
+  return prisma.store.create({
+    data: {
+      merchantId: unique(`merchant-${label}`),
+      name: `테스트 매장 ${label}`,
+      posToken: crypto.randomBytes(32).toString('hex'),
+      businessNumber,
+      ...overrides,
+    },
+  })
+}
+
+testSerial('자동연결: 코드가 없어도 사업자번호가 맞으면 매장을 찾아 코드를 붙인다', async () => {
+  const store = await createStoreWithBiz('autobind', '123-45-67890')
+  const body = {
+    storeCode: 'AUTO-CHV-001',
+    referenceId: unique('ERP-AUTO'),
+    items: [{ productId: 'P-1', name: '엔진오일', category: '부품', unitPrice: 45000, quantity: 1 }],
+    totalAmount: 45000,
+    businessNumber: '123-45-67890',
+  }
+  const res = await postCart(body)
+  assert.equal(res.status, 201, JSON.stringify(res.body))
+
+  const after = await prisma.store.findUnique({ where: { id: store.id } })
+  assert.equal(after.erpStoreCode, 'AUTO-CHV-001')
+
+  // 붙은 뒤에는 사업자번호 없이 코드만 보내도 찾아져야 한다.
+  const second = await postCart({ ...body, referenceId: unique('ERP-AUTO2'), businessNumber: undefined })
+  assert.equal(second.status, 201, JSON.stringify(second.body))
+})
+
+testSerial('자동연결: 하이픈 없는 표기로 보내도 하이픈으로 저장된 매장을 찾는다', async () => {
+  const store = await createStoreWithBiz('autobind-nohyphen', '123-45-67890')
+  const res = await postCart({
+    storeCode: 'AUTO-NOHYPHEN',
+    referenceId: unique('ERP-AUTO'),
+    items: [{ productId: 'P-1', name: '오일필터', category: '부품', unitPrice: 12000, quantity: 1 }],
+    totalAmount: 12000,
+    businessNumber: '1234567890',
+  })
+  assert.equal(res.status, 201, JSON.stringify(res.body))
+  const after = await prisma.store.findUnique({ where: { id: store.id } })
+  assert.equal(after.erpStoreCode, 'AUTO-NOHYPHEN')
+})
+
+testSerial('자동연결: 이미 다른 코드가 붙은 매장은 덮어쓰지 않고 409', async () => {
+  // 사업자번호만 아는 쪽이 남의 매장 주문을 자기 코드로 가로채지 못하게 막는다.
+  const store = await createStoreWithBiz('autobind-taken', '222-22-22222', { erpStoreCode: 'ALREADY-BOUND' })
+  const res = await postCart({
+    storeCode: 'HIJACK-ATTEMPT',
+    referenceId: unique('ERP-AUTO'),
+    items: [{ productId: 'P-1', name: 'x', category: '부품', unitPrice: 1000, quantity: 1 }],
+    totalAmount: 1000,
+    businessNumber: '222-22-22222',
+  })
+  assert.equal(res.status, 409)
+  const after = await prisma.store.findUnique({ where: { id: store.id } })
+  assert.equal(after.erpStoreCode, 'ALREADY-BOUND') // 그대로여야 한다
+})
+
+testSerial('자동연결: 같은 사업자번호를 쓰는 매장이 둘이면 409로 중단한다', async () => {
+  // 어느 쪽인지 우리가 정할 수 없으므로 추측하지 않는다.
+  await createStoreWithBiz('dup-a', '333-33-33333')
+  await createStoreWithBiz('dup-b', '333-33-33333')
+  const res = await postCart({
+    storeCode: 'AMBIGUOUS',
+    referenceId: unique('ERP-AUTO'),
+    items: [{ productId: 'P-1', name: 'x', category: '부품', unitPrice: 1000, quantity: 1 }],
+    totalAmount: 1000,
+    businessNumber: '333-33-33333',
+  })
+  assert.equal(res.status, 409)
+  const bound = await prisma.store.count({ where: { erpStoreCode: 'AMBIGUOUS' } })
+  assert.equal(bound, 0)
+})
+
+testSerial('자동연결: 일치하는 사업자번호가 없으면 404', async () => {
+  await createStoreWithBiz('nomatch', '444-44-44444')
+  const res = await postCart({
+    storeCode: 'NO-MATCH',
+    referenceId: unique('ERP-AUTO'),
+    items: [{ productId: 'P-1', name: 'x', category: '부품', unitPrice: 1000, quantity: 1 }],
+    totalAmount: 1000,
+    businessNumber: '999-99-99999',
+  })
+  assert.equal(res.status, 404)
+})
+
+testSerial('자동연결: 사업자번호 자릿수가 틀리면 400', async () => {
+  const res = await postCart({
+    storeCode: 'BAD-BIZ',
+    referenceId: unique('ERP-AUTO'),
+    items: [{ productId: 'P-1', name: 'x', category: '부품', unitPrice: 1000, quantity: 1 }],
+    totalAmount: 1000,
+    businessNumber: '12345',
+  })
+  assert.equal(res.status, 400)
+})
+
+testSerial('자동연결: 사업자번호를 안 보내면 예전처럼 404 (동작이 바뀌지 않는다)', async () => {
+  const res = await postCart({
+    storeCode: 'UNKNOWN-CODE',
+    referenceId: unique('ERP-AUTO'),
+    items: [{ productId: 'P-1', name: 'x', category: '부품', unitPrice: 1000, quantity: 1 }],
+    totalAmount: 1000,
+  })
+  assert.equal(res.status, 404)
+})
+
+// --- 관리자: 사업자번호 저장 ------------------------------------------------
+
+testSerial('관리자 사업자번호: 하이픈 없이 넣어도 하이픈 표기로 정규화해 저장한다', async () => {
+  const store = await createStore('biz-save')
+  const res = await request(app)
+    .post(`/api/admin/stores/${store.id}/business-number`)
+    .set('authorization', `Bearer ${await hqToken()}`)
+    .send({ businessNumber: '1234567890' })
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal(res.body.businessNumber, '123-45-67890')
+})
+
+testSerial('관리자 사업자번호: 자릿수가 틀리면 400', async () => {
+  const store = await createStore('biz-bad')
+  const res = await request(app)
+    .post(`/api/admin/stores/${store.id}/business-number`)
+    .set('authorization', `Bearer ${await hqToken()}`)
+    .send({ businessNumber: '123' })
+  assert.equal(res.status, 400)
+})
+
+testSerial('관리자 사업자번호: 빈 값이면 해제(null)된다', async () => {
+  const store = await createStoreWithBiz('biz-clear', '555-55-55555')
+  const res = await request(app)
+    .post(`/api/admin/stores/${store.id}/business-number`)
+    .set('authorization', `Bearer ${await hqToken()}`)
+    .send({ businessNumber: '' })
+  assert.equal(res.status, 200)
+  const after = await prisma.store.findUnique({ where: { id: store.id } })
+  assert.equal(after.businessNumber, null)
+})
+
+testSerial('관리자 사업자번호: 본사 관리자가 아니면 거부된다', async () => {
+  const store = await createStore('biz-authz')
+  const res = await request(app)
+    .post(`/api/admin/stores/${store.id}/business-number`)
+    .send({ businessNumber: '1234567890' })
+  assert.equal(res.status, 401)
 })

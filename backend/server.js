@@ -51,6 +51,9 @@ const {
   purgeExpiredPersonalData,
   getDailySummary,
   findStoreByErpCode,
+  findStoresByBusinessNumbers,
+  bindErpCodeIfUnset,
+  setStoreBusinessNumber,
   setStoreErpCode,
   findErpOrderByReference,
   upsertErpOrder,
@@ -1237,6 +1240,34 @@ app.post('/api/admin/stores/:id/pos-token', requireAuth, requireRole('hq_admin')
 // posToken과 달리 이 코드는 "비밀"이 아니라 전산 쪽 식별자를 그대로 반영한 값이라(예:
 // CHEV-UJB-001) 별도 시도 횟수 제한 없이 형식만 검증한다.
 const ERP_STORE_CODE_RE = /^[A-Za-z0-9_-]+$/
+// 사업자등록번호 자릿수. 관리자 웹 저장(POST .../business-number)과 전산 자동 연결
+// (resolveErpStore)이 같은 기준을 써야 해서 상수로 뺐다.
+const BUSINESS_NUMBER_DIGITS = 10
+// 이미 등록된 매장의 사업자번호를 채우거나 고친다. 매장 등록 화면에서만 받고 있어서 기존
+// 매장은 손댈 방법이 없었는데, 전산 자동 연결(resolveErpStore)이 이 값을 기준으로 동작하므로
+// 뒤늦게라도 채울 통로가 필요하다.
+app.post('/api/admin/stores/:id/business-number', requireAuth, requireRole('hq_admin'), asyncHandler(async (req, res) => {
+  const raw = req.body?.businessNumber
+  const wantsClear = raw === undefined || raw === null || String(raw).trim() === ''
+
+  let value = null
+  if (!wantsClear) {
+    // 표기(하이픈 유무)는 자유롭게 받되 숫자 10자리인지는 확인한다 -- 자릿수가 틀린 값이 들어가면
+    // 자동 연결이 조용히 실패하고, 왜 안 되는지 찾기가 어렵다.
+    const digits = String(raw).replace(/\D/g, '')
+    if (digits.length !== BUSINESS_NUMBER_DIGITS) {
+      return res.status(400).json({ ok: false, error: '사업자번호는 숫자 10자리여야 합니다.' })
+    }
+    value = `${digits.slice(0, 3)}-${digits.slice(3, 5)}-${digits.slice(5)}`
+  }
+
+  const store = await setStoreBusinessNumber(req.params.id, value)
+  if (!store) {
+    return res.status(404).json({ ok: false, error: '매장을 찾을 수 없습니다.' })
+  }
+  return res.json({ ok: true, storeId: store.id, businessNumber: store.businessNumber })
+}))
+
 app.post('/api/admin/stores/:id/erp-code', requireAuth, requireRole('hq_admin'), asyncHandler(async (req, res) => {
   const raw = req.body?.erpStoreCode
   const wantsClear = raw === undefined || raw === null || String(raw).trim() === ''
@@ -1592,6 +1623,71 @@ app.get('/api/erp/draft-orders/:referenceId', erpLimiter, requireErpToken, async
 // 자체 장바구니에 직접 옮겨 담고 startPayment()를 부른다. 인증/레이트리밋은 기존 draft-orders와
 // 동일하게 erpLimiter + requireErpToken(X-ERP-Token)을 그대로 재사용한다.
 
+// --- 전산 매장 해석: 코드 우선, 없으면 사업자번호로 자동 연결 ---
+//
+// 전산은 매장을 자기네 코드(CHV-001)로 부르고 우리는 merchantId로 부른다. 둘이 같은 곳이라는
+// 사실은 어느 쪽 시스템에도 없어서 원래는 사람이 관리자 웹에서 한 번 이어줘야 했다.
+// 그런데 **사업자등록번호는 양쪽이 이미 아는 유일한 공통 값**이다 -- 전산은 대리점 사업자번호를
+// 당연히 알고, 토스 가맹점도 사업자번호로 개설된다. 그래서 전산이 businessNumber를 함께 보내면
+// 첫 요청에서 자동으로 코드를 붙여준다(그 뒤로는 코드만 봐도 찾아진다).
+//
+// 자동 연결은 아래 조건을 모두 만족할 때만 한다. 하나라도 어긋나면 사람이 관리자 웹에서
+// 처리하게 두고 명확한 사유를 돌려준다 -- 잘못 이어지면 남의 매장으로 주문이 가고 결제까지
+// 이어지므로, 애매하면 자동으로 하지 않는 쪽이 옳다.
+
+// 사업자번호 표기는 "123-45-67890"과 "1234567890"이 섞여 들어온다. 우리 DB에 어느 표기로
+// 저장돼 있는지 통제할 수 없으므로 두 형태를 모두 만들어 조회한다.
+function businessNumberCandidates(raw) {
+  const digits = String(raw ?? '').replace(/\D/g, '')
+  if (digits.length !== BUSINESS_NUMBER_DIGITS) return null
+  const hyphenated = `${digits.slice(0, 3)}-${digits.slice(3, 5)}-${digits.slice(5)}`
+  return [digits, hyphenated]
+}
+
+// 반환: { store } | { error: {status, body} }
+async function resolveErpStore(storeCode, rawBusinessNumber) {
+  const byCode = await findStoreByErpCode(storeCode)
+  if (byCode) return { store: byCode }
+
+  if (rawBusinessNumber === undefined || rawBusinessNumber === null || String(rawBusinessNumber).trim() === '') {
+    return { error: { status: 404, body: { ok: false, error: '등록되지 않은 매장 코드입니다.' } } }
+  }
+
+  const candidates = businessNumberCandidates(rawBusinessNumber)
+  if (!candidates) {
+    return { error: { status: 400, body: { ok: false, error: 'businessNumber는 숫자 10자리여야 합니다.' } } }
+  }
+
+  const matches = await findStoresByBusinessNumbers(candidates)
+  if (matches.length === 0) {
+    return { error: { status: 404, body: { ok: false, error: '등록되지 않은 매장 코드입니다.' } } }
+  }
+  if (matches.length > 1) {
+    // 같은 사업자번호를 여러 매장이 쓰고 있으면 어느 쪽인지 우리가 정할 수 없다.
+    logger.error('[erp] 사업자번호가 여러 매장과 일치해 자동 연결을 중단합니다.', {
+      storeCode, matched: matches.map((m) => m.id),
+    })
+    return { error: { status: 409, body: { ok: false, error: '사업자번호가 여러 매장과 일치합니다. 본사에 매장 코드 등록을 요청해주세요.' } } }
+  }
+
+  const store = matches[0]
+  if (store.erpStoreCode) {
+    // 이미 다른 코드가 붙어 있는 매장이다. 덮어쓰면 기존 매핑이 조용히 바뀌므로 거부한다.
+    return { error: { status: 409, body: { ok: false, error: '이 매장에는 이미 다른 매장 코드가 등록되어 있습니다.' } } }
+  }
+
+  const bound = await bindErpCodeIfUnset(store.id, storeCode)
+  if (!bound) {
+    // 그 사이 다른 요청이 먼저 붙였거나 코드를 다른 매장이 선점했다. 다시 읽어 판단한다.
+    const recheck = await findStoreByErpCode(storeCode)
+    if (recheck && recheck.id === store.id) return { store: recheck }
+    return { error: { status: 409, body: { ok: false, error: '매장 코드를 등록하지 못했습니다. 본사에 문의해주세요.' } } }
+  }
+
+  logger.info('[erp] 사업자번호로 매장 코드를 자동 연결했습니다.', { storeId: store.id, storeCode })
+  return { store: { ...store, erpStoreCode: storeCode } }
+}
+
 app.post('/api/erp/carts', erpLimiter, requireErpToken, asyncHandler(async (req, res) => {
   // validateDraftOrderBody를 그대로 재사용한다 -- storeCode/referenceId/items/totalAmount/memo
   // 검증 규칙이 draft-orders와 완전히 동일해야 하고(전산 쪽이 같은 바디 스키마로 두 경로를
@@ -1611,10 +1707,12 @@ app.post('/api/erp/carts', erpLimiter, requireErpToken, asyncHandler(async (req,
     ? true
     : !(autoPayRaw === false || autoPayRaw === 'false' || autoPayRaw === 0 || autoPayRaw === '0')
 
-  const store = await findStoreByErpCode(storeCode)
-  if (!store) {
-    return res.status(404).json({ ok: false, error: '등록되지 않은 매장 코드입니다.' })
+  // 코드로 못 찾으면 사업자번호로 자동 연결을 시도한다(resolveErpStore 주석 참고).
+  const resolved = await resolveErpStore(storeCode, req.body?.businessNumber)
+  if (resolved.error) {
+    return res.status(resolved.error.status).json(resolved.error.body)
   }
+  const store = resolved.store
   if (store.status !== 'active') {
     return res.status(403).json({ ok: false, error: '비활성화된 가맹점입니다.' })
   }

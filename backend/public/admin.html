@@ -311,7 +311,9 @@
     <p style="font-size:12px;color:var(--muted);margin:8px 2px 12px;">
       <strong>POS 토큰</strong>은 POS 탭앱이 매장을 인증하는 값입니다. 외부에 노출되지 않도록 주의하세요.<br>
       <strong>전산 코드</strong>는 쉐보레 전산이 이 매장을 부르는 이름(예: CHV-001)입니다.
-      전산은 매장을 이 코드로 지정하므로, 값이 없으면 그 매장으로는 전산 주문이 들어오지 못합니다.
+      전산은 매장을 이 코드로 지정하므로, 값이 없으면 그 매장으로는 전산 주문이 들어오지 못합니다.<br>
+      <strong>사업자번호</strong>를 채워두면 전산 코드를 손으로 넣지 않아도 됩니다 — 전산이 주문에
+      사업자번호를 함께 보내오면 서버가 매장을 찾아 코드를 자동으로 붙입니다.
     </p>
     <div id="pos-token-body"></div>
   </details>
@@ -629,10 +631,29 @@ function erpCodeCell(erpStoreCode, editable) {
   </td>`
 }
 
-function posTokenRow(storeId, name, merchantId, posToken, canRegen, erpStoreCode) {
+// 사업자번호 칸.
+// 전산이 storeCode와 함께 사업자번호를 보내면 서버가 이 값으로 매장을 찾아 전산 코드를 자동으로
+// 붙여준다(서버의 resolveErpStore). 그러려면 이 값이 먼저 채워져 있어야 하는데, 지금까지는
+// 매장 등록 화면에서만 받아서 이미 등록된 매장은 고칠 방법이 없었다.
+function businessNumberCell(businessNumber, editable) {
+  const value = businessNumber || ''
+  if (!editable) {
+    return `<td>${value ? escapeHtml(value) : '<span class="muted">미지정</span>'}</td>`
+  }
+  return `<td>
+    <div class="erp-code-set">
+      <input type="text" class="biz-number-input" value="${escapeHtml(value)}" placeholder="123-45-67890"
+             maxlength="20" autocomplete="off" spellcheck="false" />
+      <button class="row-btn biz-number-save" type="button">저장</button>
+    </div>
+  </td>`
+}
+
+function posTokenRow(storeId, name, merchantId, posToken, canRegen, erpStoreCode, businessNumber) {
   return `<tr data-store-id="${escapeHtml(storeId)}">
     <td>${escapeHtml(name)}</td>
     <td>${escapeHtml(merchantId)}</td>
+    ${businessNumberCell(businessNumber, canRegen)}
     ${erpCodeCell(erpStoreCode, canRegen)}
     <td>
       <code class="pos-token-value" data-token="${escapeHtml(posToken || '')}" data-visible="false">${maskedToken()}</code>
@@ -662,8 +683,8 @@ function renderPosTokens() {
       return
     }
     posTokenBody.innerHTML = `<table>
-      <thead><tr><th>매장</th><th>merchantId</th><th>전산 코드</th><th>POS 토큰</th><th>동작</th></tr></thead>
-      <tbody>${stores.map(s => posTokenRow(s.id, s.name, s.merchantId, s.posToken, true, s.erpStoreCode)).join('')}</tbody>
+      <thead><tr><th>매장</th><th>merchantId</th><th>사업자번호</th><th>전산 코드</th><th>POS 토큰</th><th>동작</th></tr></thead>
+      <tbody>${stores.map(s => posTokenRow(s.id, s.name, s.merchantId, s.posToken, true, s.erpStoreCode, s.businessNumber)).join('')}</tbody>
     </table>`
   } else {
     if (!myStoreInfo) {
@@ -673,7 +694,7 @@ function renderPosTokens() {
     // store_admin은 토큰 재발급/전산 코드 지정 권한이 없다(둘 다 hq 전용 엔드포인트) —
     // 버튼 대신 현재 값만 보여준다.
     posTokenBody.innerHTML = `<table>
-      <tbody>${posTokenRow(myStoreInfo.id, myStoreInfo.name, myStoreInfo.merchantId, myStoreInfo.posToken, false, myStoreInfo.erpStoreCode)}</tbody>
+      <tbody>${posTokenRow(myStoreInfo.id, myStoreInfo.name, myStoreInfo.merchantId, myStoreInfo.posToken, false, myStoreInfo.erpStoreCode, myStoreInfo.businessNumber)}</tbody>
     </table>`
   }
 }
@@ -702,6 +723,42 @@ posTokenBody.addEventListener('click', async (e) => {
       setTimeout(() => { e.target.textContent = original }, 1500)
     } catch (err) {
       alert('클립보드 복사에 실패했습니다. 토큰을 직접 선택해 복사해주세요.')
+    }
+    return
+  }
+
+  if (e.target.classList.contains('biz-number-save')) {
+    const input = tr.querySelector('.biz-number-input')
+    const raw = (input?.value || '').trim()
+    e.target.disabled = true
+    try {
+      const res = await fetch(`/api/admin/stores/${storeId}/business-number`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', authorization: 'Bearer ' + token },
+        body: JSON.stringify({ businessNumber: raw }),
+      })
+      const body = await res.json().catch(() => ({}))
+      if (res.status === 401) {
+        clearSession()
+        showLogin('세션이 만료되었습니다. 다시 로그인해주세요.')
+        return
+      }
+      if (!res.ok || !body.ok) {
+        alert(body.error || '사업자번호 저장에 실패했습니다.')
+        return
+      }
+      // 서버가 하이픈 표기로 정규화해서 돌려주므로 화면도 그 값으로 맞춘다 — 사용자가 하이픈 없이
+      // 입력했을 때 저장된 형태를 바로 보여주는 편이 헷갈리지 않는다.
+      if (input) input.value = body.businessNumber || ''
+      const store = stores.find(s => s.id === storeId)
+      if (store) store.businessNumber = body.businessNumber
+      const original = e.target.textContent
+      e.target.textContent = '저장됨'
+      setTimeout(() => { e.target.textContent = original }, 1500)
+    } catch (err) {
+      alert('요청 중 오류가 발생했습니다.')
+    } finally {
+      e.target.disabled = false
     }
     return
   }

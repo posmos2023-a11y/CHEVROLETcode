@@ -708,6 +708,47 @@ function findStoreByErpCode(erpStoreCode) {
 // 본사 관리자가 매장에 전산 코드를 등록/해제할 때 쓴다. 빈 문자열/null을 보내면 코드 해제(null 저장)로
 // 취급한다(server.js가 형식 검증을 먼저 하므로 여기서는 unique 충돌만 신경 쓴다). 다른 매장이 이미
 // 쓰는 코드면 P2002가 나므로, setPosToken과 동일하게 호출부가 409로 변환할 수 있도록 코드를 붙여 던진다.
+// 전산이 사업자번호를 함께 보내오면 그걸로 매장을 찾는다(자동 연결). 사업자번호는 전산도
+// 우리도 이미 아는 유일한 공통 값이라, 이게 있으면 사람이 매핑표를 손으로 만들지 않아도 된다.
+// 표기가 "123-45-67890"일 수도 "1234567890"일 수도 있어 호출부가 두 형태를 다 만들어 넘긴다 --
+// 여기서 정규화하지 않는 이유는 DB에 저장된 값의 표기를 우리가 통제하지 못하기 때문이다.
+function findStoresByBusinessNumbers(candidates) {
+  if (!candidates || candidates.length === 0) return []
+  return prisma.store.findMany({ where: { businessNumber: { in: candidates } } })
+}
+
+// 아직 전산 코드가 없는 매장에만 붙인다. 이미 다른 코드가 붙어 있으면 건드리지 않는다 --
+// 자동 연결이 기존 매핑을 덮어쓰면, 사업자번호만 아는 쪽이 남의 매장 주문을 자기 코드로
+// 가로챌 수 있다. 반환값은 실제로 붙였는지 여부(경쟁 조건 방지를 위해 updateMany의 count로 판정).
+async function bindErpCodeIfUnset(storeId, erpStoreCode) {
+  try {
+    const result = await prisma.store.updateMany({
+      where: { id: storeId, erpStoreCode: null },
+      data: { erpStoreCode: String(erpStoreCode) },
+    })
+    return result.count > 0
+  } catch (e) {
+    // 그 사이 다른 매장이 같은 코드를 선점했으면 unique 제약에 걸린다. 자동 연결은 실패해도
+    // 치명적이지 않으므로(관리자 웹에서 수동으로 지정하면 된다) 예외를 밖으로 던지지 않는다.
+    if (e?.code === 'P2002') return false
+    throw e
+  }
+}
+
+// 관리자 웹에서 기존 매장의 사업자번호를 채워 넣을 때 쓴다. 자동 연결이 동작하려면 이 값이
+// 먼저 들어가 있어야 하는데, 매장 등록 화면에서만 받고 있어서 이미 등록된 매장은 고칠 방법이
+// 없었다.
+async function setStoreBusinessNumber(storeId, businessNumber) {
+  try {
+    return await prisma.store.update({
+      where: { id: storeId },
+      data: { businessNumber: businessNumber ? String(businessNumber) : null },
+    })
+  } catch {
+    return null
+  }
+}
+
 async function setStoreErpCode(storeId, erpStoreCode) {
   const value = erpStoreCode ? String(erpStoreCode) : null
   try {
@@ -1019,6 +1060,9 @@ module.exports = {
   purgeExpiredPersonalData,
   getDailySummary,
   findStoreByErpCode,
+  findStoresByBusinessNumbers,
+  bindErpCodeIfUnset,
+  setStoreBusinessNumber,
   setStoreErpCode,
   findErpOrderByReference,
   upsertErpOrder,
