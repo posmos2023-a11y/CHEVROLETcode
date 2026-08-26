@@ -1,4 +1,7 @@
 import { posPluginSdk } from '@tossplace/pos-plugin-sdk'
+// ⚠️ 임시 검증 패널 — 전산 연동 설계 확정용. 확인 끝나면 이 줄과 draftOrderProbe.js,
+// index.html의 probe-panel 블록을 함께 제거한다.
+import { initDraftOrderProbe } from './draftOrderProbe.js'
 
 // 실제 토스POS 단말기 밖(로컬 브라우저)에서 미리 볼 때는 posPluginSdk가 부모 프레임(POS 앱)과
 // 통신하지 못해 응답이 오지 않는다. 백엔드가 제공하는 미리보기에서는 같은 origin을 사용하고,
@@ -430,4 +433,5 @@ async function main() {
   if (tokenScreenEl.hidden) startPolling()
 }
 
+initDraftOrderProbe()
 main()
