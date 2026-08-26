@@ -529,6 +529,6 @@ async function main() {
 // 401 처리(handleUnauthorized)를 그대로 주입받아 쓴다 — 같은 로직이 두 파일에 따로 생기는 것을
 // 막기 위해서다.
 initErpCarts({ apiGet, apiPost, notify, escapeHtml, onUnauthorized: handleUnauthorized })
-initHistory({ apiGet, escapeHtml, onUnauthorized: handleUnauthorized })
+initHistory({ apiGet, apiPost, notify, escapeHtml, onUnauthorized: handleUnauthorized })
 
 main()

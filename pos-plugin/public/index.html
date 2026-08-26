@@ -659,6 +659,46 @@
 
   .history-total { margin-top: 8px; font-size: 16px; font-weight: 800; letter-spacing: -0.04em; }
 
+  .history-promo {
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid var(--line);
+  }
+
+  .history-promo-button {
+    width: 100%;
+    min-height: 46px;
+    border: 0;
+    border-radius: 13px;
+    background: var(--blue);
+    color: #fff;
+    font-size: 14px;
+    font-weight: 750;
+    letter-spacing: -0.03em;
+    cursor: pointer;
+  }
+
+  .history-promo-button.confirming { background: var(--red); }
+  .history-promo-button:disabled { background: var(--muted); cursor: wait; }
+
+  .history-promo-note {
+    margin-top: 7px;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.5;
+    letter-spacing: -0.02em;
+  }
+
+  /* 보낼 수 없는 이유. 버튼이 없는 자리에 이유가 대신 서므로 눈에 띄어야 한다. */
+  .history-promo-note.blocked {
+    margin-top: 0;
+    padding: 11px 12px;
+    border-radius: 11px;
+    background: var(--canvas);
+    color: var(--sub);
+    font-size: 13px;
+  }
+
   /* 대기 카드의 [이력] 버튼. 호출/완료/취소와 달리 되돌릴 게 없는 조회라 확인 절차가 없다. */
   .history-button {
     min-height: 38px;
@@ -894,6 +934,8 @@
         <button type="submit">조회</button>
       </form>
       <div class="history-body" id="history-body"></div>
+      <!-- 홍보 발송. 보낼 수 있을 때만 버튼이 뜨고, 아니면 이유가 뜬다. -->
+      <div class="history-promo" id="history-promo" hidden></div>
     </section>
 
     <p class="sr-only" id="page-status" role="status" aria-live="polite"></p>

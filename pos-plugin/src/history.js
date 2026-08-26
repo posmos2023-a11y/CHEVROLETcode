@@ -17,6 +17,10 @@ let deps = null
 const panelEl = () => document.getElementById('history-panel')
 const inputEl = () => document.getElementById('history-input')
 const bodyEl = () => document.getElementById('history-body')
+const promoEl = () => document.getElementById('history-promo')
+
+// 지금 화면에 띄워둔 차량번호. 홍보 발송이 어느 차에 대한 것인지 헷갈리지 않게 들고 있는다.
+let shownCarNumber = ''
 
 export function initHistory(injected) {
   deps = injected
@@ -130,6 +134,8 @@ async function search(rawCarNumber) {
   }
 
   body.innerHTML = '<div class="empty"><div class="empty-copy">불러오는 중...</div></div>'
+  const promo = promoEl()
+  if (promo) promo.hidden = true
   try {
     const { ok, status, body: res } = await deps.apiGet(`/api/pos/history?carNumber=${encodeURIComponent(carNumber)}`)
     if (!ok) {
@@ -140,8 +146,75 @@ async function search(rawCarNumber) {
       body.innerHTML = `<div class="empty"><div class="empty-copy">${deps.escapeHtml(res.error || '이력을 불러오지 못했습니다.')}</div></div>`
       return
     }
+    shownCarNumber = carNumber
     renderVisits(carNumber, res.visits || [])
+    refreshPromo(carNumber)
   } catch {
     body.innerHTML = '<div class="empty"><div class="empty-copy">네트워크 연결을 확인한 뒤 다시 시도해주세요.</div></div>'
+  }
+}
+
+// ── 홍보 메시지 수동 발송 ────────────────────────────────────────────────────
+// 광고성 정보 전송은 정보통신망법 제50조의 규제를 받는다. 보낼 수 있는지는 **서버가** 판단하고
+// (동의 여부 / 야간 / 30일 내 재발송), 여기서는 그 결과를 보여주고 버튼을 켜고 끄는 것만 한다.
+// 화면에서 막는 건 안내일 뿐 방어가 아니다 — 발송 라우트가 같은 조건을 다시 확인한다.
+async function refreshPromo(carNumber) {
+  const promo = promoEl()
+  if (!promo) return
+  promo.hidden = false
+  promo.innerHTML = '<div class="history-promo-note">확인 중...</div>'
+
+  try {
+    const { ok, body } = await deps.apiGet(`/api/pos/promo/eligibility?carNumber=${encodeURIComponent(carNumber)}`)
+    if (!ok) {
+      promo.hidden = true
+      return
+    }
+    if (body.canSend) {
+      promo.innerHTML = `
+        <button class="history-promo-button" type="button" id="history-promo-send">홍보 메시지 보내기</button>
+        <div class="history-promo-note">광고 수신에 동의한 손님입니다. 한 번 보내면 30일간 다시 보낼 수 없습니다.</div>
+      `
+      const btn = document.getElementById('history-promo-send')
+      btn.addEventListener('click', () => sendPromo(carNumber, btn))
+      return
+    }
+    // 못 보내는 이유를 그대로 보여준다. "왜 버튼이 없지?"를 묻게 두면 안 된다.
+    promo.innerHTML = `<div class="history-promo-note blocked">${deps.escapeHtml(body.message || '지금은 보낼 수 없습니다.')}</div>`
+  } catch {
+    promo.hidden = true
+  }
+}
+
+async function sendPromo(carNumber, btn) {
+  // 되돌릴 수 없다(보낸 문자는 회수가 안 된다). 대기열의 호출·취소와 같은 방식으로 한 번 더 묻는다.
+  if (btn.dataset.confirming !== 'true') {
+    btn.dataset.confirming = 'true'
+    btn.textContent = '정말 보낼까요?'
+    btn.classList.add('confirming')
+    setTimeout(() => {
+      if (btn.dataset.confirming !== 'true') return
+      btn.dataset.confirming = 'false'
+      btn.textContent = '홍보 메시지 보내기'
+      btn.classList.remove('confirming')
+    }, 3000)
+    return
+  }
+
+  btn.dataset.confirming = 'false'
+  btn.disabled = true
+  btn.textContent = '보내는 중...'
+  try {
+    const { ok, body } = await deps.apiPost('/api/pos/promo/send', { carNumber })
+    if (!ok) {
+      deps.notify('error', body.error || '보내지 못했습니다.')
+      refreshPromo(carNumber)
+      return
+    }
+    deps.notify('success', `${carNumber} 손님에게 홍보 메시지를 보냈습니다.`)
+    refreshPromo(carNumber)
+  } catch {
+    deps.notify('error', '네트워크 연결을 확인한 뒤 다시 시도해주세요.')
+    refreshPromo(carNumber)
   }
 }

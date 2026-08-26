@@ -935,6 +935,62 @@ async function markErpCartPaid(id, { paymentId, orderId }) {
   return result.count > 0
 }
 
+// 이 차의 "지금 연락처와 광고 수신 의사"를 찾는다. 수동 홍보 발송의 전제다.
+//
+// 가장 최근 기록 하나만 본다. 예전에 동의했더라도 마지막 방문에서 동의하지 않았다면 그게
+// 지금의 의사다 — 옛 동의를 근거로 보내면 안 된다.
+// 예약(Reservation)과 결제(Payment) 양쪽에 동의 기록이 남으므로 둘 중 더 최근 것을 쓴다.
+// 익명화된 건은 제외한다(전화번호가 이미 지워져 있고, 파기한 정보로 광고를 보낼 수는 없다).
+async function findMarketingContactByCarNumber(storeId, carNumber) {
+  const value = String(carNumber || '').replace(/[\s-]/g, '').trim()
+  if (!value) return null
+
+  const [reservation, payment] = await Promise.all([
+    prisma.reservation.findFirst({
+      where: { storeId, carNumber: value, anonymizedAt: null },
+      orderBy: { createdAt: 'desc' },
+      select: { phone: true, marketingConsentAt: true, createdAt: true },
+    }),
+    prisma.payment.findFirst({
+      where: { storeId, carNumber: value, anonymizedAt: null },
+      orderBy: { createdAt: 'desc' },
+      select: { phone: true, marketingConsentAt: true, createdAt: true },
+    }),
+  ])
+
+  const candidates = [reservation, payment].filter(Boolean)
+  if (!candidates.length) return null
+  candidates.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+  const latest = candidates[0]
+  return {
+    phone: latest.phone || null,
+    marketingConsentAt: latest.marketingConsentAt || null,
+    at: latest.createdAt,
+  }
+}
+
+// 이 차에 마지막으로 홍보를 보낸 시각. 반복 발송을 막는 데 쓴다.
+async function findLastPromoSend(storeId, carNumber) {
+  const value = String(carNumber || '').replace(/[\s-]/g, '').trim()
+  if (!value) return null
+  return prisma.promoSend.findFirst({
+    where: { storeId, carNumber: value },
+    orderBy: { sentAt: 'desc' },
+    select: { sentAt: true },
+  })
+}
+
+function recordPromoSend({ storeId, carNumber, phone, sentBy }) {
+  return prisma.promoSend.create({
+    data: {
+      storeId,
+      carNumber: carNumber ? String(carNumber).replace(/[\s-]/g, '').trim() : null,
+      phone: phone || null,
+      sentBy: sentBy || null,
+    },
+  })
+}
+
 // 차량번호로 그 차의 정비 이력을 찾는다. POS 탭앱에서 직원이 "이 차 지난번에 뭐 갈았지?"를
 // 확인하는 용도다.
 //
@@ -1106,6 +1162,27 @@ async function purgeExpiredErpCarts(cutoff) {
   return total
 }
 
+// 홍보 발송 기록의 개인정보(전화번호·차량번호)를 지운다. 레코드 자체는 남긴다 —
+// "언제 몇 건 보냈는지"는 통계이자 감사 근거라 지우면 안 되고, 개인을 식별하는 부분만 없앤다.
+async function purgeExpiredPromoSends(cutoff) {
+  let total = 0
+  for (let i = 0; i < PURGE_MAX_ITERATIONS; i += 1) {
+    const targets = await prisma.promoSend.findMany({
+      where: { sentAt: { lt: cutoff }, anonymizedAt: null },
+      select: { id: true },
+      take: PURGE_BATCH_SIZE,
+    })
+    if (!targets.length) break
+    const result = await prisma.promoSend.updateMany({
+      where: { id: { in: targets.map((t) => t.id) } },
+      data: { phone: null, carNumber: null, anonymizedAt: new Date() },
+    })
+    total += result.count
+    if (targets.length < PURGE_BATCH_SIZE) break
+  }
+  return total
+}
+
 // 매장이 가져가지 않은 채 오래 남은 전산 주문을 끝난 상태로 정리한다.
 //
 // 왜 필요한가: 전산이 보냈는데 매장이 그날 처리하지 않으면 pending으로 계속 남아, 다음 날
@@ -1138,9 +1215,11 @@ async function purgeExpiredPersonalData(retentionDays) {
   const reservations = await purgeExpiredReservations(cutoff)
   const payments = await purgeExpiredPayments(cutoff)
   const erpCarts = await purgeExpiredErpCarts(cutoff)
+  // 홍보 발송 기록에도 전화번호·차량번호가 남는다. 같은 기준으로 지운다.
+  const promoSends = await purgeExpiredPromoSends(cutoff)
   // 만료 처리는 보관기간(3년)과 무관하게 매일 돌아야 하는 짧은 주기의 정리라 같은 잡에 얹는다.
   const expiredErpCarts = await expireStaleErpCarts()
-  return { reservations, payments, erpCarts, expiredErpCarts }
+  return { reservations, payments, erpCarts, promoSends, expiredErpCarts }
 }
 
 // 일별 요약(계약 v3 §5.1). 예약은 serviceDate 기준(접수일), 결제는 createdAt의 KST 하루 범위
@@ -1290,6 +1369,9 @@ module.exports = {
   markErpCartPaid,
   listErpCarts,
   findRepairHistoryByCarNumber,
+  findMarketingContactByCarNumber,
+  findLastPromoSend,
+  recordPromoSend,
   completeReservationAfterPayment,
   findOpenReservationByCarNumber,
   expireStaleErpCarts,

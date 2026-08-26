@@ -1452,3 +1452,164 @@ testSerial('이력: 매장 토큰 없이는 볼 수 없다', async () => {
   const res = await request(app).get('/api/pos/history?carNumber=12가3456')
   assert.equal(res.status, 401)
 })
+
+// --- 홍보 메시지 수동 발송 -----------------------------------------------------
+// 광고성 정보 전송은 정보통신망법 제50조의 규제를 받는다. 직원이 버튼으로 보내는 경로는
+// 자동 발송과 달리 반복 클릭과 요청 위조가 가능하므로, 차단이 **서버에서** 걸려야 한다.
+// 아래 테스트는 화면이 아니라 API를 직접 두드려서 그걸 확인한다.
+
+function promoEligibility(store, carNumber) {
+  return request(app)
+    .get('/api/pos/promo/eligibility?carNumber=' + encodeURIComponent(carNumber))
+    .set('X-Store-Token', store.posToken)
+}
+
+function promoSend(store, carNumber) {
+  return request(app).post('/api/pos/promo/send')
+    .set('X-Store-Token', store.posToken)
+    .send({ carNumber })
+}
+
+// 야간 차단 때문에 실행 시각에 따라 결과가 달라진다. 낮 시간이 아니면 그 테스트는 건너뛴다.
+function isDaytimeKst() {
+  const h = new Date(Date.now() + 9 * 3600 * 1000).getUTCHours()
+  return h >= 8 && h < 21
+}
+
+async function customerWithConsent(store, carNumber, marketing) {
+  const today = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10)
+  return prisma.reservation.create({
+    data: {
+      storeId: store.id, carNumber, phone: '01099998888',
+      serviceType: '엔진오일', queueNumber: Math.floor(Math.random() * 9000) + 1000,
+      serviceDate: today, status: 'completed', completedAt: new Date(),
+      privacyConsentAt: new Date(),
+      marketingConsentAt: marketing ? new Date() : null,
+    },
+  })
+}
+
+testSerial('홍보: 광고 수신에 동의하지 않은 손님에게는 보낼 수 없다', async () => {
+  // 화면에서만 막으면 요청을 직접 만들어 우회할 수 있다. 서버가 거부해야 한다.
+  const store = await createStore('promo-noconsent')
+  await customerWithConsent(store, '11가1111', false)
+
+  const el = await promoEligibility(store, '11가1111')
+  assert.equal(el.body.canSend, false)
+  assert.equal(el.body.reason, 'no_consent')
+
+  const send = await promoSend(store, '11가1111')
+  assert.equal(send.status, 403, JSON.stringify(send.body))
+  assert.equal(send.body.reason, 'no_consent')
+
+  const sends = await prisma.promoSend.count({ where: { storeId: store.id } })
+  assert.equal(sends, 0, '발송 기록이 남았습니다')
+})
+
+testSerial('홍보: 방문 기록이 없는 차량에는 보낼 수 없다', async () => {
+  const store = await createStore('promo-norecord')
+  const send = await promoSend(store, '99하9999')
+  assert.equal(send.status, 403)
+  assert.equal(send.body.reason, 'no_record')
+})
+
+testSerial('홍보: 가장 최근 방문의 의사를 따른다(옛 동의로 보내지 않는다)', async () => {
+  // 예전에 동의했더라도 마지막 방문에서 동의하지 않았다면 그게 지금의 의사다.
+  const store = await createStore('promo-latest')
+  const old = await customerWithConsent(store, '22나2222', true)
+  await prisma.reservation.update({
+    where: { id: old.id },
+    data: { createdAt: new Date(Date.now() - 60 * 86400000) },
+  })
+  await customerWithConsent(store, '22나2222', false) // 최근 방문에서는 미동의
+
+  const el = await promoEligibility(store, '22나2222')
+  assert.equal(el.body.canSend, false)
+  assert.equal(el.body.reason, 'no_consent')
+})
+
+testSerial('홍보: 30일 안에는 같은 차에 다시 보낼 수 없다', async () => {
+  const store = await createStore('promo-throttle')
+  await customerWithConsent(store, '33다3333', true)
+  await prisma.promoSend.create({
+    data: { storeId: store.id, carNumber: '33다3333', phone: '01099998888', sentAt: new Date() },
+  })
+
+  const el = await promoEligibility(store, '33다3333')
+  assert.equal(el.body.canSend, false)
+  assert.equal(el.body.reason, 'recently_sent')
+
+  const send = await promoSend(store, '33다3333')
+  assert.equal(send.status, 403)
+})
+
+testSerial('홍보: 30일이 지나면 다시 보낼 수 있다', async () => {
+  if (!isDaytimeKst()) return // 야간에는 어차피 막힌다
+  const store = await createStore('promo-after30')
+  await customerWithConsent(store, '44라4444', true)
+  await prisma.promoSend.create({
+    data: {
+      storeId: store.id, carNumber: '44라4444', phone: '01099998888',
+      sentAt: new Date(Date.now() - 40 * 86400000),
+    },
+  })
+
+  const el = await promoEligibility(store, '44라4444')
+  assert.equal(el.body.canSend, true, JSON.stringify(el.body))
+})
+
+testSerial('홍보: 다른 매장 손님에게는 보낼 수 없다', async () => {
+  const storeA = await createStore('promo-owner')
+  const storeB = await createStore('promo-other')
+  await customerWithConsent(storeA, '55마5555', true)
+
+  const el = await promoEligibility(storeB, '55마5555')
+  assert.equal(el.body.canSend, false)
+  assert.equal(el.body.reason, 'no_record')
+})
+
+testSerial('홍보: 파기(익명화)된 손님에게는 보낼 수 없다', async () => {
+  const store = await createStore('promo-purged')
+  const r = await customerWithConsent(store, '66바6666', true)
+  await prisma.reservation.update({
+    where: { id: r.id },
+    data: { carNumber: '삭제됨', phone: '0100000000', anonymizedAt: new Date() },
+  })
+
+  const el = await promoEligibility(store, '66바6666')
+  assert.equal(el.body.canSend, false)
+  assert.equal(el.body.reason, 'no_record')
+})
+
+testSerial('홍보: 매장 토큰 없이는 부를 수 없다', async () => {
+  const el = await request(app).get('/api/pos/promo/eligibility?carNumber=12가3456')
+  assert.equal(el.status, 401)
+  const send = await request(app).post('/api/pos/promo/send').send({ carNumber: '12가3456' })
+  assert.equal(send.status, 401)
+})
+
+testSerial('홍보: 차량번호 없이 부르면 400', async () => {
+  const store = await createStore('promo-nocar')
+  assert.equal((await request(app).get('/api/pos/promo/eligibility').set('X-Store-Token', store.posToken)).status, 400)
+  assert.equal((await request(app).post('/api/pos/promo/send').set('X-Store-Token', store.posToken).send({})).status, 400)
+})
+
+testSerial('개인정보 파기: 홍보 발송 기록의 전화번호도 지운다', async () => {
+  // 발송 기록에도 전화번호·차량번호가 남는다. 레코드는 남기고(발송 통계·감사 근거)
+  // 개인을 식별하는 부분만 지운다.
+  const store = await createStore('promo-purge-log')
+  await prisma.promoSend.create({
+    data: {
+      storeId: store.id, carNumber: '77사7777', phone: '01099998888',
+      sentAt: new Date(Date.now() - 4000 * 86400000),
+    },
+  })
+
+  const result = await purgeExpiredPersonalData()
+  assert.equal(result.promoSends >= 1, true, JSON.stringify(result))
+
+  const row = await prisma.promoSend.findFirst({ where: { storeId: store.id } })
+  assert.equal(row.phone, null)
+  assert.equal(row.carNumber, null)
+  assert.equal(row.anonymizedAt instanceof Date, true)
+})

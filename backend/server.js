@@ -68,6 +68,9 @@ const {
   markErpCartPaid,
   listErpCarts,
   findRepairHistoryByCarNumber,
+  findMarketingContactByCarNumber,
+  findLastPromoSend,
+  recordPromoSend,
   completeReservationAfterPayment,
   findOpenReservationByCarNumber,
   cancelErpCart,
@@ -77,6 +80,7 @@ const { PostgresRateLimitStore } = require('./src/rateLimitStore')
 const logger = require('./src/logger')
 const solapi = require('./src/solapi')
 const { hashPassword, verifyPassword, signAdminToken, verifyAdminToken } = require('./src/auth')
+const { sendPromoAlimtalk } = require('./src/solapi')
 const { securityHeaders } = require('./src/securityHeaders')
 
 // --- 부팅 가드 (계약 §10) ---
@@ -1791,6 +1795,122 @@ app.get('/api/erp/draft-orders/:referenceId', erpLimiter, requireErpToken, async
     createdAt: order.createdAt,
     paidAt: order.paidAt,
   })
+}))
+
+// ── 수동 홍보 발송의 차단 조건 ────────────────────────────────────────────────
+//
+// 광고성 정보 전송은 정보통신망법 제50조의 규제를 받는다. 자동 발송(결제 3개월 뒤)은 조건이
+// 코드에 고정돼 있어 안전하지만, 직원이 버튼으로 보내는 건 다르다 — 반복해서 누를 수 있고,
+// 동의 여부를 화면에서만 막으면 요청을 직접 만들어 우회할 수 있다. 그래서 **서버에서** 막는다.
+//
+// 1) 수신 동의 없으면 발송 불가. 가장 최근 방문에서 동의하지 않았다면 그게 지금의 의사다.
+// 2) 야간(21시~08시) 발송 금지. 야간 광고는 별도의 동의가 필요한데 우리는 그 동의를 받지 않는다.
+// 3) 같은 차에 30일 안에 다시 보낼 수 없다. 스팸이 되면 수신거부와 과태료로 돌아온다.
+const PROMO_MIN_INTERVAL_DAYS = 30
+const PROMO_NIGHT_START_HOUR = 21 // 이 시각부터
+const PROMO_NIGHT_END_HOUR = 8 //   이 시각 전까지 금지
+
+function kstHour(now) {
+  // 서버는 UTC로 돌지만 야간 규제는 한국 시각 기준이다.
+  return new Date((now || Date.now()) + 9 * 60 * 60 * 1000).getUTCHours()
+}
+
+// 보낼 수 있으면 { ok: true, phone }, 아니면 { ok: false, reason, message }.
+async function evaluatePromoEligibility(storeId, carNumber) {
+  const contact = await findMarketingContactByCarNumber(storeId, carNumber)
+  if (!contact) {
+    return { ok: false, reason: 'no_record', message: '이 차량의 방문 기록이 없습니다.' }
+  }
+  if (!contact.phone) {
+    return { ok: false, reason: 'no_phone', message: '연락처가 없어 보낼 수 없습니다.' }
+  }
+  if (!contact.marketingConsentAt) {
+    return {
+      ok: false,
+      reason: 'no_consent',
+      message: '광고 수신에 동의하지 않은 손님입니다. 보낼 수 없습니다.',
+    }
+  }
+
+  const hour = kstHour()
+  if (hour >= PROMO_NIGHT_START_HOUR || hour < PROMO_NIGHT_END_HOUR) {
+    return {
+      ok: false,
+      reason: 'night',
+      message: `야간(${PROMO_NIGHT_START_HOUR}시~${PROMO_NIGHT_END_HOUR}시)에는 광고를 보낼 수 없습니다.`,
+    }
+  }
+
+  const last = await findLastPromoSend(storeId, carNumber)
+  if (last) {
+    const days = (Date.now() - new Date(last.sentAt).getTime()) / (24 * 60 * 60 * 1000)
+    if (days < PROMO_MIN_INTERVAL_DAYS) {
+      return {
+        ok: false,
+        reason: 'recently_sent',
+        message: `${Math.ceil(PROMO_MIN_INTERVAL_DAYS - days)}일 뒤에 다시 보낼 수 있습니다.`,
+        lastSentAt: last.sentAt,
+      }
+    }
+  }
+  return { ok: true, phone: contact.phone, lastSentAt: last ? last.sentAt : null }
+}
+
+// 이 차에 지금 홍보를 보낼 수 있는지 알려준다. 화면에서 버튼을 켤지 끌지 판단하는 데 쓴다
+// (실제 차단은 발송 라우트가 다시 확인한다 — 화면만 믿으면 안 된다).
+app.get('/api/pos/promo/eligibility', posIpFloodLimiter, posQueueReadLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  const carNumber = String(req.query.carNumber || '').trim()
+  if (!carNumber) {
+    return res.status(400).json({ ok: false, error: '차량번호를 입력해주세요.' })
+  }
+  const result = await evaluatePromoEligibility(req.store.id, carNumber)
+  return res.json({
+    ok: true,
+    canSend: result.ok === true,
+    reason: result.reason || null,
+    message: result.message || null,
+    lastSentAt: result.lastSentAt || null,
+  })
+}))
+
+// 직원이 [홍보 보내기]를 눌렀을 때. 위 조건을 **여기서 다시** 확인한다.
+app.post('/api/pos/promo/send', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  const carNumber = String(req.body?.carNumber || '').trim()
+  if (!carNumber) {
+    return res.status(400).json({ ok: false, error: '차량번호를 입력해주세요.' })
+  }
+
+  const eligible = await evaluatePromoEligibility(req.store.id, carNumber)
+  if (!eligible.ok) {
+    // 403으로 돌려준다 — 잘못된 요청이 아니라 "보내면 안 되는 상대"다.
+    return res.status(403).json({ ok: false, error: eligible.message, reason: eligible.reason })
+  }
+
+  // 발송 기록을 **먼저** 남긴다. 발송이 성공했는데 기록이 실패하면 30일 제한이 풀려서
+  // 같은 손님에게 계속 보낼 수 있게 된다 — 그쪽이 더 위험하다.
+  await recordPromoSend({
+    storeId: req.store.id,
+    carNumber,
+    phone: eligible.phone,
+    sentBy: null, // POS 탭앱은 매장 단위 인증이라 개인을 특정할 수 없다
+  })
+
+  const sent = await sendPromoAlimtalk({
+    phone: eligible.phone,
+    carNumber,
+    storeName: req.store.name,
+    storeId: req.store.id,
+    paymentId: null,
+  })
+  if (!sent) {
+    logger.error('[promo] 수동 발송 실패', { storeId: req.store.id })
+    return res.status(502).json({
+      ok: false,
+      error: '발송에 실패했습니다. 잠시 후 다시 시도해주세요.',
+      reason: 'send_failed',
+    })
+  }
+  return res.json({ ok: true })
 }))
 
 // 차량번호로 정비 이력을 조회한다. 직원이 "이 차 지난번에 뭐 갈았지?"를 POS에서 바로 본다.
