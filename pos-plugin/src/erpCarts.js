@@ -4,6 +4,8 @@
 // 실제 조회는 기존 대기열 폴링 타이머 안에서 refreshErpCarts()를 통해 함께 실행된다(타이머를
 // 두 개 만들면 정지/재개 로직이 갈라지므로 절대 새 타이머를 만들지 않는다).
 import { posPluginSdk } from '@tossplace/pos-plugin-sdk'
+// lineItem을 만드는 규칙은 실단말기에서 알아낸 것이라 한 곳에만 둔다(lineItem.js 상단 주석).
+import { buildLineItem } from './lineItem.js'
 
 const draftOrder = posPluginSdk.draftOrder
 
@@ -18,43 +20,6 @@ export function initErpCarts(injected) {
   deps = injected
   if (!listEl) return
   listEl.addEventListener('click', handleListClick)
-}
-
-// ── lineItem 조립 — 딱 이 함수 하나에만 모은다 ──────────────────────────────
-// 실단말기에서 POS가 **스스로 만든** 장바구니 항목을 덤프해서 확정한 모양이다
-// (draftOrderProbe.js의 ③ 장바구니 덤프). 그 결과:
-//
-//   문서(types/index.d.ts의 Pick, 런타임 zod 스키마)는 둘 다 실제보다 **좁다.**
-//   POS가 담은 item은 { id, title, category, options, code } 같은 5개짜리가 아니라
-//   카탈로그 원본 객체 통째였다 — merchantId, description, state, prices[], defaultPriceId,
-//   priceVariations, optionSets, color, imageUrl, labels, durationSeconds, metadata(거대)까지.
-//   category도 {id, title}이 아니라 merchantId/code/order/enabled/kioskOrder/createdAt/position
-//   등이 다 붙은 원본이었고, itemPrice에도 id/isDefault/state/barcode/isStockable/stockQuantity가
-//   더 있었다.
-//
-// 앞서 문서대로 필드를 깎아 보냈더니 addLineItem은 성공을 반환하는데 POS [주문] 탭이
-// "일시적인 오류"로 깨졌다 — 포스가 렌더링하면서 없는 필드를 참조했기 때문으로 보인다.
-// 그래서 **카탈로그 원본을 통째로 펼치고(...baseItem) 화면에 보이는 값만 갈아끼운다.**
-// 깎지 말 것 — 문서에 없는 필드라도 지우면 깨진다.
-//
-// 진단 결과가 바뀌면 이 함수만 고치면 되도록, 다른 곳에서는 addLineItem에 넘길 객체를
-// 직접 만들지 않는다.
-function buildLineItem({ baseItem, title, priceValue, quantity, memo }) {
-  // getCatalogs()가 주는 가격 객체의 이름이 버전에 따라 price(단수)일 수도, prices(배열)일 수도
-  // 있어서 둘 다 받아준다 — 덤프에서는 배열(prices)로 나왔다.
-  const basePrice = baseItem.price || (Array.isArray(baseItem.prices) ? baseItem.prices[0] : null) || {}
-  return {
-    // 원본을 통째로 펼친 뒤 화면에 보이는 이름만 교체한다.
-    item: { ...baseItem, type: 'ITEM', title, options: baseItem.options ?? [] },
-    // 가격도 원본 구조를 그대로 두고 금액만 교체한다.
-    itemPrice: { ...basePrice, priceValue, title: basePrice.title ?? '기본' },
-    discount: [],
-    // 덤프에서 memo는 undefined가 아니라 빈 문자열이었다 — 그 형태를 맞춘다.
-    memo: memo || '',
-    optionChoices: [],
-    quantity,
-    diningOption: 'HERE',
-  }
 }
 
 // 전산 품목은 POS 카탈로그에 등록돼 있지 않다. POS가 요구하는 item.id/category는 "이미 있는
@@ -215,18 +180,10 @@ async function runLoadCartToPos(cart) {
     button.textContent = '담는 중...'
   }
 
-  // 실패했을 때 "우리가 방금 추가한 항목"만 골라 지우려면, 담기 전 장바구니에 이미 있던
-  // key들을 먼저 기억해둬야 한다. 이 조회 자체가 실패하면 무엇을 지워야 할지 알 수 없으므로
-  // 아예 addLineItem을 시도하지 않고 실패로 보고한다.
-  let beforeKeys
-  try {
-    const before = await draftOrder.get()
-    beforeKeys = new Set((before?.lineItems || []).map((li) => li.key))
-  } catch (e) {
-    await handleLoadFailure(cart, e, [])
-    return
-  }
-
+  // 되돌릴 대상은 우리가 만든 key다. 예전에는 담기 전후 key를 비교해 새로 생긴 것을 찾았는데,
+  // 포스는 key를 자동으로 만들어주지 않아(lineItem.js (1) 참고) 그 비교로는 아무것도 못 찾았다.
+  // 지금은 buildLineItem이 key를 직접 발급하므로 그 값을 그대로 들고 있으면 된다 — 담기 전
+  // 장바구니를 조회할 이유도 없어졌다.
   const addedKeys = []
   try {
     const base = await getBaseCatalogItem()
@@ -242,12 +199,9 @@ async function runLoadCartToPos(cart) {
         quantity: item.quantity,
         memo: cart.memo,
       })
-      const result = await draftOrder.addLineItem(lineItem)
-      const currentKeys = (result?.lineItems || []).map((li) => li.key)
-      // 이번 addLineItem 호출로 새로 생긴 key(담기 전에도 없었고, 지금까지 우리가 추가한
-      // 것도 아닌 key)만 골라 되돌리기 목록에 추가한다.
-      const newKey = currentKeys.find((k) => !beforeKeys.has(k) && !addedKeys.includes(k))
-      if (newKey) addedKeys.push(newKey)
+      // addLineItem이 던지면 이 항목은 안 담긴 것이므로, 성공한 뒤에 되돌리기 목록에 넣는다.
+      await draftOrder.addLineItem(lineItem)
+      addedKeys.push(lineItem.key)
     }
 
     let payError = null

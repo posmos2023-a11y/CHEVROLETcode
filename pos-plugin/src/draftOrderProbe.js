@@ -50,6 +50,7 @@
 // 장바구니에 담은 뒤 이걸 호출하면 포스 결제가 시작된다 — MOU 목표 흐름의 마지막 조각.
 
 import { posPluginSdk } from '@tossplace/pos-plugin-sdk'
+import { buildLineItem, stripNullI18n, makeLineItemKey } from './lineItem.js'
 
 const draftOrder = posPluginSdk.draftOrder
 
@@ -70,20 +71,6 @@ function show(value) {
     return JSON.stringify(value)
   } catch {
     return String(value)
-  }
-}
-
-// ③ 덤프로 확정된 모양(파일 상단 주석 참고): 카탈로그 원본을 통째로 펼치고 보이는 값만 교체.
-function buildLineItem({ baseItem, title, priceValue, quantity, memo }) {
-  const basePrice = baseItem.price || (Array.isArray(baseItem.prices) ? baseItem.prices[0] : null) || {}
-  return {
-    item: { ...baseItem, type: 'ITEM', title, options: baseItem.options ?? [] },
-    itemPrice: { ...basePrice, priceValue, title: basePrice.title ?? '기본' },
-    discount: [],
-    memo: memo || '',
-    optionChoices: [],
-    quantity,
-    diningOption: 'HERE',
   }
 }
 
@@ -214,9 +201,12 @@ async function probeReadd() {
   }
   try {
     // key는 포스가 항목마다 새로 발급하므로 빼고 보낸다(스키마상 optional).
+    // key는 항목마다 새로 발급해야 하고(같은 key를 두 번 넣으면 포스가 어느 쪽인지 알 수 없다),
+    // 카탈로그가 돌려준 titleI18n: null은 SDK 스키마가 거부하므로 지운다(lineItem.js (3) 참고).
     const { key, lineItemId, ...rest } = lastDumpedLineItem
-    log(`   보낼 값: ${show(rest)}`)
-    const result = await draftOrder.addLineItem(rest)
+    const payload = stripNullI18n({ ...rest, key: makeLineItemKey() })
+    log(`   보낼 값: ${show(payload)}`)
+    const result = await draftOrder.addLineItem(payload)
     log(`✅ 담기 성공 — 항목 ${result?.lineItems?.length ?? '?'}개`, 'ok')
     log('   → [주문] 탭이 정상인지 확인하세요.', 'ok')
   } catch (e) {
