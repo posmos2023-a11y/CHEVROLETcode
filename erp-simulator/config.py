@@ -12,10 +12,33 @@ config.ini에는 ERP 토큰(비밀값)이 들어가므로 저장소에 커밋되
 
 import configparser
 import os
+import sys
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
-EXAMPLE_CONFIG_PATH = os.path.join(BASE_DIR, "config.example.ini")
+
+
+def resource_dir():
+    """번들에 함께 넣은 **읽기 전용** 파일(style.qss, config.example.ini)이 있는 곳.
+
+    PyInstaller로 묶으면 실행할 때마다 임시 폴더에 압축을 풀고 그 경로를 sys._MEIPASS에
+    넣어준다. 그때 __file__은 그 임시 폴더를 가리키므로 읽기 전용 리소스는 여기서 찾으면 된다.
+    묶지 않고 소스로 실행할 때는 그냥 이 파일이 있는 폴더다."""
+    return getattr(sys, "_MEIPASS", BASE_DIR)
+
+
+def data_dir():
+    """사용자가 저장한 값(config.ini)이 **남아 있어야 하는** 곳.
+
+    resource_dir()에 쓰면 안 된다 — PyInstaller onefile은 임시 폴더를 종료할 때 지우기 때문에,
+    설정을 저장해도 다음 실행에서 사라진다(ERP 토큰을 매번 다시 입력하게 된다).
+    묶인 상태에서는 exe가 있는 폴더에 둔다."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return BASE_DIR
+
+
+CONFIG_PATH = os.path.join(data_dir(), "config.ini")
+EXAMPLE_CONFIG_PATH = os.path.join(resource_dir(), "config.example.ini")
 
 DEFAULT_BASE_URL = "https://chevrolet-api-813801981857.asia-northeast3.run.app"
 DEFAULT_STORE_CODE = "CHV-001"

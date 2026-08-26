@@ -816,7 +816,9 @@ def main():
     # 폰트로 대체하므로 별도 존재 확인 로직 없이 그냥 지정만 한다.
     app.setFont(QFont("맑은 고딕", 10))
 
-    qss_path = os.path.join(BASE_DIR, "style.qss")
+    # style.qss는 읽기 전용 리소스라 번들 안(sys._MEIPASS)에서 찾아야 한다 — BASE_DIR로 두면
+    # exe로 묶었을 때 스타일이 통째로 안 먹는다(config.py의 resource_dir 주석 참고).
+    qss_path = os.path.join(config_module.resource_dir(), "style.qss")
     if os.path.exists(qss_path):
         with open(qss_path, "r", encoding="utf-8") as f:
             app.setStyleSheet(f.read())

@@ -45,6 +45,26 @@ python main.py
 `python`이 없다면 먼저 `python --version`으로 설치 여부를 확인하고,
 [python.org](https://www.python.org/downloads/)에서 3.9 이상을 설치하세요.
 
+## 단독 실행파일(.exe)로 묶기
+
+시연은 파이썬이 없는 PC에서 하는 경우가 많습니다. exe 하나만 복사하면 바로 뜹니다.
+
+```powershell
+python -m pip install pyinstaller
+cd erp-simulator
+.\build.ps1
+```
+
+산출물: `dist\쉐보레정비전산.exe` (약 33MB, 단일 파일)
+
+- `-Clean` 옵션을 주면 이전 산출물까지 지우고 새로 빌드합니다.
+- **`config.ini`는 exe에 들어가지 않습니다.** ERP 토큰이 담기는 파일이라 구워넣으면 그 exe를
+  받는 사람 모두에게 토큰이 새어나갑니다. 대신 처음 실행할 때 **exe 옆에** 새로 만들어지고,
+  [설정]에서 넣은 토큰은 거기 저장됩니다. 그래서 **exe를 남에게 줄 때는 exe 파일만** 주세요
+  (같은 폴더의 `config.ini`를 함께 주면 토큰이 그대로 넘어갑니다).
+- `style.qss`와 `config.example.ini`는 읽기 전용 리소스라 exe 안에 함께 들어갑니다.
+- `dist/`, `build/`, `*.spec`은 `.gitignore`에 등록돼 있습니다.
+
 ## 설정
 
 앱을 처음 실행하면 `config.example.ini`를 복사해 `config.ini`가 자동으로
