@@ -22,13 +22,17 @@
 //   OrderItemType = 'ITEM' | 'DELIVERY_FEE' | 'PREPAID_CARD' | 'MULTI_USE_TICKET' | 'COMBO' | 'GIFT_CARD'
 //   (AD_HOC 없음 — Open API의 targetType과는 다른 체계다)
 //
-// ⚠️ 1차 시도 실패 원인:
-// item에 code와 options를 함께 넣어 보냈다. 타입 선언(types/index.d.ts)에는
-// Pick<PluginCatalogItem, 'id'|'title'|'category'|'options'|'code'> 로 적혀 있지만
-// **런타임 스키마의 item에는 code도 options도 없다.** zod의 z.object()는 모르는 키를 에러 없이
-// 걸러내기만 하는데, SDK는 parse() 결과를 버리고 **원본 객체를 그대로** 포스로 보낸다.
-// 그래서 검증은 통과하고(=성공 반환) 포스는 예상에 없던 options 배열을 받아 [주문] 탭 렌더링에서
-// 깨졌다. 이번엔 스키마에 있는 필드만, 정확히 그 형태로만 보낸다.
+// ⚠️ zod 스키마가 전부가 아니다 — 실호출로 확인된 것:
+// SDK는 parse() 결과를 버리고 **원본 객체를 그대로** 포스 본체로 보낸다(위 코드 참고).
+// 그래서 스키마에 없는 키도 포스까지 전달되고, 반대로 **포스 본체는 스키마에 없는 필드를 읽는다.**
+//   - item.options를 빼고 보냈더니 포스가 "Cannot read properties of undefined (reading 'map')"을
+//     errorMessage로 돌려줬다. 즉 포스는 item.options를 배열로 가정하고 .map() 한다.
+//   - 타입 선언(types/index.d.ts:1124)은 item을
+//       Pick<PluginCatalogItem, 'id'|'title'|'category'|'options'|'code'> & { type }
+//     로 정의한다. options는 필수, code는 선택(PluginCatalogItem.code?: string).
+// 결론: **검증은 zod 스키마, 실제 소비는 타입 선언** 기준으로 맞춰야 한다.
+// 그래서 item에는 스키마 필드 + options를 넣고, 선택 필드인 code는 넣지 않는다.
+// options는 빈 배열로 둔다 — optionChoices도 비어 있으므로 서로 어긋나지 않는다.
 //
 // 결제: DraftOrder 인터페이스에 startPayment()가 있다(types/index.d.ts:280).
 // 장바구니에 담은 뒤 이걸 호출하면 포스 결제가 시작된다 — MOU 목표 흐름의 마지막 조각.
@@ -57,15 +61,18 @@ function show(value) {
   }
 }
 
-// PluginDraftOrderItemDtoSchema에 있는 필드만, 스키마가 정한 타입 그대로 만든다.
+// zod 스키마 필드 + 포스 본체가 실제로 읽는 item.options로 만든다(파일 상단 주석 참고).
 // 선택 필드(sku)는 값이 있을 때만 넣는다 — z.string().optional()이라 undefined를 명시적으로
 // 넣어도 통과하지만, 포스로 전달되는 건 원본 객체이므로 불필요한 키는 아예 만들지 않는다.
-function buildLineItem({ itemId, title, category, priceValue, quantity, memo, sku }) {
+function buildLineItem({ itemId, title, category, priceValue, quantity, memo, sku, options }) {
   const lineItem = {
     item: {
       id: itemId,
       title,
       category: { id: category.id, title: category.title },
+      // 포스가 .map()하므로 반드시 배열이어야 한다. 기본은 빈 배열 — optionChoices도 비어 있어
+      // 서로 어긋나지 않는다.
+      options: options ?? [],
       type: 'ITEM',
     },
     itemPrice: {
@@ -140,6 +147,7 @@ async function probeCatalog() {
         id: base.id,
         title: base.title,
         category: { id: base.category.id, title: base.category.title },
+        options: [],
         type: 'ITEM',
       },
       // 대조군이므로 가격 정보도 카탈로그 값을 그대로 쓴다(스키마에 있는 키만 골라서).
