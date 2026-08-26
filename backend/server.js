@@ -326,12 +326,18 @@ const requireStore = asyncHandler(async (req, res, next) => {
 // 가지므로 훨씬 강한 인증이 필요하다.
 const requireStoreToken = asyncHandler(async (req, res, next) => {
   const token = String(req.get('x-store-token') || '').trim()
+  // 인증 실패는 rejectPosAuthFailure가 카운터를 올리고 401(또는 한도 초과 시 429)까지 보낸다.
+  // 성공 경로에서는 카운터를 전혀 건드리지 않는다 — 폴링이 DB에 쓰지 않게 하려는 것이 핵심이다.
   if (!token) {
-    return res.status(401).json({ ok: false, error: '매장 인증 토큰이 필요합니다.', code: 'STORE_TOKEN_REQUIRED' })
+    return rejectPosAuthFailure(req, res, {
+      ok: false, error: '매장 인증 토큰이 필요합니다.', code: 'STORE_TOKEN_REQUIRED',
+    })
   }
   const store = await findStoreByPosToken(token)
   if (!store) {
-    return res.status(401).json({ ok: false, error: '매장 인증 토큰이 올바르지 않습니다.', code: 'INVALID_STORE_TOKEN' })
+    return rejectPosAuthFailure(req, res, {
+      ok: false, error: '매장 인증 토큰이 올바르지 않습니다.', code: 'INVALID_STORE_TOKEN',
+    })
   }
   if (store.status !== 'active') {
     return res.status(403).json({ ok: false, error: '비활성화된 가맹점입니다.' })
@@ -787,9 +793,41 @@ app.get('/api/reservations/failed', requireAuth, asyncHandler(async (req, res) =
 // GET /api/pos/queue는 5초 폴링 대상이라 DB 기반 PostgresRateLimitStore 대신 express-rate-limit
 // 기본 메모리 스토어를 쓴다(계약 §9) — 이미 토큰 인증이 붙어 있어 인스턴스별 한도로 충분하고,
 // 폴링마다 DB round-trip을 추가로 만들 이유가 없다.
+// 폴링(조회) 라우트의 한도. **IP가 아니라 매장 토큰 기준**으로 센다.
+//
+// 예전에는 IP당 분당 60회였는데, 탭앱 한 대가 분당 24회(5초마다 queue + erp-carts)를 쓴다.
+// 정비소는 한 인터넷 회선에 POS를 여러 대 두므로 **3대만 돼도 72회가 되어 정상 영업 중에
+// 429로 막힌다**(실측: 200 응답 60회 뒤 429 = 단말기 2.5대분). 증상이 "가끔 화면이 멈춰요"로
+// 나타나서 원인을 찾기도 어렵다.
+//
+// 매장 토큰으로 키를 잡으면 한 매장이 단말기를 몇 대 두든 그 매장 몫 안에서만 소비된다.
+// 토큰은 인증 전 값이지만 이 한도의 목적은 "한 클라이언트가 과하게 두드리는 것"을 막는 것이라
+// 문제되지 않는다 — 토큰을 바꿔가며 우회하려는 쪽은 아래 posIpFloodLimiter와 인증 실패
+// 카운터(recordPosAuthFailure)가 잡는다.
+const POS_READ_LIMIT_PER_MIN = 300
+
+function posStoreRateKey(req) {
+  const token = String(req.get('x-store-token') || '').trim()
+  // 토큰 원문을 메모리 키로 들고 있지 않도록 해시해서 쓴다.
+  if (token) return `store:${crypto.createHash('sha256').update(token).digest('hex').slice(0, 32)}`
+  return `ip:${rateLimit.ipKeyGenerator(req.ip)}`
+}
+
 const posQueueReadLimiter = rateLimit({
   windowMs: 60 * 1000,
-  limit: 60,
+  limit: POS_READ_LIMIT_PER_MIN,
+  keyGenerator: posStoreRateKey,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { ok: false, error: '요청이 너무 많습니다. 잠시 후 다시 시도해주세요.' },
+})
+
+// 토큰을 매번 바꿔가며 두드리면 위 한도는 매번 새 키가 되어 우회된다. 그런 원시적인 폭주는
+// IP 기준으로 막는다. 정상 매장(단말기 여러 대 + 상태 변경 요청)이 걸리지 않게 넉넉히 잡되,
+// 초당 수십 건짜리 폭주는 확실히 끊는 값이다. 메모리 기준이라 DB를 전혀 건드리지 않는다.
+const posIpFloodLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 600,
   standardHeaders: true,
   legacyHeaders: false,
   message: { ok: false, error: '요청이 너무 많습니다. 잠시 후 다시 시도해주세요.' },
@@ -807,34 +845,56 @@ const posLimiter = rateLimit({
 })
 
 // X-Store-Token 무차별 대입 방어 (validatePosToken 위 주석 참고).
-// 관리자가 짧은 토큰(최소 4자)을 지정할 수 있게 하면서도 안전하려면, 토큰 추측 시도 자체를
-// 막아야 한다. 그래서 "토큰이 틀린 요청(401)"만 세어 IP당 15분에 10회로 제한한다.
+// 관리자가 짧은 토큰(최소 4자)을 지정할 수 있게 하면서도 안전하려면 토큰 추측 시도 자체를
+// 막아야 한다. IP당 15분에 10회 실패면 차단한다.
 //
-// 두 옵션 조합이 핵심이다:
-//   - skipSuccessfulRequests: 정상 요청은 카운트에서 되돌린다(decrement). POS 탭앱은 5초마다
-//     폴링하므로, 성공까지 세면 정상 매장이 몇 분 만에 스스로 잠긴다.
-//   - requestWasSuccessful: 기본값은 "4xx/5xx면 실패"라서 404(없는 예약 조작)나 409(상태 충돌)
-//     같은 정상 운영 중 발생하는 응답까지 실패로 세어 직원이 잠긴다. 401(토큰 불일치)만
-//     실패로 취급하도록 명시한다.
+// ⚠️ 예전에는 이걸 express-rate-limit의 skipSuccessfulRequests로 구현했다. 그 옵션은
+// "일단 세고(increment), 성공하면 되돌리는(decrement)" 방식이라 **정상 요청 1건당 DB 쓰기가
+// 2회** 발생했다(실측 확인). 폴링이 5초마다 도는 라우트라 400개 매장이면 초당 320회 —
+// 아무 일도 없는데 DB가 그만큼 두들겨 맞는다.
 //
-// 인스턴스별 메모리가 아니라 DB 스토어를 쓰는 이유: Cloud Run이 인스턴스를 최대 20개까지
-// 띄우므로 메모리 기준이면 공격자가 사실상 20배의 시도 기회를 얻는다.
-const posAuthLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  limit: 10,
-  skipSuccessfulRequests: true,
-  requestWasSuccessful: (req, res) => res.statusCode !== 401,
-  store: new PostgresRateLimitStore(prisma, { prefix: 'pos-auth', windowMs: 15 * 60 * 1000 }),
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { ok: false, error: '매장 인증 실패가 반복되어 일시적으로 차단되었습니다. 15분 후 다시 시도해주세요.' },
+// 그래서 미들웨어를 걷어내고 **인증이 실패했을 때만** 카운터를 건드리도록 바꿨다.
+// 성공 경로는 DB 쓰기 0회, 방어 성질은 그대로다: 토큰을 틀린 쪽은 항상 실패 경로로 가서
+// 세어지고, 맞힌 쪽은 애초에 정당한 매장이다.
+//
+// 인스턴스별 메모리가 아니라 DB 스토어를 쓰는 이유는 그대로다: Cloud Run이 인스턴스를 여러 개
+// 띄우므로 메모리 기준이면 공격자가 인스턴스 수만큼 시도 기회를 더 얻는다.
+const POS_AUTH_FAILURE_LIMIT = 10
+const POS_AUTH_FAILURE_WINDOW_MS = 15 * 60 * 1000
+const posAuthFailureStore = new PostgresRateLimitStore(prisma, {
+  prefix: 'pos-auth',
+  windowMs: POS_AUTH_FAILURE_WINDOW_MS,
 })
+
+// 인증 실패를 1회 기록하고, 한도를 넘었으면 429를 보낸 뒤 true를 돌려준다.
+// (호출부는 true면 이미 응답이 나갔으므로 그대로 return 하면 된다.)
+async function rejectPosAuthFailure(req, res, unauthorizedBody) {
+  const key = `ip:${rateLimit.ipKeyGenerator(req.ip)}`
+  let totalHits = 1
+  try {
+    const result = await posAuthFailureStore.increment(key)
+    totalHits = result.totalHits
+  } catch (e) {
+    // 카운터를 못 쓰더라도 인증 자체는 이미 실패한 상태다. 여기서 500을 내면 공격자에게
+    // DB를 흔드는 수단을 주는 셈이라, 로그만 남기고 평소대로 401로 돌려보낸다.
+    logger.error('[pos] 인증 실패 카운터 기록 실패', { error: e.message })
+  }
+  if (totalHits > POS_AUTH_FAILURE_LIMIT) {
+    res.status(429).json({
+      ok: false,
+      error: '매장 인증 실패가 반복되어 일시적으로 차단되었습니다. 15분 후 다시 시도해주세요.',
+    })
+    return true
+  }
+  res.status(401).json(unauthorizedBody)
+  return true
+}
 
 // 오늘(KST) serviceDate 접수분 + 아직 끝나지 않은 이월 건(called/notify_failed)을 함께 보여준다
 // (계약 v3 §4.1~4.2). 응답 최상위 serviceDate(오늘 날짜)는 그대로 유지하고, 각 item에도
 // serviceDate를 실어보내 POS 화면이 "오늘 최상위 serviceDate와 다르면 이월 건"으로 배지를 붙일 수
 // 있게 한다.
-app.get('/api/pos/queue', posQueueReadLimiter, posAuthLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+app.get('/api/pos/queue', posIpFloodLimiter, posQueueReadLimiter, requireStoreToken, asyncHandler(async (req, res) => {
   const serviceDate = kstDateString()
   const reservations = await listActiveQueueForStore(req.store.id, serviceDate)
   return res.json({
@@ -859,7 +919,7 @@ app.get('/api/pos/queue', posQueueReadLimiter, posAuthLimiter, requireStoreToken
 // items를 파싱해서 내려준다. queue 폴링과 마찬가지로 인스턴스 기준 메모리 레이트리밋
 // (posQueueReadLimiter)으로 충분하다 -- 이미 토큰 인증이 붙어 있고, 폴링마다 DB round-trip을
 // 늘릴 이유가 없다.
-app.get('/api/pos/erp-carts', posQueueReadLimiter, posAuthLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+app.get('/api/pos/erp-carts', posIpFloodLimiter, posQueueReadLimiter, requireStoreToken, asyncHandler(async (req, res) => {
   const rows = await listPendingErpCarts(req.store.id, 20)
   const carts = []
   for (const row of rows) {
@@ -888,7 +948,7 @@ app.get('/api/pos/erp-carts', posQueueReadLimiter, posAuthLimiter, requireStoreT
 // POS 플러그인이 addLineItem() 결과를 되돌려준다. posLimiter를 쓴다 -- 폴링(조회)이 아니라
 // "이 매장 전체 기준으로 한도를 두는 게 의미 있는" 상태 변경 액션이라 posQueueReadLimiter가 아닌
 // 기존 posLimiter(DB 기반)와 맞춘다.
-app.post('/api/pos/erp-carts/:id/consume', posLimiter, posAuthLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+app.post('/api/pos/erp-carts/:id/consume', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
   const result = req.body?.result
   if (result !== 'loaded' && result !== 'failed') {
     return res.status(400).json({ ok: false, error: "result는 'loaded' 또는 'failed'여야 합니다." })
@@ -932,7 +992,7 @@ app.post('/api/pos/erp-carts/:id/consume', posLimiter, posAuthLimiter, requireSt
 // 반드시 명시적인 확인 동작(예: 2단계 확인 버튼) 뒤에만 이 엔드포인트를 호출해야 한다 —
 // 서버는 그 UX를 강제할 수 없으므로 프론트(탭앱) 쪽 책임이다.
 // 해당 매장 + 오늘 serviceDate의 예약만 대상으로 한다(계약 §3.14) — 아니면 404.
-app.post('/api/pos/queue/:id/call', posLimiter, posAuthLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+app.post('/api/pos/queue/:id/call', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
   const serviceDate = kstDateString()
   const reservation = await getReservation(req.params.id)
   if (!reservation || reservation.storeId !== req.store.id || reservation.serviceDate !== serviceDate) {
@@ -952,7 +1012,7 @@ app.post('/api/pos/queue/:id/call', posLimiter, posAuthLimiter, requireStoreToke
 // 차(어제 called 상태)를 다음날 POS에서 완료 처리할 수 있어야 하기 때문이다. 호출(call)은 여전히
 // 오늘 것만 허용하므로(아래 call 라우트), 여기서 day-scope를 빼도 "어제 waiting을 오늘 실수로 새로
 // 호출"하는 사고로는 이어지지 않는다.
-app.post('/api/pos/queue/:id/complete', posLimiter, posAuthLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+app.post('/api/pos/queue/:id/complete', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
   const existing = await getReservation(req.params.id)
   if (!existing || existing.storeId !== req.store.id) {
     return res.status(404).json({ ok: false, error: '예약을 찾을 수 없습니다.' })
@@ -969,7 +1029,7 @@ app.post('/api/pos/queue/:id/complete', posLimiter, posAuthLimiter, requireStore
 
 // 노쇼 손님을 대기열에서 빼는 용도 (계약 §3.16 신규). complete와 동일하게(계약 v3 §4.3) 해당
 // 매장만 확인하고 day-scope는 두지 않는다 — 이월(called/notify_failed) 건도 취소할 수 있어야 한다.
-app.post('/api/pos/queue/:id/cancel', posLimiter, posAuthLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+app.post('/api/pos/queue/:id/cancel', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
   const existing = await getReservation(req.params.id)
   if (!existing || existing.storeId !== req.store.id) {
     return res.status(404).json({ ok: false, error: '예약을 찾을 수 없습니다.' })

@@ -658,3 +658,69 @@ testSerial('자동연결: 형식에 맞지 않는 storeCode는 저장하지 않�
   const after = await prisma.store.findUnique({ where: { id: store.id } })
   assert.equal(after.erpStoreCode, null) // 아무것도 붙지 않아야 한다
 })
+
+// --- POS 폴링 부하/한도 (400개 매장 규모 대비) ------------------------------
+// 실측으로 드러난 두 가지를 고친 뒤의 회귀 테스트다:
+//   1) 정상 폴링 1건마다 RateLimitHit에 2회 쓰던 문제(increment 후 decrement)
+//   2) 조회 한도가 IP 기준이라 한 매장이 POS를 3대만 둬도 정상 영업 중 429로 막히던 문제
+
+testSerial('폴링 부하: 인증에 성공한 요청은 RateLimitHit에 쓰지 않는다', async () => {
+  const store = await createStore('poll-nowrite')
+  await prisma.$executeRawUnsafe('DELETE FROM "RateLimitHit"')
+
+  for (let i = 0; i < 15; i += 1) {
+    const res = await getPosCarts(store)
+    assert.equal(res.status, 200)
+  }
+
+  const rows = await prisma.$queryRawUnsafe('SELECT "key", "count" FROM "RateLimitHit"')
+  // 성공만 15번 했으므로 카운터 행 자체가 생기면 안 된다. 예전 구현은 여기서 행이 생기고
+  // count가 0으로 남았다(15번 올렸다가 15번 되돌린 흔적).
+  assert.deepEqual(rows, [], `성공 요청이 카운터를 건드렸습니다: ${JSON.stringify(rows)}`)
+})
+
+testSerial('폴링 한도: 한 매장이 단말기를 여러 대 둬도 조회가 막히지 않는다', async () => {
+  // 예전 한도는 IP당 분당 60회였는데 탭앱 한 대가 분당 24회를 쓴다 -> 3대면 72회로 초과.
+  // 지금은 매장 토큰 기준이라 한 매장 몫(300회) 안에서 소비된다.
+  const store = await createStore('poll-many-terminals')
+  const THREE_TERMINALS_PER_MIN = 72
+  for (let i = 0; i < THREE_TERMINALS_PER_MIN; i += 1) {
+    const res = await getPosCarts(store)
+    assert.equal(res.status, 200, `${i + 1}번째 요청에서 ${res.status}`)
+  }
+})
+
+testSerial('폴링 한도: 매장이 다르면 서로의 한도를 잡아먹지 않는다', async () => {
+  const storeA = await createStore('poll-isolate-a')
+  const storeB = await createStore('poll-isolate-b')
+  for (let i = 0; i < 40; i += 1) {
+    assert.equal((await getPosCarts(storeA)).status, 200)
+  }
+  // A가 많이 썼어도 B는 영향이 없어야 한다(예전 IP 기준이면 같은 키를 공유해 막혔다).
+  assert.equal((await getPosCarts(storeB)).status, 200)
+})
+
+testSerial('무차별 대입 방어: 틀린 토큰 10회 뒤 429로 차단된다', async () => {
+  await prisma.$executeRawUnsafe('DELETE FROM "RateLimitHit"')
+  const codes = []
+  for (let i = 0; i < 13; i += 1) {
+    const res = await request(app).get('/api/pos/erp-carts').set('X-Store-Token', `wrong-token-${i}`)
+    codes.push(res.status)
+  }
+  const first429 = codes.indexOf(429)
+  assert.equal(codes.slice(0, 10).every((c) => c === 401), true, `앞 10회가 401이 아님: ${codes}`)
+  assert.equal(first429, 10, `11번째부터 429여야 하는데 ${first429 + 1}번째: ${codes}`)
+
+  // 실패는 DB에 기록돼야 한다(인스턴스가 여러 개여도 시도 횟수가 공유되도록).
+  const rows = await prisma.$queryRawUnsafe('SELECT "count" FROM "RateLimitHit"')
+  assert.equal(rows.length, 1)
+  assert.equal(Number(rows[0].count) >= 10, true)
+})
+
+testSerial('무차별 대입 방어: 토큰을 아예 안 보내도 실패로 센다', async () => {
+  await prisma.$executeRawUnsafe('DELETE FROM "RateLimitHit"')
+  const res = await request(app).get('/api/pos/erp-carts')
+  assert.equal(res.status, 401)
+  const rows = await prisma.$queryRawUnsafe('SELECT "count" FROM "RateLimitHit"')
+  assert.equal(rows.length, 1)
+})
