@@ -128,26 +128,43 @@ model ErpCart {
 
 ---
 
-## 5. 미해결 — `addLineItem` 렌더링 문제
+## 5. `addLineItem` — 해결 (2026-08-26 실단말기 검증 완료)
 
-`addLineItem()`이 **성공을 반환하는데도** POS [주문] 탭이 "일시적인 오류가 발생했습니다"로 깨진다.
-실단말기에서 진단 중이다.
+**결론: 쉐보레 품목을 토스 POS 카탈로그에 미리 등록할 필요가 없다. MOU 원안대로 성립한다.**
 
-지금까지 확정된 것:
+카탈로그에 "제육 7,000원" 하나뿐인 매장에서 "엔진오일 5W30 (4L) 45,000원"이 [주문] 탭에 정상
+표시됐고, 메모(차량번호)도 함께 보이며, 결제 버튼이 45,000원으로 활성화됐다.
 
-| 사실 | 근거 |
-|---|---|
-| SDK는 `parse()` 결과를 버리고 **원본 객체를 그대로** 포스로 보낸다 | `dist/index.esm.js`의 `addLineItem` 구현 |
-| 따라서 zod 스키마에 없는 키도 포스까지 전달된다 | 위와 동일 |
-| `item.options`는 **필수** — 없으면 포스가 `.map()`에서 터진다 | 실호출 errorMessage |
-| zod 스키마의 `item`에는 `options`가 **없다** | `PluginDraftOrderItemDtoSchema` 원문 |
-| 즉 **검증은 zod, 실제 소비는 타입 선언** 기준으로 맞춰야 한다 | 위 둘의 조합 |
-| `OrderItemType`에 `AD_HOC`이 없다 (Open API의 `targetType`과 다른 체계) | `types/index.d.ts:580` |
+### 공개 문서에 없거나 **틀리게** 적힌 것들 (전부 실호출로 확인)
 
-다음 진단: POS가 **스스로 만든** 정상 lineItem을 덤프해서(플러그인 검증 패널 ③) 우리가 만든 것과
-필드 단위로 비교한다. 그리고 그 항목을 그대로 되담아(④) `addLineItem` 자체의 가용성을 가른다.
+| # | 사실 | 문서는 뭐라고 하나 |
+|---|---|---|
+| 1 | **`key`는 자동 생성되지 않는다. 직접 발급해야 한다.** | `types/index.d.ts:1120` "넣지 않으면 자동으로 생성됨", zod도 `optional` — **둘 다 틀렸다** |
+| 2 | `item`은 카탈로그 **원본 객체 통째**여야 한다 | `Pick<PluginCatalogItem, 'id'\|'title'\|'category'\|'options'\|'code'>` — 실제보다 좁다 |
+| 3 | `item.category`도 원본 통째(`merchantId`, `order`, `enabled`, `kioskOrder`, `position`...) | `{id, title, titleI18n?}` — 좁다 |
+| 4 | `itemPrice`에 `id`, `isDefault`, `state`, `barcode`, `isStockable`, `stockQuantity`도 있다 | 6개 필드 `Pick` — 좁다 |
+| 5 | `item.options`는 필수. 없으면 포스가 `.map()`에서 터진다 | zod 스키마에는 아예 없다 |
+| 6 | **SDK 스키마가 SDK 자기 데이터를 거부한다** — `getCatalogs()`의 카테고리에 `titleI18n: null`이 들어있는데 스키마는 `.optional()`이라 `null`을 거부 | 문서에 언급 없음 |
+| 7 | `memo`는 `undefined`가 아니라 빈 문자열(`""`) | 문서에 언급 없음 |
+| 8 | SDK는 `parse()` 결과를 버리고 **원본 객체를 그대로** 보낸다 → 스키마에 없는 키도 포스까지 전달된다 | 문서에 언급 없음 |
+| 9 | `OrderItemType`에 `AD_HOC`이 없다 (Open API의 `targetType`과 다른 체계) | `types/index.d.ts:580` |
 
-이 문제 때문에 **lineItem을 만드는 코드는 함수 하나에 모아 뒀다.** 진단이 끝나면 거기만 고치면 된다.
+### `key`가 없을 때의 증상 (셋 다 같은 원인)
+
+- POS [주문] 탭이 "일시적인 오류가 발생했습니다"로 깨진다
+- `addLineItem` 응답의 `lineItems`가 비어서 돌아온다 ("담기 성공 — 항목 0개")
+- `deleteLineItem(key)`로 되돌릴 수 없다
+
+포스가 스스로 담은 항목은 `key: "BQ8-knv-Ns0z8_qKZzFmW"`(21자 URL-safe)를 갖고 있었다.
+같은 형식으로 직접 발급한다.
+
+### 어떻게 알아냈나
+
+플러그인에 임시 검증 패널을 넣어 **포스가 스스로 담은 항목을 통째로 덤프**했다. 필드를 하나씩
+추측해 채우는 걸 그만두고 정답지를 직접 본 것이 결정적이었다 — 문서만 봤다면 `key`가 자동
+생성된다고 계속 믿었을 것이다.
+
+구현은 `pos-plugin/src/lineItem.js` 한 곳에 모여 있다.
 
 ---
 
@@ -223,5 +240,8 @@ POST /api/admin/stores/:id/erp-code   (관리자 로그인 필요)
 (품목 왕복 무손실, 양방향 멱등, 인증 경계, `addLineItem`에 필요한 필드 존재 여부).
 백엔드 단위 테스트는 81개다.
 
-한 가지 남은 것: **`addLineItem` 렌더링 문제(§5)가 풀리기 전까지는 POS 단말기에서의
-끝단 확인이 불가능하다.** 그 앞 구간(전산 → 서버 → 플러그인 수신)은 전부 검증됐다.
+`addLineItem`은 실단말기에서 검증됐다(§5) — 카탈로그 등록 없이 임의 품목이 [주문] 탭에
+정상 표시되고 결제 버튼이 활성화된다. `lineItem.js`의 순수 함수(key 발급, null i18n 제거,
+원본 필드 보존)는 브라우저 밖에서 별도로 점검한다.
+
+남은 것은 `startPayment()` 실호출 확인, 그리고 PyQt 앱 → POS 단말기까지 이어지는 시연이다.
