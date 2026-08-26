@@ -1,3 +1,7 @@
+// ⚠️ 다른 어떤 import보다 먼저. 이 아래에서 나는 오류를 잡으려면 가드가 먼저 걸려 있어야 한다.
+import { installCrashGuard } from './crashGuard.js'
+installCrashGuard()
+
 import { posPluginSdk } from '@tossplace/pos-plugin-sdk'
 // 전산(ERP)이 담아둔 장바구니를 POS로 옮기는 화면. 대기열 폴링/토큰 화면과 관심사가 달라
 // 별도 파일로 뒀다 — app.js에서는 초기화와 "같은 폴링 타이머에서 같이 불러오기"만 담당한다.

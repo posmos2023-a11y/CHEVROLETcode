@@ -229,7 +229,11 @@ function handleListClick(e) {
   if (inFlight.has(cartId) || consumed.has(cartId)) return
   const cart = lastCarts.find((c) => c.id === cartId)
   if (!cart) return
-  loadCartToPos(cart)
+  // 담기 도중 어떤 예외가 나든 화면까지 죽이지 않는다. 여기서 새면 처리되지 않은 거부가 되어
+  // 원인을 알 수 없는 상태로 남는다.
+  loadCartToPos(cart).catch((e) => {
+    deps.notify('error', `처리 중 오류가 발생했습니다: ${e?.message || e}`)
+  })
 }
 
 // ── 결제 완료 감지 ──────────────────────────────────────────────────────────
@@ -242,11 +246,22 @@ function handleListClick(e) {
 // 여러 건을 연달아 담고 한 번에 결제할 수도 있으므로 배열로 들고 있다가 전부 보고한다.
 const PENDING_PAID_KEY = 'chevrolet_erp_pending_paid'
 
+// 결제 대기 기록의 유효 시간. 결제 화면으로 넘어가면서 탭앱이 다시 로드되면 'paid' 이벤트를
+// 놓치는데, 그때 이 기록이 지워지지 않고 남는다. 유효 시간이 없으면 그 찌꺼기가 계속 쌓였다가
+// 한참 뒤 엉뚱한 결제가 일어났을 때 옛날 건까지 몽땅 "결제완료"로 보고돼버린다.
+const PENDING_PAID_TTL_MS = 10 * 60 * 1000
+
 function loadPendingPaid() {
   try {
     const raw = localStorage.getItem(PENDING_PAID_KEY)
     const parsed = raw ? JSON.parse(raw) : []
-    return Array.isArray(parsed) ? parsed : []
+    if (!Array.isArray(parsed)) return []
+    const now = Date.now()
+    return parsed
+      // 예전 버전은 문자열 배열로 저장했다. 시각을 모르니 만료된 것으로 본다 — 남겨두면
+      // 위에 적은 오보고 위험이 그대로다.
+      .filter((entry) => entry && typeof entry === 'object' && typeof entry.id === 'string')
+      .filter((entry) => now - Number(entry.at || 0) < PENDING_PAID_TTL_MS)
   } catch {
     return []
   }
@@ -262,8 +277,9 @@ function savePendingPaid(ids) {
 }
 
 function rememberLoadedCart(cartId) {
-  const ids = loadPendingPaid()
-  if (!ids.includes(cartId)) savePendingPaid([...ids, cartId])
+  const entries = loadPendingPaid()
+  if (entries.some((e) => e.id === cartId)) return
+  savePendingPaid([...entries, { id: cartId, at: Date.now() }])
 }
 
 // 결제 완료 통보. 실패해도 재시도하지 않는다 — 담기(consume)와 달리 이건 기록용이라,
@@ -280,11 +296,11 @@ async function reportPaid(cartId, paymentId, orderId) {
 function initPaymentWatch() {
   try {
     posPluginSdk.payment.on('paid', (paymentId, orderId) => {
-      const ids = loadPendingPaid()
-      if (!ids.length) return
+      const entries = loadPendingPaid()
+      if (!entries.length) return
       // 먼저 지운다 — 통보가 실패해도 다음 결제 때 엉뚱한 건이 딸려가지 않게 한다.
       savePendingPaid([])
-      Promise.all(ids.map((id) => reportPaid(id, paymentId, orderId)))
+      Promise.all(entries.map((e) => reportPaid(e.id, paymentId, orderId)))
         .then((results) => {
           if (results.some(Boolean)) deps.notify('success', '결제 완료를 전산에 알렸습니다.')
         })
@@ -302,7 +318,14 @@ function initPaymentWatch() {
 // 알린다(자동으로 더 손쓸 방법이 없으므로 사람이 알아야 한다).
 async function reportConsume(cartId, resultBody) {
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const { ok, status, body } = await deps.apiPost(`/api/pos/erp-carts/${cartId}/consume`, resultBody)
+    // apiPost 안의 fetch는 네트워크가 끊기면 거부한다. 여기서 던지면 호출부의 catch를 타고
+    // 되돌리기·안내가 꼬이므로, 통신 실패도 "보고 실패"라는 값으로 바꿔서 돌려준다.
+    let ok, status, body
+    try {
+      ;({ ok, status, body } = await deps.apiPost(`/api/pos/erp-carts/${cartId}/consume`, resultBody))
+    } catch {
+      continue
+    }
     if (ok) return { ok, status, body }
     if (status === 401) {
       deps.onUnauthorized(body.error)
@@ -363,49 +386,48 @@ async function runLoadCartToPos(cart) {
       addedKeys.push(lineItem.key)
     }
 
-    let payError = null
-    if (cart.autoPay) {
-      try {
-        await draftOrder.startPayment()
-      } catch (e) {
-        payError = e
-      }
-    }
-
-    if (payError) {
-      // 판단 지점: 품목은 이미 전부 정확히 담겼다(절반만 담긴 상태가 아니다) — 여기서 되돌리면
-      // 방금 정상적으로 담은 항목까지 지워버리는 것이라 오히려 손해다. 그래서 결제 자동 시작
-      // 실패는 "담기 자체는 성공"으로 서버에 보고하고, 직원에게는 결제를 직접 눌러야 한다고
-      // 안내한다. 서버 계약상 result는 loaded/failed 둘뿐이라 "부분 성공"을 표현할 방법이
-      // 없다는 한계는 있다.
-      const reported = await reportConsume(cart.id, { result: 'loaded' })
-      rememberLoadedCart(cart.id)
-      if (reported.ok) removeCartFromView(cart.id)
-      deps.notify('error', `담기는 완료됐지만 결제 화면 자동 실행에 실패했습니다. 직접 결제를 눌러주세요. (${payError.message || payError})`)
-      return
-    }
-
-    const reported = await reportConsume(cart.id, { result: 'loaded' })
-    // 결제가 끝났을 때 어느 건인지 알아야 하므로 기억해 둔다(initPaymentWatch 주석 참고).
+    // ── 여기가 분기점이다 ──
+    // 품목은 이미 POS 장바구니에 전부 들어갔다. 전산 입장에서 "옮기기"는 이 시점에 끝났다.
+    //
+    // startPayment()는 POS를 결제 화면으로 넘긴다. 그 순간 이 탭앱(iframe)은 가려지거나 통째로
+    // 다시 로드된다 — 실제로 "담고 결제 시작을 누르면 화면이 하얘진다"는 신고가 있었다.
+    // 그러면 startPayment() 뒤에 있는 코드는 영영 실행되지 않는다. 서버 보고도, 결제 감시
+    // 등록(rememberLoadedCart)도 같이 날아간다. "결제는 됐는데 전산 주문에 그대로 남아 있다"가
+    // 정확히 이 증상이다.
+    //
+    // 그래서 결제를 시작하기 **전에** 보고하고 기억해 둔다. 순서를 뒤집는 것만으로 그 뒤에
+    // 화면이 죽든 말든 상태는 남는다.
     rememberLoadedCart(cart.id)
+    const reported = await reportConsume(cart.id, { result: 'loaded' })
 
     if (!reported.ok) {
-      // ⚠️ 품목은 POS에 담겼는데 그 사실을 서버가 모른다. 서버에는 아직 pending이라 이 카드는
-      // 다음 폴링이나 재시작 뒤에 되살아난다. 여기서 화면에서만 지우면 직원은 끝난 줄 알고,
-      // 나중에 되살아난 카드를 다시 눌러 같은 품목을 또 담게 된다 — 이미 결제했다면 이중 결제다.
-      // 그래서 카드를 남겨두고, 무엇이 일어났는지 그대로 알린다.
+      // 아직 결제는 시작하지 않았다. 서버가 어떤 상태인지 모르는 채로 결제까지 자동으로
+      // 밀어붙이면, 나중에 이 카드가 되살아났을 때 결제된 건인지 아닌지 아무도 모른다.
+      // 담긴 것은 사실이므로 카드는 남겨두고, 결제는 직원이 직접 누르게 한다.
       deps.notify(
         'error',
-        '담기는 됐지만 서버에 알리지 못했습니다. 이 주문은 목록에 남습니다 — ' +
-        '[주문] 탭에 이미 담겨 있으니 다시 누르지 마시고, 결제 후 [지우기]로 정리해주세요.'
+        '담기는 됐지만 서버에 알리지 못했습니다. [주문] 탭에 품목이 들어가 있으니 거기서 결제해주세요. ' +
+        '이 주문은 목록에 남습니다 — 다시 누르지 마시고, 결제 후 [지우기]로 정리해주세요.'
       )
       return
     }
 
-    // 성공하면 다음 폴링을 기다리지 않고 즉시 화면에서 지운다 — 그 사이 직원이 같은
-    // 카드를 다시 눌러 중복으로 담는 것을 막기 위해서다.
+    // 보고가 끝났으니 화면에서 먼저 지운다. 결제 화면으로 넘어간 뒤에는 이 아래가 실행된다는
+    // 보장이 없기 때문이다.
     removeCartFromView(cart.id)
-    deps.notify('success', cart.autoPay ? '담고 결제를 시작했습니다.' : 'POS 장바구니에 담았습니다.')
+
+    if (!cart.autoPay) {
+      deps.notify('success', 'POS 장바구니에 담았습니다.')
+      return
+    }
+
+    deps.notify('success', '담았습니다. 결제 화면으로 넘어갑니다.')
+    try {
+      await draftOrder.startPayment()
+    } catch (payError) {
+      // 담기와 보고는 이미 끝난 뒤다. 되돌릴 것은 없고, 직접 결제하라고 알리기만 하면 된다.
+      deps.notify('error', `결제 화면을 열지 못했습니다. [주문] 탭에서 직접 결제해주세요. (${payError.message || payError})`)
+    }
   } catch (e) {
     await handleLoadFailure(cart, e, addedKeys)
   }
