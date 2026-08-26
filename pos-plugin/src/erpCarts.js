@@ -19,8 +19,34 @@ let deps = null
 export function initErpCarts(injected) {
   deps = injected
   initPaymentWatch()
+
+  // 직원이 직접 다시 확인할 수단. 폴링이 최대 15초까지 늘어나므로, "지금 서버는 뭐라고
+  // 하는지"를 바로 보고 싶을 때가 있다 — 특히 카드가 안 사라진다고 느낄 때.
+  const refresh = document.getElementById('erp-refresh')
+  if (refresh) {
+    refresh.addEventListener('click', async () => {
+      refresh.disabled = true
+      try {
+        await refreshErpCarts()
+      } finally {
+        refresh.disabled = false
+      }
+    })
+  }
+
   if (!listEl) return
   listEl.addEventListener('click', handleListClick)
+}
+
+// 마지막으로 서버 응답을 받은 시각과 건수. 화면이 멈춘 건지 서버가 그렇게 답하는 건지
+// 직원이 구분할 수 있어야 한다 — "안 사라져요"의 원인이 둘 중 어느 쪽인지 바로 갈린다.
+function stampUpdated(count) {
+  const el = document.getElementById('erp-cart-updated')
+  if (!el) return
+  const time = new Intl.DateTimeFormat('ko-KR', { hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(new Date())
+  el.textContent = count
+    ? `${time} 기준 · 서버에 ${count}건 남아 있습니다`
+    : `${time} 기준 · 대기 중인 주문 없음`
 }
 
 // 전산 품목은 POS 카탈로그에 등록돼 있지 않다. POS가 요구하는 item.id/category는 "이미 있는
@@ -112,7 +138,9 @@ function renderErpCarts(incoming) {
 // 이 함수만 쓰인다(아래 refreshErpCarts는 그 필드를 아직 안 주는 서버용 폴백).
 export function applyErpCarts(carts) {
   if (!deps) return
-  renderErpCarts(Array.isArray(carts) ? carts : [])
+  const list = Array.isArray(carts) ? carts : []
+  renderErpCarts(list)
+  stampUpdated(list.filter((c) => !consumed.has(c.id)).length)
 }
 
 // 서버가 erpCarts 필드를 아직 안 내려주는 경우(배포 과도기)의 폴백. 이 API가 없거나 실패해도
@@ -132,7 +160,9 @@ export async function refreshErpCarts() {
       renderErpCarts([])
       return
     }
-    renderErpCarts(body.carts || [])
+    const list = body.carts || []
+    renderErpCarts(list)
+    stampUpdated(list.filter((c) => !consumed.has(c.id)).length)
   } catch {
     renderErpCarts([])
   }
