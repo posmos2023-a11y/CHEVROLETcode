@@ -4,7 +4,7 @@ import { posPluginSdk } from '@tossplace/pos-plugin-sdk'
 import { initDraftOrderProbe } from './draftOrderProbe.js'
 // 전산(ERP)이 담아둔 장바구니를 POS로 옮기는 화면. 대기열 폴링/토큰 화면과 관심사가 달라
 // 별도 파일로 뒀다 — app.js에서는 초기화와 "같은 폴링 타이머에서 같이 불러오기"만 담당한다.
-import { initErpCarts, refreshErpCarts } from './erpCarts.js'
+import { initErpCarts, refreshErpCarts, applyErpCarts } from './erpCarts.js'
 
 // 실제 토스POS 단말기 밖(로컬 브라우저)에서 미리 볼 때는 posPluginSdk가 부모 프레임(POS 앱)과
 // 통신하지 못해 응답이 오지 않는다. 백엔드가 제공하는 미리보기에서는 같은 origin을 사용하고,
@@ -179,6 +179,8 @@ const ACTION_SUCCESS_MESSAGE = {
 }
 
 async function runAction(id, action) {
+  // 직원이 뭔가를 눌렀다는 건 지금 바쁘다는 뜻이다 -- 폴링을 다시 빠르게 되돌린다.
+  noteActivity()
   const { ok, status, body } = await apiPost(ACTION_PATH[action](id))
   if (!ok) {
     if (status === 401) {
@@ -326,12 +328,15 @@ async function loadQueue({ manual = false } = {}) {
     }
     setConnection('online')
     applyQueueResponse(body)
-    // 전산 주문도 같은 5초 타이머 안에서 함께 가져온다(타이머를 따로 만들지 않는다). 대기열
-    // 조회가 이미 성공한 뒤이므로 토큰은 유효하다고 볼 수 있지만, 혹시 이 요청만 401이 나더라도
-    // refreshErpCarts 내부에서 handleUnauthorized로 동일하게 처리된다. 이 API가 아직 배포되지
-    // 않았거나 실패해도 refreshErpCarts는 예외를 밖으로 던지지 않으므로 대기열 화면은 영향받지
-    // 않는다.
-    await refreshErpCarts()
+    // 전산 주문은 이 응답에 함께 실려 온다(서버가 /api/pos/queue에 erpCarts를 담아준다).
+    // 예전에는 경로를 따로 한 번 더 호출해서 매장당 폴링 요청이 두 배였다.
+    // 아직 그 필드를 안 주는 서버(배포 과도기)일 수도 있으므로, 없을 때만 옛 경로를 부른다.
+    if (Array.isArray(body.erpCarts)) {
+      applyErpCarts(body.erpCarts)
+    } else {
+      await refreshErpCarts()
+    }
+    onPollResult(body)
     return true
   } catch {
     setConnection('error')
@@ -349,15 +354,78 @@ refreshButtonEl.addEventListener('click', async () => {
   }
 })
 
+// ── 폴링 주기 ────────────────────────────────────────────────────────────
+// 고정 5초로 돌리면 매장 한 곳이 하루 17,280번 서버를 부른다. 400개 매장이면 하루 690만 번인데,
+// 그 대부분은 "바뀐 것 없음"을 확인하려고 서버와 DB를 깨우는 낭비다.
+//
+// 그래서 **바뀐 게 없으면 간격을 늘리고, 바뀌거나 사람이 만지면 즉시 빠르게 되돌린다.**
+// 손님이 오가는 바쁜 시간에는 5초로 붙어 있고, 한산할 때만 느려진다. 상한을 15초로 낮게 둔 이유는
+// 전산에서 주문을 보낸 직원이 POS 앞에서 기다리기 때문이다 — 30초까지 늘리면 "안 떠요" 소리가 난다.
+const POLL_MIN_MS = 5000
+const POLL_MAX_MS = 15000
+let pollIntervalMs = POLL_MIN_MS
+let lastSnapshot = ''
+
+// 응답이 지난번과 같은지 비교할 지문. 화면에 그리는 값만 담아서, 서버가 순서를 바꾸거나
+// 무관한 필드를 더해도 불필요하게 "바뀜"으로 잡히지 않게 한다.
+function snapshotOf(body) {
+  try {
+    const q = (body.reservations || []).map((r) => `${r.id}:${r.status}`).join(',')
+    const c = (body.erpCarts || []).map((x) => x.id).join(',')
+    return `${q}|${c}`
+  } catch {
+    return String(Date.now()) // 비교 불가면 항상 "바뀜"으로 취급한다(느려지지 않는 쪽이 안전)
+  }
+}
+
+function noteActivity() {
+  if (pollIntervalMs === POLL_MIN_MS) return
+  pollIntervalMs = POLL_MIN_MS
+  if (pollTimer) startPolling()
+}
+
+function onPollResult(body) {
+  const snap = snapshotOf(body)
+  if (snap !== lastSnapshot) {
+    lastSnapshot = snap
+    noteActivity()
+    return
+  }
+  // 변화가 없었다 -> 조금 느리게. 상한까지만.
+  const next = Math.min(Math.round(pollIntervalMs * 1.5), POLL_MAX_MS)
+  if (next !== pollIntervalMs) {
+    pollIntervalMs = next
+    if (pollTimer) startPolling()
+  }
+}
+
 function startPolling() {
   if (pollTimer) clearInterval(pollTimer)
-  pollTimer = setInterval(loadQueue, 5000)
+  pollTimer = setInterval(loadQueue, pollIntervalMs)
 }
 
 function stopPolling() {
   if (pollTimer) clearInterval(pollTimer)
   pollTimer = null
 }
+
+// 화면이 가려져 있으면(다른 탭/앱을 보는 중) 폴링을 멈춘다. 정비소는 하루 10시간 남짓 영업하고
+// 그 사이에도 POS는 다른 화면에 있는 시간이 훨씬 길다.
+// ⚠️ 토스 POS 웹뷰에서 document.hidden이 실제로 동작하는지는 확인되지 않았다. 동작하지 않으면
+// 이 코드는 아무 일도 하지 않고 기존과 똑같이 계속 폴링한다 — 즉 안 되더라도 손해는 없다.
+// 다시 보일 때는 간격을 기다리지 않고 **즉시 한 번** 불러온다. 그러지 않으면 화면을 켠 직원이
+// 최대 15초 동안 낡은 목록을 보게 된다.
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    stopPolling()
+    return
+  }
+  if (tokenScreenEl.hidden) {
+    noteActivity()
+    loadQueue()
+    startPolling()
+  }
+})
 
 // ─────────────────────────────────────────────────────────────────────────
 // 토큰 입력 화면

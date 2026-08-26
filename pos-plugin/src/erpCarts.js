@@ -97,8 +97,16 @@ function renderErpCarts(incoming) {
     .join('')
 }
 
-// 서버가 아직 이 API를 배포하지 않았을 수 있다(404) — 그 경우에도 대기열 화면은 멀쩡해야 하므로
-// 여기서 난 오류는 절대 밖으로 던지지 않고 "전산 주문 없음"으로 조용히 처리한다.
+// 대기열 응답(/api/pos/queue)에 함께 실려 온 전산 주문을 화면에 반영한다.
+// 폴링 요청을 매장당 절반으로 줄이려고 서버가 두 결과를 한 응답에 담아주기 때문에, 평소에는
+// 이 함수만 쓰인다(아래 refreshErpCarts는 그 필드를 아직 안 주는 서버용 폴백).
+export function applyErpCarts(carts) {
+  if (!deps) return
+  renderErpCarts(Array.isArray(carts) ? carts : [])
+}
+
+// 서버가 erpCarts 필드를 아직 안 내려주는 경우(배포 과도기)의 폴백. 이 API가 없거나 실패해도
+// 대기열 화면은 멀쩡해야 하므로 오류를 밖으로 던지지 않고 "전산 주문 없음"으로 조용히 처리한다.
 export async function refreshErpCarts() {
   if (!deps) return
   try {

@@ -896,11 +896,19 @@ async function rejectPosAuthFailure(req, res, unauthorizedBody) {
 // 있게 한다.
 app.get('/api/pos/queue', posIpFloodLimiter, posQueueReadLimiter, requireStoreToken, asyncHandler(async (req, res) => {
   const serviceDate = kstDateString()
-  const reservations = await listActiveQueueForStore(req.store.id, serviceDate)
+  // 대기열과 전산 장바구니를 한 응답에 함께 담는다. 예전에는 탭앱이 두 경로를 각각 폴링해서
+  // 매장당 요청이 두 배였다 -- 400개 매장 기준 초당 160건 중 절반이 이 때문이었다.
+  // 두 조회는 서로 무관하므로 병렬로 던진다.
+  const [reservations, erpCarts] = await Promise.all([
+    listActiveQueueForStore(req.store.id, serviceDate),
+    loadPendingErpCartsForResponse(req.store.id),
+  ])
   return res.json({
     ok: true,
     serviceDate,
     storeName: req.store.name,
+    // 구버전 탭앱은 이 필드를 무시하고 /api/pos/erp-carts를 계속 부른다(그 경로도 살아 있다).
+    erpCarts,
     reservations: reservations.map((r) => ({
       id: r.id,
       queueNumber: r.queueNumber,
@@ -919,8 +927,10 @@ app.get('/api/pos/queue', posIpFloodLimiter, posQueueReadLimiter, requireStoreTo
 // items를 파싱해서 내려준다. queue 폴링과 마찬가지로 인스턴스 기준 메모리 레이트리밋
 // (posQueueReadLimiter)으로 충분하다 -- 이미 토큰 인증이 붙어 있고, 폴링마다 DB round-trip을
 // 늘릴 이유가 없다.
-app.get('/api/pos/erp-carts', posIpFloodLimiter, posQueueReadLimiter, requireStoreToken, asyncHandler(async (req, res) => {
-  const rows = await listPendingErpCarts(req.store.id, 20)
+// 대기 중인 전산 장바구니를 응답 형태로 만든다. /api/pos/queue와 /api/pos/erp-carts가
+// 같은 값을 내려주도록 한 곳에 모았다.
+async function loadPendingErpCartsForResponse(storeId) {
+  const rows = await listPendingErpCarts(storeId, 20)
   const carts = []
   for (const row of rows) {
     let items
@@ -942,7 +952,14 @@ app.get('/api/pos/erp-carts', posIpFloodLimiter, posQueueReadLimiter, requireSto
       createdAt: row.createdAt,
     })
   }
-  return res.json({ ok: true, carts })
+  return carts
+}
+
+// ⚠️ 이 라우트는 **구버전 탭앱 호환용**으로 남겨둔다. 새 탭앱은 /api/pos/queue 응답의
+// erpCarts를 쓰므로 이 경로를 부르지 않는다 -- 폴링 요청이 매장당 절반으로 줄어든다.
+// 400개 매장이 한꺼번에 업데이트되지는 않으므로 당분간 둘 다 살아 있어야 한다.
+app.get('/api/pos/erp-carts', posIpFloodLimiter, posQueueReadLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  return res.json({ ok: true, carts: await loadPendingErpCartsForResponse(req.store.id) })
 }))
 
 // POS 플러그인이 addLineItem() 결과를 되돌려준다. posLimiter를 쓴다 -- 폴링(조회)이 아니라

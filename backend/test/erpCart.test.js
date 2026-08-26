@@ -724,3 +724,52 @@ testSerial('무차별 대입 방어: 토큰을 아예 안 보내도 실패로 �
   const rows = await prisma.$queryRawUnsafe('SELECT "count" FROM "RateLimitHit"')
   assert.equal(rows.length, 1)
 })
+
+// --- 폴링 요청 합치기 (매장당 요청 수를 절반으로) -----------------------------
+// 탭앱이 /api/pos/queue와 /api/pos/erp-carts를 각각 폴링하던 것을 하나로 합쳤다.
+// 400개 매장이 한꺼번에 업데이트되지는 않으므로 옛 경로도 계속 살아 있어야 한다.
+
+testSerial('합친 응답: /api/pos/queue가 대기열과 전산 주문을 함께 내려준다', async () => {
+  const store = await createStore('merged-response')
+  const body = validBody(store)
+  assert.equal((await postCart(body)).status, 201)
+
+  const res = await request(app).get('/api/pos/queue').set('X-Store-Token', store.posToken)
+  assert.equal(res.status, 200)
+  assert.equal(Array.isArray(res.body.reservations), true)
+  assert.equal(Array.isArray(res.body.erpCarts), true, 'erpCarts 필드가 없습니다')
+  assert.equal(res.body.erpCarts.length, 1)
+  assert.equal(res.body.erpCarts[0].referenceId, body.referenceId)
+  assert.equal(res.body.erpCarts[0].items[0].name, '엔진오일 5W30 (4L)')
+})
+
+testSerial('합친 응답: 옛 경로(/api/pos/erp-carts)도 같은 값을 계속 내려준다', async () => {
+  // 구버전 탭앱이 남아 있는 동안 이 경로가 죽으면 그 매장은 전산 주문을 못 받는다.
+  const store = await createStore('legacy-route')
+  const body = validBody(store)
+  assert.equal((await postCart(body)).status, 201)
+
+  const merged = await request(app).get('/api/pos/queue').set('X-Store-Token', store.posToken)
+  const legacy = await getPosCarts(store)
+  assert.equal(legacy.status, 200)
+  assert.deepEqual(legacy.body.carts, merged.body.erpCarts, '두 경로의 전산 주문이 다릅니다')
+})
+
+testSerial('합친 응답: 다른 매장의 전산 주문은 섞이지 않는다', async () => {
+  const storeA = await createStore('merged-isolate-a')
+  const storeB = await createStore('merged-isolate-b')
+  assert.equal((await postCart(validBody(storeA))).status, 201)
+
+  const resB = await request(app).get('/api/pos/queue').set('X-Store-Token', storeB.posToken)
+  assert.equal(resB.status, 200)
+  assert.deepEqual(resB.body.erpCarts, [])
+})
+
+testSerial('합친 응답: 전산 주문이 없으면 빈 배열이다(필드 자체는 항상 있다)', async () => {
+  // 탭앱은 이 필드의 존재 여부로 "합친 응답을 주는 서버인가"를 판단해 옛 경로 호출을 건너뛴다.
+  // 비어 있다고 필드를 빼면 구형 서버로 오인해 요청을 두 번 하게 된다.
+  const store = await createStore('merged-empty')
+  const res = await request(app).get('/api/pos/queue').set('X-Store-Token', store.posToken)
+  assert.equal(res.status, 200)
+  assert.deepEqual(res.body.erpCarts, [])
+})
