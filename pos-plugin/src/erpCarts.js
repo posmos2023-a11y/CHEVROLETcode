@@ -89,7 +89,11 @@ function renderErpCarts(incoming) {
       return `
         <article class="erp-cart-item" data-cart-id="${deps.escapeHtml(cart.id)}">
           <div class="erp-cart-ref">${deps.escapeHtml(cart.referenceId || '')}</div>
-          <strong class="erp-cart-memo">${deps.escapeHtml(cart.memo || '-')}</strong>
+          <div class="erp-cart-head">
+            <strong class="erp-cart-car">${deps.escapeHtml(cart.carNumber || cart.memo || '-')}</strong>
+            ${cart.linkedReservation ? '<span class="erp-cart-linked">예약 연결됨</span>' : ''}
+          </div>
+          ${cart.carNumber && cart.memo ? `<div class="erp-cart-memo">${deps.escapeHtml(cart.memo)}</div>` : ''}
           <div class="erp-cart-summary">${summarizeItems(cart.items)}</div>
           <div class="erp-cart-total">${formatWon(cart.totalAmount)}</div>
           <div class="erp-cart-actions">

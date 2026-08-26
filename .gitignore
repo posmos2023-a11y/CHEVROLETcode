@@ -20,4 +20,5 @@ __pycache__/
 erp-simulator/build/
 erp-simulator/dist/
 erp-simulator/dist-new/
+erp-simulator/dist-v2/
 erp-simulator/*.spec

@@ -1293,3 +1293,33 @@ testSerial('비밀번호 변경: 잠금 카운터도 함께 풀린다', async ()
   assert.equal(after.failedLoginCount, 0)
   assert.equal(after.lockedUntil, null)
 })
+
+testSerial('POS 응답: 차량번호와 예약 연결 여부가 카드에 실려 온다', async () => {
+  // 정비소는 차량번호로 일을 식별한다. memo에도 들어 있지만 자유 문자열이라 화면에서
+  // 따로 강조할 수 없어서 별도 필드로 내린다. 연결 표시는 "결제 후 자동완료된다"는 신호다.
+  const store = await createStore('poscard-fields')
+  const today = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10)
+  const reservation = await prisma.reservation.create({
+    data: {
+      storeId: store.id, carNumber: '55마5555', phone: '01012345678',
+      serviceType: '엔진오일', queueNumber: 11, serviceDate: today, status: 'called',
+    },
+  })
+  const body = validBody(store, { carNumber: '55마5555' })
+  assert.equal((await postCart(body)).body.linkedReservation, true)
+
+  const res = await getPosCarts(store)
+  const card = res.body.carts[0]
+  assert.equal(card.carNumber, '55마5555')
+  assert.equal(card.linkedReservation, true)
+
+  // 연결되지 않은 건은 표시가 없어야 한다.
+  const store2 = await createStore('poscard-unlinked')
+  const body2 = validBody(store2, { carNumber: '66바6666' })
+  assert.equal((await postCart(body2)).body.linkedReservation, false)
+  const card2 = (await getPosCarts(store2)).body.carts[0]
+  assert.equal(card2.carNumber, '66바6666')
+  assert.equal(card2.linkedReservation, false)
+
+  assert.equal(reservation.id.length > 0, true)
+})

@@ -1003,6 +1003,12 @@ async function loadPendingErpCartsForResponse(storeId) {
       memo: row.memo,
       autoPay: row.autoPay,
       createdAt: row.createdAt,
+      // 차량번호는 memo에도 들어 있지만 자유 문자열이라 화면에서 따로 강조할 수 없다.
+      // 정비소는 차량번호로 일을 식별하므로 별도 필드로 내려 카드에 크게 띄운다.
+      carNumber: row.carNumber,
+      // 예약과 이어졌으면 결제 후 정비완료까지 자동으로 된다. 직원이 그 사실을 알아야
+      // "왜 대기열에서 안 사라지지?"를 나중에 묻지 않는다.
+      linkedReservation: Boolean(row.reservationId),
     })
   }
   return carts

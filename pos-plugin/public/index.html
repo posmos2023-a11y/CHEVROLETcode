@@ -248,10 +248,39 @@
     letter-spacing: -0.01em;
   }
 
-  .erp-cart-memo {
-    font-size: 16px;
-    font-weight: 750;
+  /* 차량번호를 가장 크게. 정비소는 차량번호로 일을 식별한다 — 손님 이름보다 이게 먼저다. */
+  .erp-cart-head {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 7px;
+  }
+
+  .erp-cart-car {
+    font-size: 17px;
+    font-weight: 800;
     letter-spacing: -0.04em;
+  }
+
+  /* 예약과 이어졌다는 표식. 이게 붙어 있으면 결제 후 정비완료까지 자동으로 되므로
+     직원이 대기열에서 따로 [완료]를 누르지 않아도 된다. */
+  .erp-cart-linked {
+    display: inline-flex;
+    align-items: center;
+    min-height: 21px;
+    padding: 0 7px;
+    border-radius: 7px;
+    background: var(--green-soft);
+    color: #008b5a;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: -0.03em;
+  }
+
+  .erp-cart-memo {
+    color: var(--sub);
+    font-size: 13px;
+    letter-spacing: -0.03em;
   }
 
   .erp-cart-summary {

@@ -253,6 +253,12 @@ class MainWindow(QMainWindow):
         plate_label.setObjectName("FieldLabel")
         self.plate_edit = QLineEdit()
         self.plate_edit.setPlaceholderText("예: 12가3456")
+        # 이 값은 POS 화면 표시뿐 아니라 "그날 대기 중인 예약 손님"을 찾는 데도 쓰인다.
+        # 직원이 왜 채워야 하는지 모르면 비워두게 되므로 툴팁으로 알려준다.
+        self.plate_edit.setToolTip(
+            "POS 화면에 표시되고, 그날 대기 중인 예약 손님과 자동으로 이어집니다. "
+            "이어지면 결제가 끝났을 때 정비완료 처리까지 자동으로 됩니다."
+        )
         customer_label = QLabel("고객명")
         customer_label.setObjectName("FieldLabel")
         self.customer_edit = QLineEdit()
@@ -627,7 +633,19 @@ class MainWindow(QMainWindow):
         self._refresh_cart_ui()
 
         self._current_reference_id = reference_id
-        self._set_status(f"전송됨 · POS 대기 중... ({reference_id})", STATUS_COLOR_PENDING)
+        # 서버가 차량번호로 그날 대기 손님을 찾아 이어줬는지 알려준다(linkedReservation).
+        # 이어지면 결제가 끝났을 때 정비완료까지 자동으로 처리되므로, 직원이 그 사실을 알아야
+        # "왜 대기열에서 안 사라지지?"를 나중에 묻지 않는다.
+        if result.get("linkedReservation"):
+            link_note = " · 대기 손님과 연결됨"
+        elif self.plate_edit.text().strip():
+            # 차량번호는 보냈는데 못 이었다. 예약 없이 온 손님일 수도 있고, 번호가 다를 수도 있다.
+            link_note = " · 연결된 예약 없음"
+        else:
+            link_note = ""
+        self._set_status(
+            f"전송됨 · POS 대기 중...{link_note} ({reference_id})", STATUS_COLOR_PENDING
+        )
         self._start_poll(reference_id)
 
     def _on_send_failed(self, message):
