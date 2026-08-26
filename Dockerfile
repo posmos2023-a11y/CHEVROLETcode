@@ -1,7 +1,13 @@
 # Cloud Run 배포용. 저장소 루트를 빌드 컨텍스트로 사용한다.
 # backend/server.js가 형제 폴더 front-plugin/, pos-plugin/dist/를 정적 서빙하므로
 # 이미지 안에 두 폴더가 모두 포함되어야 한다.
-ARG CHEVROLET_API_BASE_URL=
+# POS 플러그인 번들에 구워 넣을 API 주소.
+# 기본값을 비워두면 안 된다 — pos-plugin/build.js가 주소 없는 배포 번들을 거부하고 종료(exit 1)해서
+# 이미지 빌드 전체가 실패한다(실제로 그렇게 배포가 깨졌다). 그 가드 자체는 필요하다: 주소가 빠진
+# 번들은 단말기에서 상대경로로 요청을 보내 "네트워크 연결을 확인하세요"만 뜨고 원인을 알 수 없다.
+# Cloud Build 트리거는 Dockerfile만 보고 build-arg를 넘기지 않으므로, 여기에 운영 주소를 기본값으로
+# 둔다. 다른 환경은 `docker build --build-arg CHEVROLET_API_BASE_URL=...`로 덮어쓰면 된다.
+ARG CHEVROLET_API_BASE_URL=https://chevrolet-api-813801981857.asia-northeast3.run.app
 FROM node:18-slim AS pos-plugin-build
 ARG CHEVROLET_API_BASE_URL
 WORKDIR /app/pos-plugin
