@@ -36,6 +36,13 @@ if (!accessKey || !secretKey || !merchantId) {
 const BASE = 'https://open-api.tossplace.com/api-public/openapi/v1'
 const orderKey = `posmos-verify-${crypto.randomUUID()}`
 
+// 테스트 주문 금액(원). 기본 5,000원이며 TOSS_TEST_AMOUNT로 바꿀 수 있다.
+// 실가맹점이라 실제로 결제하면 진짜 돈이 나가므로, 결제 흐름까지 확인할 때는 소액으로 둘 것.
+const parsedAmount = Number(process.env.TOSS_TEST_AMOUNT)
+const AMOUNT = Number.isSafeInteger(parsedAmount) && parsedAmount > 0 ? parsedAmount : 5000
+// 부가세 포함가(taxInclusive: true) 기준으로 공급가/세액을 역산한다.
+const TAX = Math.round(AMOUNT / 11)
+
 // 구성 근거 — 토스 개발자센터 공식 답변(2026-08 승인 메일)으로 확정된 내용:
 // - payments는 **필수 필드**라 생략하면 안 되고, 미결제 주문은 빈 배열("payments": [])로 보낸다.
 //   (공개 문서만 보고 "생략하면 OPENED"로 오해하기 쉬운 지점 — 답변으로 정정됨)
@@ -70,7 +77,7 @@ const body = {
           title: '기본',
           priceType: 'FIXED',
           priceUnit: 1,
-          priceValue: 1000,
+          priceValue: AMOUNT,
           isTaxFree: false,
           taxInclusive: true,
         },
@@ -79,18 +86,15 @@ const body = {
     ],
     // ⚠️ chargePrice는 숫자가 아니라 **객체**다(공식 문서 예시 기준. 숫자로 보내면
     // "order.chargePrice는 형식이 올바르지 않습니다" 4000 에러).
-    // 부가세 포함가(taxInclusive: true) 기준으로 공급가/세액을 역산한다:
-    //   taxAmount   = round(총액 / 11)
-    //   supplyAmount = 총액 - taxAmount
     chargePrice: {
-      listPrice: 1000,
+      listPrice: AMOUNT,
       discountAmount: 0,
       tipAmount: 0,
       serviceChargeAmount: 0,
-      taxAmount: Math.round(1000 / 11),
-      supplyAmount: 1000 - Math.round(1000 / 11),
+      taxAmount: TAX,
+      supplyAmount: AMOUNT - TAX,
       taxExemptAmount: 0,
-      totalAmount: 1000,
+      totalAmount: AMOUNT,
     },
   },
   // 미결제 주문이라도 payments 자체는 필수 — 빈 배열로 보낸다(토스 답변).
@@ -100,7 +104,8 @@ const body = {
 ;(async () => {
   const url = `${BASE}/merchants/${encodeURIComponent(merchantId)}/order/orders`
   console.log(`대상: POST ${url}`)
-  console.log(`orderKey: ${orderKey}\n`)
+  console.log(`orderKey: ${orderKey}`)
+  console.log(`금액: ${AMOUNT.toLocaleString('ko-KR')}원 (공급가 ${(AMOUNT - TAX).toLocaleString('ko-KR')} + 부가세 ${TAX.toLocaleString('ko-KR')})\n`)
 
   let res
   try {
