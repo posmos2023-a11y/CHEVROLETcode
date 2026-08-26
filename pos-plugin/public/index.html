@@ -556,6 +556,23 @@
 
   /* 정비 이력. 화면을 덮는 대신 목록 아래에 펼쳐지는 패널로 둔다 — POS는 터치라
      모달을 띄우면 닫기 버튼을 못 찾고 헤매는 일이 잦다. */
+  .section-actions { display: flex; align-items: center; gap: 8px; }
+
+  .history-open-button {
+    min-height: 40px;
+    padding: 0 13px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: var(--surface);
+    color: var(--sub);
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: -0.03em;
+    cursor: pointer;
+  }
+
+  .history-open-button:active { transform: scale(0.97); }
+
   .history-panel {
     margin-top: 18px;
     padding: 16px;
@@ -849,7 +866,12 @@
             <h2 id="queue-heading">대기 고객</h2>
             <p id="last-updated">5초마다 자동 업데이트</p>
           </div>
-          <button class="refresh-button" id="refresh-button" type="button" aria-label="대기열 새로고침">↻</button>
+          <div class="section-actions">
+            <!-- 대기열이 비어 있어도 이력을 볼 수 있어야 한다. 자주 찾는 건 오늘 손님이 아니라
+                 지난번에 왔던 차라, 카드에 달린 버튼만으로는 닿지 않는다. -->
+            <button class="history-open-button" id="history-open" type="button">정비 이력</button>
+            <button class="refresh-button" id="refresh-button" type="button" aria-label="대기열 새로고침">↻</button>
+          </div>
         </div>
         <div class="list" id="list"></div>
       </section>

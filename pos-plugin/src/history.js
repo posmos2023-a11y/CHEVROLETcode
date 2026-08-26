@@ -30,6 +30,20 @@ export function initHistory(injected) {
 
   const closeBtn = document.getElementById('history-close')
   if (closeBtn) closeBtn.addEventListener('click', close)
+
+  // 헤더의 상시 입구. 대기열이 비어 있어도 여기로 들어올 수 있다.
+  const openBtn = document.getElementById('history-open')
+  if (openBtn) {
+    openBtn.addEventListener('click', () => {
+      const panel = panelEl()
+      // 이미 열려 있으면 닫는다 — 화면이 좁아 열어둔 채로 두면 대기열이 밀린다.
+      if (panel && !panel.hidden) {
+        close()
+        return
+      }
+      openHistoryFor('')
+    })
+  }
 }
 
 // 대기 고객 카드의 [이력] 버튼에서 부른다 — 직원이 차량번호를 다시 칠 이유가 없다.
@@ -38,8 +52,14 @@ export function openHistoryFor(carNumber) {
   if (!panel) return
   panel.hidden = false
   inputEl().value = carNumber || ''
-  if (carNumber) search(carNumber)
-  else inputEl().focus()
+  if (carNumber) {
+    search(carNumber)
+    return
+  }
+  bodyEl().innerHTML = '<div class="empty"><div class="empty-copy">차량번호를 입력하면 지난 정비 내역을 보여드립니다.</div></div>'
+  inputEl().focus()
+  // 패널이 화면 아래에 있어서, 대기열이 길면 열어도 안 보인다.
+  panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
 }
 
 function close() {
