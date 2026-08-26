@@ -79,10 +79,14 @@ async function get(url) {
   console.log(`주문 ${list.length}건\n`)
   for (const o of list) {
     const key = o.orderKey ?? o.key ?? '(orderKey 없음)'
-    const state = o.state ?? o.status ?? '(상태 없음)'
+    // 실제 응답 필드명은 orderState다(단건 조회로 확인). state/status는 혹시 모를 변형 대비 폴백.
+    const state = o.orderState ?? o.state ?? o.status ?? '(상태 없음)'
     const amount = o.chargePrice?.totalAmount ?? o.totalAmount ?? '?'
     const created = o.createdAt ?? o.openedAt ?? ''
-    console.log(`  [${state}] ${amount}원  ${key}  ${created}`)
+    // diningOption을 같이 보여줘야 "어떤 값으로 만든 주문이 POS에 뜨는지" 대조할 수 있다.
+    const dining = o.lineItems?.[0]?.diningOption ?? '-'
+    const number = o.orderNumber ? ` (${o.orderNumber})` : ''
+    console.log(`  [${state}] ${amount}원  dining=${String(dining).padEnd(9)} ${key}${number}  ${created}`)
   }
   console.log('\n우리가 만든 주문(orderKey가 posmos-verify-... 또는 erp-...)이 위 목록에 있고 상태가')
   console.log('OPENED라면, 주문 생성 자체는 정상이고 POS 화면 쪽 노출 조건 문제입니다.')

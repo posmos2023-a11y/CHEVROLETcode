@@ -65,6 +65,14 @@ async function createTossDraftOrder({ merchantId, orderKey, orderNumber, memo, i
   // 반드시 환경변수로 오버라이드 가능해야 한다(하드코딩 금지 -- ERP_CONTRACT_V1 §3 필수 요구사항).
   const baseUrl = process.env.TOSS_OPENAPI_BASE_URL || 'https://open-api.tossplace.com'
   // 공식 문서 예시 값은 'HERE'다 -- 'FOR_HERE'는 4000 에러로 확인됨(verify-toss-order.js).
+  // diningOption 허용 enum은 공개 문서에 없어서 실호출로 직접 알아냈다(2026-08-26,
+  // scripts/probe-dining-option.js로 후보 18개 탐색):
+  //   허용: HERE, TOGO, DELIVERY, PICKUP
+  //   거부: TO_GO, TAKE_OUT, TAKEOUT, TAKE_AWAY, TAKEAWAY, PACKAGING, PACKAGE, PICK_UP,
+  //         EAT_IN, DINE_IN, IN_STORE, STORE, NONE, ETC, DEFAULT, UNKNOWN
+  // 정비 매장에는 외식업 개념인 이 값들이 다 어색하지만 필수 필드라 하나는 넣어야 하고,
+  // 문서 예시값이자 가장 무난한 HERE를 기본으로 쓴다. 네 값 모두로 주문을 만들어봤으나
+  // POS [현황] 탭 노출 여부에는 차이가 없었다(= 화면 미표시 원인은 diningOption이 아니다).
   const diningOption = process.env.TOSS_DINING_OPTION || 'HERE'
 
   const body = {
