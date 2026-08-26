@@ -51,10 +51,23 @@ const body = {
     memo: '포스모스 연동 검증용 테스트 주문 (결제하지 마세요)',
     lineItems: [
       {
-        diningOption: process.env.TOSS_DINING_OPTION || 'FOR_HERE',
+        // 공식 문서의 요청 예시에 쓰인 값은 'HERE'다(전체 enum 목록은 문서에 없음).
+        // 처음엔 'FOR_HERE'로 추정해 보냈다가 "diningOption는 유효하지 않은 값입니다"(4000) 400을
+        // 받았고, 문서 예시를 다시 확인해 'HERE'로 정정했다.
+        diningOption: process.env.TOSS_DINING_OPTION || 'HERE',
         targetType: 'AD_HOC',
-        item: { title: '연동 테스트 상품' },
+        // item.category는 필수다(문서 표에는 있으나 놓치기 쉬움 — 실호출에서 4000으로 확인).
+        // enum이 아니라 { title, code } 객체라 카테고리명도 우리가 자유롭게 정할 수 있다.
+        // 카탈로그 미등록(AD_HOC) 상품이라 토스에 미리 만들어 둔 카테고리가 없어도 된다.
+        item: {
+          title: '연동 테스트 상품',
+          category: { title: '정비' },
+        },
         itemPrice: {
+          // itemPrice.title도 필수다(실호출 4000으로 확인). 가격 항목의 이름으로, 공식 문서
+          // 예시에는 "기본"이 쓰여 있다. 사이즈/옵션별 가격이 있는 업종을 위한 필드라
+          // 정비 매장처럼 단일 가격이면 "기본"을 그대로 쓰면 된다.
+          title: '기본',
           priceType: 'FIXED',
           priceUnit: 1,
           priceValue: 1000,
@@ -64,7 +77,21 @@ const body = {
         quantity: 1,
       },
     ],
-    chargePrice: 1000,
+    // ⚠️ chargePrice는 숫자가 아니라 **객체**다(공식 문서 예시 기준. 숫자로 보내면
+    // "order.chargePrice는 형식이 올바르지 않습니다" 4000 에러).
+    // 부가세 포함가(taxInclusive: true) 기준으로 공급가/세액을 역산한다:
+    //   taxAmount   = round(총액 / 11)
+    //   supplyAmount = 총액 - taxAmount
+    chargePrice: {
+      listPrice: 1000,
+      discountAmount: 0,
+      tipAmount: 0,
+      serviceChargeAmount: 0,
+      taxAmount: Math.round(1000 / 11),
+      supplyAmount: 1000 - Math.round(1000 / 11),
+      taxExemptAmount: 0,
+      totalAmount: 1000,
+    },
   },
   // 미결제 주문이라도 payments 자체는 필수 — 빈 배열로 보낸다(토스 답변).
   payments: [],
@@ -114,11 +141,15 @@ const body = {
     console.log('     이 앱(posmos-chevrolet-order)이 해당 가맹점에 연결(설치)돼 있는지 확인하세요.')
   } else if (res.status === 400) {
     console.log('⚠️ 400 = 인증은 통과! body 스키마만 조정하면 됩니다.')
-    console.log('   → 위 응답 메시지가 가리키는 필드를 고치세요. diningOption 허용값 문제라면')
-    console.log('     TOSS_DINING_OPTION 환경변수로 다른 값을 넣어 재시도하세요 (예: TAKE_OUT, DELIVERY 등')
-    console.log('     — 정확한 허용값은 응답 메시지에 나옵니다).')
+    console.log('   → 위 응답 메시지가 가리키는 필드를 고치세요.')
+    console.log('     diningOption 문제라면 TOSS_DINING_OPTION 환경변수로 값을 바꿔 재시도하세요.')
+    console.log('     기본값은 공식 문서 예시의 HERE 이고, 안 되면 TAKE_OUT / DELIVERY 등을 시도해보세요')
+    console.log('     (전체 허용 목록은 공개 문서에 없어 실호출로 찾아야 합니다).')
   } else {
     console.log(`❓ 예상 밖 응답(${res.status}). 위 본문을 확인하세요.`)
   }
-  process.exit(res.ok ? 0 : 1)
+  // process.exit()를 바로 부르면 Windows에서 stdout이 다 비워지기 전에 핸들이 닫히면서
+  // "Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)"이 뜬다. 종료 코드만 지정해두고
+  // 이벤트 루프가 자연스럽게 끝나게 두면 출력이 온전히 나온 뒤 정상 종료된다.
+  process.exitCode = res.ok ? 0 : 1
 })()

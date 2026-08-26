@@ -11,6 +11,31 @@
 - [ ] POS에서 완료 2단계 탭 후 대기열에서 제거되는지 확인
 - [ ] Front/POS 개발자센터 ZIP을 최신 커밋 기준으로 다시 생성·업로드
 
+## P0 — 쉐보레 전산(ERP) 연동
+
+전산 "담기" → 이 서버(`X-ERP-Token`) → 토스 POS 미결제(OPENED) 주문 자동 생성 연동. 상세 스펙은
+바탕화면 `쉐보레전산-토스POS-연동스펙(초안).md`(v0.3), API 설명은 `README.md`의
+"쉐보레 전산(ERP) 연동" 섹션 참고.
+
+**완료**
+- [x] 토스 개발자센터 주문 생성 API 사용 승인 (2026-08) — Open API 앱 `posmos-chevrolet-order`(서비스코드 AX4CEZY6)
+- [x] 토스 공식 확인 — `payments: []`(빈 배열) 필수(생략 시 400), `requestedInfo` 미전송 시 OPENED,
+      `targetType: "AD_HOC"`로 카탈로그 미등록 상품 전달
+- [x] 중개 서버 구현 — `POST /api/erp/draft-orders`(멱등 주문 생성), `GET /api/erp/draft-orders/:referenceId`(조회),
+      `POST /api/admin/stores/:id/erp-code`(매장코드 등록)
+
+**남은 작업**
+- [ ] 매장별 `erpStoreCode` 실제 등록 — 관리자 화면에서 `hq_admin`이 연동 대상 매장마다 1회 등록해야
+      전산이 보내는 `storeCode`가 매장에 매핑됨(등록 전에는 전산 요청이 전부 404)
+- [ ] 전산 측 `POST /api/erp/draft-orders` 호출 실제 구현 — 전산 개발 담당, 스펙 문서 §4 기준
+- [ ] 실제 매장 1곳에서 시연 — 전산에서 "담기" → 토스 POS [현황] 탭에 미결제 주문 표시 확인
+      (지금까지는 목 서버 기준으로만 검증됨, 실제 토스 Open API 호출은 아직 검증 안 됨)
+- [ ] 결제완료 회신 2단계 설계·구현 — 지금은 전산이 `GET /api/erp/draft-orders/:referenceId`로 직접
+      재조회하는 방식만 가능하고, 이 서버가 전산 쪽으로 먼저 통보하는 콜백(스펙 §6)은 미구현.
+      전산 측 콜백 URL/인증 토큰 확정이 선행되어야 함
+- [ ] `TOSS_OPENAPI_ACCESS_KEY`/`TOSS_OPENAPI_SECRET_KEY`/`ERP_API_TOKEN`을 운영 환경(Secret Manager 등)에 등록
+      (`backend/.env.example` 참고)
+
 ## P0 — 프로덕션 하드닝(2026-08-24) 후속 확정 필요
 
 백엔드 크래시 방지·보안 헤더·POS 토큰 인증·개인정보 동의 수집/파기·Docker/CI 정비까지는
@@ -46,7 +71,8 @@
 - [x] Cloud Run Build/Start 명령과 `PORT` 동작 확인
 - [ ] Secret Manager로 운영 비밀값 이전. 이번 하드닝으로 늘어난 신규 환경변수도 포함:
       `TOSS_WEBHOOK_SECRET`(production 필수로 승격됨), `ADMIN_ALLOWED_ORIGINS`, `DATA_RETENTION_DAYS`,
-      `PROMO_OPT_OUT_TEXT`, `PROMO_MAX_PER_RUN` (`backend/.env.example` 참고)
+      `PROMO_OPT_OUT_TEXT`, `PROMO_MAX_PER_RUN`, ERP 연동용 `TOSS_OPENAPI_ACCESS_KEY`/
+      `TOSS_OPENAPI_SECRET_KEY`/`ERP_API_TOKEN` (`backend/.env.example` 참고)
 - [x] Front/POS API base URL을 환경별 설정으로 분리
 - [ ] GCP API 도메인을 Toss Front/POS ACL에 등록
 

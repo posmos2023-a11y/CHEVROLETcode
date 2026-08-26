@@ -15,12 +15,14 @@ model Store {
   businessNumber String?
   status         String   @default("active")
   posToken       String?  @unique // 매장별 POS 탭앱 인증 토큰(64자 hex, X-Store-Token 헤더로 검증)
+  erpStoreCode   String?  @unique // 쉐보레 전산 측 매장 코드. 전산이 이 값으로 매장을 지정한다.
   createdAt      DateTime @default(now())
 
   reservations  Reservation[]
   payments      Payment[]
   queueCounters QueueCounter[]
   adminUsers    AdminUser[]
+  erpOrders     ErpOrder[]
 }
 
 // Design Ref: docs/02-design/features/multi-store-support.design.md Phase 3
@@ -117,4 +119,27 @@ model RateLimitHit {
   count       Int
 
   @@index([windowStart])
+}
+
+// 쉐보레 전산(ERP) -> 우리 -> 토스 주문 생성 중개 기록 (ERP_CONTRACT_V1 §2.2).
+// referenceId(전산 측 주문 참조번호)가 멱등키다 — 같은 값으로 재호출해도 토스에 중복 주문을
+// 만들지 않는다(tossOrderKey를 referenceId에서 안정적으로 파생시켜 재시도해도 동일하게 만든다).
+model ErpOrder {
+  id           String    @id @default(uuid())
+  storeId      String
+  store        Store     @relation(fields: [storeId], references: [id])
+  referenceId  String    @unique // 전산 측 주문 참조번호 = 멱등키
+  tossOrderKey String    @unique // 토스로 보낸 orderKey (referenceId에서 파생, 안정적)
+  tossOrderId  String? // 토스가 돌려준 주문 id (응답 스키마 미확정이라 nullable)
+  totalAmount  Int
+  status       String    @default("created") // created | failed | paid
+  itemsJson    String // 전산이 보낸 items 원본 JSON (감사/디버깅/결제통보 회신용)
+  memo         String?
+  tossRawJson  String? // 토스 응답 원본(성공/실패 모두) — 스키마 미확정이라 통째로 보관
+  errorMessage String?
+  createdAt    DateTime  @default(now())
+  paidAt       DateTime?
+
+  @@index([storeId, createdAt])
+  @@index([status])
 }

@@ -696,6 +696,72 @@ async function releasePromoClaim(id) {
   }
 }
 
+// --- 쉐보레 전산(ERP) 연동 (ERP_CONTRACT_V1 §5) ---
+
+// 전산이 보낸 storeCode로 매장을 찾는다. 등록되지 않은 코드(빈 값 포함)는 null-safe하게 null을
+// 반환한다 -- findStoreByMerchantId와 동일한 패턴.
+function findStoreByErpCode(erpStoreCode) {
+  if (erpStoreCode === undefined || erpStoreCode === null || erpStoreCode === '') return null
+  return prisma.store.findUnique({ where: { erpStoreCode: String(erpStoreCode) } })
+}
+
+// 본사 관리자가 매장에 전산 코드를 등록/해제할 때 쓴다. 빈 문자열/null을 보내면 코드 해제(null 저장)로
+// 취급한다(server.js가 형식 검증을 먼저 하므로 여기서는 unique 충돌만 신경 쓴다). 다른 매장이 이미
+// 쓰는 코드면 P2002가 나므로, setPosToken과 동일하게 호출부가 409로 변환할 수 있도록 코드를 붙여 던진다.
+async function setStoreErpCode(storeId, erpStoreCode) {
+  const value = erpStoreCode ? String(erpStoreCode) : null
+  try {
+    return await prisma.store.update({ where: { id: storeId }, data: { erpStoreCode: value } })
+  } catch (e) {
+    if (e?.code === 'P2002') {
+      const conflict = new Error('다른 매장이 이미 사용 중인 코드입니다.')
+      conflict.code = 'ERP_CODE_TAKEN'
+      throw conflict
+    }
+    return null
+  }
+}
+
+// referenceId(전산 측 주문 참조번호)는 ErpOrder의 멱등키다. 같은 값으로 재조회/재시도할 때 쓴다.
+function findErpOrderByReference(referenceId) {
+  if (!referenceId) return null
+  return prisma.erpOrder.findUnique({ where: { referenceId } })
+}
+
+// ErpOrder 생성/갱신을 한 함수로 묶는다 -- 최초 생성(created/failed)과 실패 후 재시도(같은
+// referenceId/tossOrderKey로 다시 생성 시도) 모두 이 함수를 거친다. referenceId가 unique라
+// upsert가 자연스럽다(재시도 시 update 경로를 탄다).
+function upsertErpOrder({ referenceId, storeId, tossOrderKey, tossOrderId, totalAmount, status, itemsJson, memo, tossRawJson, errorMessage }) {
+  const data = {
+    storeId,
+    tossOrderKey,
+    tossOrderId: tossOrderId ?? null,
+    totalAmount,
+    status,
+    itemsJson,
+    memo: memo ?? null,
+    tossRawJson: tossRawJson ?? null,
+    errorMessage: errorMessage ?? null,
+  }
+  return prisma.erpOrder.upsert({
+    where: { referenceId },
+    create: { referenceId, ...data },
+    update: data,
+  })
+}
+
+// 향후 결제 웹훅 연동용(계약 §5) -- 지금은 함수만 만들어 둔다. 아직 호출부가 없다.
+async function markErpOrderPaid(referenceId, paidAt) {
+  try {
+    return await prisma.erpOrder.update({
+      where: { referenceId },
+      data: { status: 'paid', paidAt: paidAt || new Date() },
+    })
+  } catch {
+    return null
+  }
+}
+
 // 웹훅 중복 수신 방지. 이미 처리한 x-toss-webhook-id면 false(스킵), 처음 보는 id면 기록하고 true.
 async function recordWebhookEventOnce(webhookId, eventType) {
   try {
@@ -872,4 +938,9 @@ module.exports = {
   releasePromoClaim,
   purgeExpiredPersonalData,
   getDailySummary,
+  findStoreByErpCode,
+  setStoreErpCode,
+  findErpOrderByReference,
+  upsertErpOrder,
+  markErpOrderPaid,
 }

@@ -50,7 +50,12 @@ const {
   releasePromoClaim,
   purgeExpiredPersonalData,
   getDailySummary,
+  findStoreByErpCode,
+  setStoreErpCode,
+  findErpOrderByReference,
+  upsertErpOrder,
 } = require('./src/store')
+const { createTossDraftOrder } = require('./src/tossOrderClient')
 const { PostgresRateLimitStore } = require('./src/rateLimitStore')
 const logger = require('./src/logger')
 const solapi = require('./src/solapi')
@@ -1147,6 +1152,37 @@ app.post('/api/admin/stores/:id/pos-token', requireAuth, requireRole('hq_admin')
   return res.json({ ok: true, storeId: store.id, posToken: store.posToken })
 }))
 
+// 쉐보레 전산(ERP) 측 매장 코드 등록/해제 (본사 전용, ERP_CONTRACT_V1 §4.4). 전산이
+// POST /api/erp/draft-orders를 보낼 때 storeCode로 이 값을 지정해 매장을 특정한다.
+// posToken과 달리 이 코드는 "비밀"이 아니라 전산 쪽 식별자를 그대로 반영한 값이라(예:
+// CHEV-UJB-001) 별도 시도 횟수 제한 없이 형식만 검증한다.
+const ERP_STORE_CODE_RE = /^[A-Za-z0-9_-]+$/
+app.post('/api/admin/stores/:id/erp-code', requireAuth, requireRole('hq_admin'), asyncHandler(async (req, res) => {
+  const raw = req.body?.erpStoreCode
+  const wantsClear = raw === undefined || raw === null || String(raw).trim() === ''
+
+  if (!wantsClear) {
+    const code = String(raw).trim()
+    if (code.length < 1 || code.length > 64 || !ERP_STORE_CODE_RE.test(code)) {
+      return res.status(400).json({ ok: false, error: '매장 코드는 1~64자의 영문/숫자/하이픈(-)/밑줄(_)만 사용할 수 있습니다.' })
+    }
+  }
+
+  let store
+  try {
+    store = await setStoreErpCode(req.params.id, wantsClear ? null : String(raw).trim())
+  } catch (e) {
+    if (e?.code === 'ERP_CODE_TAKEN') {
+      return res.status(409).json({ ok: false, error: e.message })
+    }
+    throw e
+  }
+  if (!store) {
+    return res.status(404).json({ ok: false, error: '매장을 찾을 수 없습니다.' })
+  }
+  return res.json({ ok: true, storeId: store.id, erpStoreCode: store.erpStoreCode })
+}))
+
 // --- 토스플레이스 결제 웹훅 (Phase 4, 백업 경로) ---
 // payment.html이 결제 성공 후 클라이언트에서 직접 POST /api/payments를 호출하는 게 기본 경로다.
 // 이 웹훅은 그 호출이 네트워크 문제 등으로 유실됐을 때를 대비한 보완 장치다.
@@ -1280,6 +1316,192 @@ app.post('/api/webhooks/toss/payment', asyncHandler(async (req, res) => {
   }
 
   return res.json({ ok: true })
+}))
+
+// --- 쉐보레 전산(ERP) 연동 (ERP_CONTRACT_V1 §4) ---
+// 전산이 우리 서버에 "이 매장에 이런 주문을 미결제 상태로 만들어달라"고 요청하는 창구다.
+// 우리는 그 요청을 검증한 뒤 토스 Open API로 넘겨 OPENED 주문을 만들고, 매장은 토스 POS
+// [현황] 탭에서 그 주문을 선택해 결제만 하면 된다(§0).
+//
+// 공유 토큰(X-ERP-Token) 인증. requirePromotionJobAuth와 동일하게 timingSafeEqual로 비교해
+// 타이밍 공격으로 토큰 일부를 추측하는 걸 막는다. 미설정이면 503 -- 전산 연동 자체를 켜지
+// 않은 환경(로컬 개발 등)에서 이 라우트가 500 대신 명확한 신호를 주기 위함이다.
+function requireErpToken(req, res, next) {
+  const expected = process.env.ERP_API_TOKEN
+  const supplied = req.get('x-erp-token') || ''
+  if (!expected) {
+    return res.status(503).json({ ok: false, error: 'ERP 연동이 설정되지 않았습니다.' })
+  }
+  const expectedBuf = Buffer.from(expected)
+  const suppliedBuf = Buffer.from(supplied)
+  if (expectedBuf.length !== suppliedBuf.length || !crypto.timingSafeEqual(expectedBuf, suppliedBuf)) {
+    return res.status(401).json({ ok: false, error: 'unauthorized' })
+  }
+  return next()
+}
+
+// 전산 쪽 시스템이 오작동해 짧은 시간에 대량 요청을 보내도 DB/토스 API를 보호할 수 있도록
+// 매장 관리 라우트들과 동일한 DB 기반 레이트리밋을 쓴다(분당 120 -- 전산은 사람이 아니라
+// 배치/큐 처리라 사람 조작 API보다 한도를 넉넉히 둔다).
+const erpLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 120,
+  store: new PostgresRateLimitStore(prisma, { prefix: 'erp', windowMs: 60 * 1000 }),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { ok: false, error: '요청이 너무 많습니다. 잠시 후 다시 시도해주세요.' },
+})
+
+const ERP_MAX_ITEMS = 100
+const ERP_MAX_UNIT_PRICE = 100000000
+const ERP_MAX_QUANTITY = 10000
+const ERP_MAX_TOTAL_AMOUNT = 1000000000
+
+// 요청 바디를 검증하고, 문제가 있으면 에러 사유 문자열을, 문제가 없으면 정규화된 값을 반환한다.
+// 라우트 핸들러 하나에 검증 로직이 전부 몰려있으면 가독성이 떨어져서 별도 함수로 뺐다.
+function validateDraftOrderBody(body) {
+  const storeCode = String(body?.storeCode ?? '').trim()
+  if (!storeCode) return { error: 'storeCode가 필요합니다.' }
+
+  const referenceId = String(body?.referenceId ?? '').trim()
+  if (!referenceId || referenceId.length > 200) {
+    return { error: 'referenceId는 1~200자여야 합니다.' }
+  }
+
+  const itemsRaw = body?.items
+  if (!Array.isArray(itemsRaw) || itemsRaw.length < 1 || itemsRaw.length > ERP_MAX_ITEMS) {
+    return { error: `items는 1~${ERP_MAX_ITEMS}건의 배열이어야 합니다.` }
+  }
+
+  let sum = 0
+  const items = []
+  for (const raw of itemsRaw) {
+    const name = String(raw?.name ?? '').trim()
+    if (!name || name.length > 100) {
+      return { error: '항목 name은 1~100자여야 합니다.' }
+    }
+    const unitPrice = raw?.unitPrice
+    if (!Number.isSafeInteger(unitPrice) || unitPrice < 0 || unitPrice > ERP_MAX_UNIT_PRICE) {
+      return { error: '항목 unitPrice가 올바르지 않습니다.' }
+    }
+    const quantity = raw?.quantity
+    if (!Number.isSafeInteger(quantity) || quantity < 1 || quantity > ERP_MAX_QUANTITY) {
+      return { error: '항목 quantity가 올바르지 않습니다.' }
+    }
+    const productId = raw?.productId !== undefined && raw?.productId !== null ? String(raw.productId) : null
+    // category는 계약서 §4.2에는 없는 선택 필드다 -- 토스 item.category가 필수라(tossOrderClient.js),
+    // 전산이 보내주면 그대로 쓰고 안 보내면 클라이언트 쪽 기본값('정비')을 그대로 둔다.
+    const category = raw?.category !== undefined && raw?.category !== null ? String(raw.category) : undefined
+    sum += unitPrice * quantity
+    items.push({ productId, name, unitPrice, quantity, category })
+  }
+
+  const totalAmount = body?.totalAmount
+  if (!Number.isSafeInteger(totalAmount) || totalAmount < 0 || totalAmount > ERP_MAX_TOTAL_AMOUNT) {
+    return { error: 'totalAmount가 올바르지 않습니다.' }
+  }
+  if (totalAmount !== sum) {
+    return { error: 'totalAmount가 항목 합계와 일치하지 않습니다.' }
+  }
+
+  const memoRaw = body?.memo
+  const memo = memoRaw === undefined || memoRaw === null ? null : String(memoRaw)
+  if (memo && memo.length > 200) {
+    return { error: 'memo는 200자 이하여야 합니다.' }
+  }
+
+  return { storeCode, referenceId, items, totalAmount, memo }
+}
+
+// referenceId에서 안정적으로 파생시킨다 -- 재시도해도 항상 같은 값이 나와야 토스 쪽에서도
+// 같은 주문으로 취급해 중복이 생기지 않는다(§4.2-3).
+function deriveTossOrderKey(referenceId) {
+  return `erp-${referenceId}`
+}
+
+app.post('/api/erp/draft-orders', erpLimiter, requireErpToken, asyncHandler(async (req, res) => {
+  const parsed = validateDraftOrderBody(req.body)
+  if (parsed.error) {
+    return res.status(400).json({ ok: false, error: parsed.error })
+  }
+  const { storeCode, referenceId, items, totalAmount, memo } = parsed
+
+  const store = await findStoreByErpCode(storeCode)
+  if (!store) {
+    return res.status(404).json({ ok: false, error: '등록되지 않은 매장 코드입니다.' })
+  }
+  if (store.status !== 'active') {
+    return res.status(403).json({ ok: false, error: '비활성화된 가맹점입니다.' })
+  }
+
+  // 멱등: 이미 처리된(failed가 아닌) 건이면 토스를 다시 호출하지 않고 그대로 돌려준다.
+  const existing = await findErpOrderByReference(referenceId)
+  if (existing && existing.status !== 'failed') {
+    return res.json({ ok: true, referenceId, tossOrderId: existing.tossOrderId, status: 'OPENED', duplicate: true })
+  }
+
+  const tossOrderKey = deriveTossOrderKey(referenceId)
+  const itemsJson = JSON.stringify(items)
+
+  const result = await createTossDraftOrder({
+    merchantId: store.merchantId,
+    orderKey: tossOrderKey,
+    orderNumber: referenceId,
+    memo,
+    items,
+    totalAmount,
+  })
+
+  if (!result.ok) {
+    // 토스의 원본 에러 문구는 로그에만 남기고 클라이언트에는 내보내지 않는다(§4.2-4) -- 내부
+    // API 키 설정 실수 등 운영 정보가 그대로 노출될 수 있기 때문이다.
+    logger.error('[erp] 토스 주문 생성 실패', { referenceId, storeId: store.id, status: result.status, error: result.error })
+    await upsertErpOrder({
+      referenceId,
+      storeId: store.id,
+      tossOrderKey,
+      tossOrderId: null,
+      totalAmount,
+      status: 'failed',
+      itemsJson,
+      memo,
+      tossRawJson: result.raw ? JSON.stringify(result.raw) : null,
+      errorMessage: result.error,
+    })
+    return res.status(502).json({ ok: false, error: '토스 주문 생성에 실패했습니다.', referenceId })
+  }
+
+  await upsertErpOrder({
+    referenceId,
+    storeId: store.id,
+    tossOrderKey,
+    tossOrderId: result.tossOrderId,
+    totalAmount,
+    status: 'created',
+    itemsJson,
+    memo,
+    tossRawJson: result.raw ? JSON.stringify(result.raw) : null,
+    errorMessage: null,
+  })
+
+  return res.status(201).json({ ok: true, referenceId, tossOrderId: result.tossOrderId, status: 'OPENED' })
+}))
+
+// 전산이 결과를 재조회할 수 있게 한다(§4.3).
+app.get('/api/erp/draft-orders/:referenceId', erpLimiter, requireErpToken, asyncHandler(async (req, res) => {
+  const order = await findErpOrderByReference(req.params.referenceId)
+  if (!order) {
+    return res.status(404).json({ ok: false, error: '요청하신 주문을 찾을 수 없습니다.' })
+  }
+  return res.json({
+    ok: true,
+    referenceId: order.referenceId,
+    tossOrderId: order.tossOrderId,
+    status: order.status,
+    totalAmount: order.totalAmount,
+    createdAt: order.createdAt,
+    paidAt: order.paidAt,
+  })
 }))
 
 // --- 내부 배치 작업 (Cloud Scheduler 전용) ---
