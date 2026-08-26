@@ -23,7 +23,7 @@ export function initErpCarts(injected) {
 }
 
 // 전산 품목은 POS 카탈로그에 등록돼 있지 않다. POS가 요구하는 item.id/category는 "이미 있는
-// 상품"을 빌려 쓰는 수밖에 없어(draftOrderProbe.js의 probeAdHoc과 동일한 전제), 카탈로그의
+// 상품"을 빌려 쓰는 수밖에 없어(근거는 lineItem.js 상단 주석), 카탈로그의
 // 아무 상품이나 하나를 기준으로 삼아 모든 라인아이템에 재사용한다.
 async function getBaseCatalogItem() {
   const catalogs = await posPluginSdk.catalog.getCatalogs()

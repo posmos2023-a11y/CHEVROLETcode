@@ -1,7 +1,4 @@
 import { posPluginSdk } from '@tossplace/pos-plugin-sdk'
-// ⚠️ 임시 검증 패널 — 전산 연동 설계 확정용. 확인 끝나면 이 줄과 draftOrderProbe.js,
-// index.html의 probe-panel 블록을 함께 제거한다.
-import { initDraftOrderProbe } from './draftOrderProbe.js'
 // 전산(ERP)이 담아둔 장바구니를 POS로 옮기는 화면. 대기열 폴링/토큰 화면과 관심사가 달라
 // 별도 파일로 뒀다 — app.js에서는 초기화와 "같은 폴링 타이머에서 같이 불러오기"만 담당한다.
 import { initErpCarts, refreshErpCarts, applyErpCarts } from './erpCarts.js'
@@ -523,5 +520,4 @@ async function main() {
 // 막기 위해서다.
 initErpCarts({ apiGet, apiPost, notify, escapeHtml, onUnauthorized: handleUnauthorized })
 
-initDraftOrderProbe()
 main()
