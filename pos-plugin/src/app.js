@@ -2,6 +2,9 @@ import { posPluginSdk } from '@tossplace/pos-plugin-sdk'
 // ⚠️ 임시 검증 패널 — 전산 연동 설계 확정용. 확인 끝나면 이 줄과 draftOrderProbe.js,
 // index.html의 probe-panel 블록을 함께 제거한다.
 import { initDraftOrderProbe } from './draftOrderProbe.js'
+// 전산(ERP)이 담아둔 장바구니를 POS로 옮기는 화면. 대기열 폴링/토큰 화면과 관심사가 달라
+// 별도 파일로 뒀다 — app.js에서는 초기화와 "같은 폴링 타이머에서 같이 불러오기"만 담당한다.
+import { initErpCarts, refreshErpCarts } from './erpCarts.js'
 
 // 실제 토스POS 단말기 밖(로컬 브라우저)에서 미리 볼 때는 posPluginSdk가 부모 프레임(POS 앱)과
 // 통신하지 못해 응답이 오지 않는다. 백엔드가 제공하는 미리보기에서는 같은 origin을 사용하고,
@@ -118,14 +121,24 @@ async function apiGet(path) {
   return { ok: res.ok && body.ok, status: res.status, body }
 }
 
-async function apiPost(path) {
+// body 기본값을 {}로 둬서 기존 호출부(call/complete/cancel — 전부 빈 바디)는 그대로 동작하고,
+// ERP 장바구니 결과 보고(consume)처럼 실제 바디가 필요한 곳만 두 번째 인자를 넘기면 된다.
+async function apiPost(path, body = {}) {
   const res = await fetch(`${API_BASE}${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Store-Token': getStoreToken() },
-    body: JSON.stringify({}),
+    body: JSON.stringify(body),
   })
-  const body = await res.json().catch(() => ({}))
-  return { ok: res.ok && body.ok, status: res.status, body }
+  const responseBody = await res.json().catch(() => ({}))
+  return { ok: res.ok && responseBody.ok, status: res.status, body: responseBody }
+}
+
+// 토큰이 만료/폐기됐을 때의 처리를 한 곳에 모은다 — 대기열(runAction/loadQueue)과 전산 주문
+// (erpCarts.refreshErpCarts)이 401을 받았을 때 똑같이 이 함수를 타야, 나중에 처리 방식이 하나만
+// 바뀌고 나머지가 어긋나는 일이 없다.
+function handleUnauthorized(errorMessage) {
+  clearStoreToken()
+  showTokenScreen(errorMessage || '매장 인증 토큰이 만료되었거나 올바르지 않습니다. 다시 입력해주세요.')
 }
 
 function clearConfirm(id) {
@@ -170,8 +183,7 @@ async function runAction(id, action) {
   if (!ok) {
     if (status === 401) {
       // 요청 도중 토큰이 회전/폐기됐을 수 있다. 저장된 값을 지우고 재입력을 받는다.
-      clearStoreToken()
-      showTokenScreen(body.error || '매장 인증 토큰이 만료되었거나 올바르지 않습니다. 다시 입력해주세요.')
+      handleUnauthorized(body.error)
       return
     }
     notify('error', body.error || '처리 중 오류가 발생했습니다.')
@@ -305,8 +317,7 @@ async function loadQueue({ manual = false } = {}) {
     const { ok, status, body } = await apiGet('/api/pos/queue')
     if (!ok) {
       if (status === 401) {
-        clearStoreToken()
-        showTokenScreen(body.error || '매장 인증 토큰이 만료되었거나 올바르지 않습니다. 다시 입력해주세요.')
+        handleUnauthorized(body.error)
         return false
       }
       setConnection('error')
@@ -315,6 +326,12 @@ async function loadQueue({ manual = false } = {}) {
     }
     setConnection('online')
     applyQueueResponse(body)
+    // 전산 주문도 같은 5초 타이머 안에서 함께 가져온다(타이머를 따로 만들지 않는다). 대기열
+    // 조회가 이미 성공한 뒤이므로 토큰은 유효하다고 볼 수 있지만, 혹시 이 요청만 401이 나더라도
+    // refreshErpCarts 내부에서 handleUnauthorized로 동일하게 처리된다. 이 API가 아직 배포되지
+    // 않았거나 실패해도 refreshErpCarts는 예외를 밖으로 던지지 않으므로 대기열 화면은 영향받지
+    // 않는다.
+    await refreshErpCarts()
     return true
   } catch {
     setConnection('error')
@@ -432,6 +449,11 @@ async function main() {
   // (네트워크 오류 등)는 원래부터 폴링으로 자동 복구를 시도했으므로 동일하게 계속 폴링한다.
   if (tokenScreenEl.hidden) startPolling()
 }
+
+// erpCarts.js는 fetch를 직접 만들지 않고 여기(app.js)의 apiGet/apiPost/notify/escapeHtml과
+// 401 처리(handleUnauthorized)를 그대로 주입받아 쓴다 — 같은 로직이 두 파일에 따로 생기는 것을
+// 막기 위해서다.
+initErpCarts({ apiGet, apiPost, notify, escapeHtml, onUnauthorized: handleUnauthorized })
 
 initDraftOrderProbe()
 main()

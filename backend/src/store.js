@@ -750,6 +750,86 @@ function upsertErpOrder({ referenceId, storeId, tossOrderKey, tossOrderId, total
   })
 }
 
+// --- 쉐보레 전산(ERP) "물건 담기" -> POS 플러그인 장바구니 중계 (POS-CART-BRIDGE §1) ---
+// ErpOrder(토스 Open API로 주문을 직접 생성하는 기존 경로)와는 완전히 별개다. 이쪽은 전산이
+// 올려둔 장바구니를 POS 플러그인이 폴링해 가져가서 자기 장바구니에 옮겨 담는 중계용이라,
+// 토스와는 아무것도 통신하지 않는다.
+
+// referenceId(전산 측 참조번호)가 멱등키이자 unique 컬럼이다 -- 그래서 순수 create만으로는
+// "cancelled 상태였던 건을 같은 referenceId로 재생성"을 표현할 수 없다(옛 cancelled 로우가 이미
+// 그 referenceId를 쥐고 있어 새 로우를 또 만들면 unique 제약(P2002)에 걸린다). 그래서
+// upsertErpOrder와 동일하게 upsert를 쓴다: referenceId가 처음이면 새 로우를, cancelled 로우가
+// 이미 있으면 그 로우를 pending으로 되돌려 재사용한다(errorMessage/loadedAt도 새 장바구니처럼
+// 초기화). 멱등 판단(cancelled가 아닌 기존 건은 손대지 않고 duplicate로 응답) 자체는
+// server.js가 findErpCartByReference로 먼저 조회해서 처리하고, 이 함수는 "없거나 cancelled일
+// 때만" 호출된다.
+function createErpCart({ storeId, referenceId, itemsJson, totalAmount, memo, autoPay }) {
+  const data = {
+    storeId,
+    itemsJson,
+    totalAmount,
+    memo: memo ?? null,
+    autoPay: autoPay !== false,
+    status: 'pending',
+    errorMessage: null,
+    loadedAt: null,
+  }
+  return prisma.erpCart.upsert({
+    where: { referenceId },
+    create: { referenceId, ...data },
+    update: data,
+  })
+}
+
+function findErpCartByReference(referenceId) {
+  if (!referenceId) return null
+  return prisma.erpCart.findUnique({ where: { referenceId } })
+}
+
+// POS 플러그인 폴링(GET /api/pos/erp-carts) 전용. 오래 기다린 것부터 순서대로 최대 limit건.
+function listPendingErpCarts(storeId, limit) {
+  return prisma.erpCart.findMany({
+    where: { storeId, status: 'pending' },
+    orderBy: { createdAt: 'asc' },
+    take: limit,
+  })
+}
+
+// POS가 addLineItem()까지 성공적으로 마쳤다는 통보(consume). updateMany + count로 pending ->
+// loaded 전이가 실제로 일어났는지 판별한다 -- POS 단말기가 여러 대면 같은 cart를 두 대가 거의
+// 동시에 consume할 수 있어서, findUnique 후 update 2단계로 짜면 경쟁 조건이 생긴다(둘 다 pending을
+// 보고 둘 다 "내가 처리했다"고 응답할 수 있음). 이 원자적 updateMany 자체가 낙관적 잠금 역할을 해서
+// 딱 한쪽만 count:1을 받는다.
+async function markErpCartLoaded(id) {
+  const result = await prisma.erpCart.updateMany({
+    where: { id, status: 'pending' },
+    data: { status: 'loaded', loadedAt: new Date() },
+  })
+  return result.count > 0
+}
+
+// markErpCartLoaded와 동일한 이유로 원자적 updateMany를 쓴다. errorMessage는 호출부(server.js)가
+// 이미 500자로 잘라 넘긴다고 가정한다(여기서 다시 자르지 않음 -- 책임을 한 곳에 둔다).
+async function markErpCartFailed(id, errorMessage) {
+  const result = await prisma.erpCart.updateMany({
+    where: { id, status: 'pending' },
+    data: { status: 'failed', errorMessage: errorMessage ?? null },
+  })
+  return result.count > 0
+}
+
+// 전산 쪽에서 주문을 취소했을 때(POST /api/erp/carts/:referenceId/cancel). pending일 때만
+// cancelled로 전이한다 -- 이미 POS가 가져간(loaded) 뒤라면 취소해도 POS 장바구니에는 이미
+// 반영되어 있으므로 여기서 조용히 상태만 바꾸면 안 되고(호출부가 409로 알려야 함), 그 판단을
+// 위해 전이 성공 여부(boolean)를 그대로 반환한다.
+async function cancelErpCart(referenceId) {
+  const result = await prisma.erpCart.updateMany({
+    where: { referenceId, status: 'pending' },
+    data: { status: 'cancelled' },
+  })
+  return result.count > 0
+}
+
 // 향후 결제 웹훅 연동용(계약 §5) -- 지금은 함수만 만들어 둔다. 아직 호출부가 없다.
 async function markErpOrderPaid(referenceId, paidAt) {
   try {
@@ -943,4 +1023,10 @@ module.exports = {
   findErpOrderByReference,
   upsertErpOrder,
   markErpOrderPaid,
+  createErpCart,
+  findErpCartByReference,
+  listPendingErpCarts,
+  markErpCartLoaded,
+  markErpCartFailed,
+  cancelErpCart,
 }

@@ -226,6 +226,65 @@
     gap: 10px;
   }
 
+  .erp-cart-section { margin-bottom: 28px; }
+
+  /* 전산 주문 카드. 대기 고객 카드(.queue-item)와 같은 border/radius/shadow/여백 값을 그대로
+     써서 같은 화면 안에서 시각적으로 한 세트처럼 보이게 한다 — 다만 내용 구성(참조번호 →
+     메모 → 품목요약 → 합계 → 버튼)이 세로로 쌓이는 형태라 grid-template-columns 대신
+     단순 세로 grid를 쓴다. */
+  .erp-cart-item {
+    display: grid;
+    gap: 4px;
+    padding: 16px;
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    background: var(--surface);
+    box-shadow: var(--shadow);
+  }
+
+  .erp-cart-ref {
+    color: var(--muted);
+    font-size: 11px;
+    letter-spacing: -0.01em;
+  }
+
+  .erp-cart-memo {
+    font-size: 16px;
+    font-weight: 750;
+    letter-spacing: -0.04em;
+  }
+
+  .erp-cart-summary {
+    color: var(--sub);
+    font-size: 13px;
+    letter-spacing: -0.03em;
+  }
+
+  .erp-cart-total {
+    margin-top: 4px;
+    font-size: 20px;
+    font-weight: 800;
+    letter-spacing: -0.05em;
+  }
+
+  .erp-cart-button {
+    min-height: 48px;
+    margin-top: 8px;
+    padding: 0 14px;
+    border: 0;
+    border-radius: 13px;
+    background: var(--blue);
+    color: #fff;
+    font-size: 14px;
+    font-weight: 750;
+    letter-spacing: -0.03em;
+    cursor: pointer;
+    transition: transform 120ms ease;
+  }
+
+  .erp-cart-button:active { transform: scale(0.98); }
+  .erp-cart-button:disabled { background: var(--muted); cursor: wait; }
+
   .queue-item {
     display: grid;
     grid-template-columns: 58px minmax(0, 1fr) auto;
@@ -634,6 +693,25 @@
           <span class="summary-label">다음 호출</span>
           <strong class="summary-value" id="next-number">—</strong>
           <span class="summary-note">가장 먼저 호출할 번호</span>
+        </div>
+      </section>
+
+      <section class="erp-cart-section" aria-labelledby="erp-cart-heading">
+        <div class="section-heading">
+          <div>
+            <h2 id="erp-cart-heading">전산 주문</h2>
+            <p>전산에서 담은 주문을 POS 장바구니로 옮깁니다</p>
+          </div>
+        </div>
+        <!-- 자바스크립트가 아직 첫 응답을 못 받았거나(로컬 미리보기에서 서버가 없는 경우 등)
+             JS 실행 전이라도 빈 상태가 보이도록 기본값을 정적으로 넣어둔다. 응답이 오면
+             renderErpCarts()가 그대로 덮어쓴다. -->
+        <div class="list" id="erp-cart-list">
+          <div class="empty">
+            <div class="empty-mark" aria-hidden="true">✓</div>
+            <div class="empty-title">전산에서 보낸 주문이 없습니다</div>
+            <div class="empty-copy">전산에서 물건을 담으면 이곳에 표시됩니다.</div>
+          </div>
         </div>
       </section>
 

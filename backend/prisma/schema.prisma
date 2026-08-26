@@ -23,6 +23,7 @@ model Store {
   queueCounters QueueCounter[]
   adminUsers    AdminUser[]
   erpOrders     ErpOrder[]
+  erpCarts      ErpCart[]
 }
 
 // Design Ref: docs/02-design/features/multi-store-support.design.md Phase 3
@@ -142,4 +143,26 @@ model ErpOrder {
 
   @@index([storeId, createdAt])
   @@index([status])
+}
+
+// 전산(ERP) "물건 담기" -> POS 플러그인 폴링 연동 (POS-CART-BRIDGE §1). ErpOrder(토스 Open API로
+// 주문 자체를 생성하는 기존 경로)와는 완전히 별개다 -- 그 경로로 만든 주문은 POS에서 결제할 수
+// 없다는 게 실증됐다(docs/ERP연동-결제경로-조사결과.md). 이 테이블은 "전산이 담아둔 장바구니"를
+// POS 플러그인이 가져가 posPluginSdk.draftOrder.addLineItem()으로 POS 자체 장바구니에 직접 옮겨
+// 담게 하는 중계용 큐일 뿐, 토스와는 아무것도 통신하지 않는다.
+model ErpCart {
+  id           String    @id @default(uuid())
+  storeId      String
+  store        Store     @relation(fields: [storeId], references: [id])
+  referenceId  String    @unique // 전산 측 참조번호 = 멱등키
+  itemsJson    String              // items 배열 원본 JSON
+  totalAmount  Int
+  memo         String?
+  autoPay      Boolean   @default(true)
+  status       String    @default("pending")  // pending | loaded | failed | cancelled
+  errorMessage String?
+  createdAt    DateTime  @default(now())
+  loadedAt     DateTime?
+
+  @@index([storeId, status, createdAt])
 }

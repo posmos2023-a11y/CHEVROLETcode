@@ -7,3 +7,10 @@ node_modules/
 backend/.env
 backend/prisma/dev.db
 backend/prisma/dev.db-journal
+
+# ERP 시뮬레이터 설정 파일 - ERP 토큰(비밀값)이 들어가므로 커밋 금지
+erp-simulator/config.ini
+
+# 파이썬 바이트코드 캐시. 앱을 한 번 실행하기만 해도 생겨서, 없으면 매번 커밋 대상으로 뜬다.
+__pycache__/
+*.pyc

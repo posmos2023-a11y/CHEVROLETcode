@@ -1,0 +1,306 @@
+/*
+  쉐보레 정비 전산 시뮬레이터 - 스타일시트.
+
+  왜 QSS를 파일로 분리했나: 데모/검증 도구라도 "장난감 앱"처럼 보이면 MOU 자리에서
+  신뢰를 못 준다. 흰 배경 + 회색 구분선 + 토스 블루 강조색 한 가지로 통일해서
+  실제 업무용 전산 프로그램 톤을 흉내낸다. main.py 코드에 인라인으로 흩어놓지
+  않고 여기 모아둬야 나중에 색만 바꾸는 디자인 수정이 쉽다.
+*/
+
+* {
+    font-family: "맑은 고딕", "Malgun Gothic", sans-serif;
+}
+
+QMainWindow, QWidget {
+    background-color: #FFFFFF;
+    color: #191F28;
+}
+
+/* ---------------- 상단 바 ---------------- */
+
+#TopBar {
+    background-color: #FFFFFF;
+    border-bottom: 1px solid #E5E8EB;
+}
+
+#AppTitle {
+    font-size: 16px;
+    font-weight: 700;
+    color: #191F28;
+}
+
+#StoreCodeBadge {
+    padding: 4px 10px;
+    background-color: #F2F4F6;
+    border-radius: 6px;
+    color: #4E5968;
+    font-size: 12px;
+    font-weight: 600;
+}
+
+#SettingsButton {
+    min-height: 32px;
+    padding: 0 16px;
+    background-color: #FFFFFF;
+    border: 1px solid #D1D6DB;
+    border-radius: 6px;
+    color: #333D4B;
+    font-weight: 600;
+}
+
+#SettingsButton:hover {
+    background-color: #F2F4F6;
+}
+
+/* ---------------- 좌측 패널 ---------------- */
+
+#FieldLabel {
+    color: #4E5968;
+    font-weight: 600;
+    min-width: 52px;
+}
+
+QLineEdit {
+    border: 1px solid #D1D6DB;
+    border-radius: 6px;
+    padding: 6px 10px;
+    min-height: 24px;
+    background-color: #FFFFFF;
+    selection-background-color: #3182F6;
+}
+
+QLineEdit:focus {
+    border: 1px solid #3182F6;
+}
+
+#SearchInput {
+    min-height: 30px;
+}
+
+QTabBar#CategoryTabs {
+    background: transparent;
+}
+
+QTabBar#CategoryTabs::tab {
+    padding: 8px 18px;
+    margin-right: 4px;
+    background-color: #F2F4F6;
+    color: #4E5968;
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+    font-weight: 600;
+    min-height: 20px;
+}
+
+QTabBar#CategoryTabs::tab:selected {
+    background-color: #3182F6;
+    color: #FFFFFF;
+}
+
+QTabBar#CategoryTabs::tab:hover:!selected {
+    background-color: #E8F1FE;
+}
+
+/* ---------------- 테이블 공통 ---------------- */
+
+QTableWidget {
+    border: 1px solid #E5E8EB;
+    border-radius: 8px;
+    gridline-color: #EFF1F3;
+    selection-background-color: #E8F1FE;
+    selection-color: #191F28;
+    alternate-background-color: #FAFBFC;
+}
+
+QTableWidget::item {
+    padding-left: 6px;
+    border-bottom: 1px solid #F2F4F6;
+}
+
+QHeaderView::section {
+    background-color: #F9FAFB;
+    color: #6B7684;
+    font-weight: 700;
+    padding: 8px 6px;
+    border: none;
+    border-bottom: 1px solid #E5E8EB;
+}
+
+#AddButton {
+    min-height: 28px;
+    padding: 0 12px;
+    background-color: #FFFFFF;
+    border: 1px solid #3182F6;
+    border-radius: 6px;
+    color: #3182F6;
+    font-weight: 700;
+}
+
+#AddButton:hover {
+    background-color: #E8F1FE;
+}
+
+/* ---------------- 우측 장바구니 패널 ---------------- */
+
+#CartPanel {
+    background-color: #FBFCFD;
+    border-left: 1px solid #E5E8EB;
+}
+
+#SectionTitle {
+    font-size: 15px;
+    font-weight: 700;
+    color: #191F28;
+}
+
+#StepButton {
+    min-width: 24px;
+    max-width: 24px;
+    min-height: 24px;
+    max-height: 24px;
+    border: 1px solid #D1D6DB;
+    border-radius: 4px;
+    background-color: #FFFFFF;
+    color: #333D4B;
+    font-weight: 700;
+}
+
+#StepButton:hover {
+    background-color: #F2F4F6;
+}
+
+QSpinBox {
+    border: 1px solid #D1D6DB;
+    border-radius: 4px;
+    padding: 2px;
+    background-color: #FFFFFF;
+}
+
+#RemoveButton {
+    min-width: 26px;
+    max-width: 26px;
+    min-height: 26px;
+    max-height: 26px;
+    border: none;
+    border-radius: 13px;
+    background-color: #F2F4F6;
+    color: #8B95A1;
+    font-weight: 700;
+}
+
+#RemoveButton:hover {
+    background-color: #FEECEC;
+    color: #D93025;
+}
+
+#TotalsFrame {
+    background-color: #F2F4F6;
+    border-radius: 8px;
+}
+
+#TotalLabel {
+    color: #4E5968;
+    font-size: 13px;
+}
+
+#TotalBigLabel {
+    color: #191F28;
+    font-size: 16px;
+    font-weight: 700;
+}
+
+#TotalValue {
+    color: #3182F6;
+    font-size: 22px;
+    font-weight: 800;
+}
+
+QCheckBox {
+    font-weight: 600;
+    color: #333D4B;
+    spacing: 8px;
+}
+
+/* ---------------- 버튼 ---------------- */
+
+QPushButton {
+    min-height: 36px;
+    border-radius: 8px;
+    font-weight: 700;
+    padding: 0 16px;
+}
+
+#PrimaryButton {
+    background-color: #3182F6;
+    color: #FFFFFF;
+    font-size: 14px;
+}
+
+#PrimaryButton:hover {
+    background-color: #1B64DA;
+}
+
+#PrimaryButton:disabled {
+    background-color: #C9D6E5;
+    color: #FFFFFF;
+}
+
+#SecondaryButton {
+    background-color: #FFFFFF;
+    border: 1px solid #D1D6DB;
+    color: #4E5968;
+}
+
+#SecondaryButton:hover {
+    background-color: #F2F4F6;
+}
+
+/* ---------------- 하단 상태줄 ---------------- */
+
+QStatusBar {
+    background-color: #F9FAFB;
+    border-top: 1px solid #E5E8EB;
+    min-height: 34px;
+}
+
+#StatusLabel {
+    padding-left: 8px;
+    font-size: 13px;
+}
+
+#StatusCancelButton {
+    min-height: 26px;
+    padding: 0 14px;
+    margin-right: 8px;
+    background-color: #FFFFFF;
+    border: 1px solid #D1D6DB;
+    border-radius: 6px;
+    color: #4E5968;
+    font-weight: 600;
+}
+
+#StatusCancelButton:hover {
+    background-color: #F2F4F6;
+}
+
+/* 복원 버튼은 [취소]와 나란히 뜨지만 성격이 반대(되살리기)라, 강조색 테두리로 구분한다.
+   실패 직후에만 잠깐 보이는 버튼이라 눈에 띄어야 직원이 놓치지 않는다. */
+#StatusRestoreButton {
+    min-height: 26px;
+    padding: 0 14px;
+    margin-right: 8px;
+    background-color: #EAF3FF;
+    border: 1px solid #3182F6;
+    border-radius: 6px;
+    color: #1B64DA;
+    font-weight: 700;
+}
+
+#StatusRestoreButton:hover {
+    background-color: #DCEAFF;
+}
+
+#HintLabel {
+    color: #8B95A1;
+    font-size: 12px;
+}

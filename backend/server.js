@@ -54,6 +54,12 @@ const {
   setStoreErpCode,
   findErpOrderByReference,
   upsertErpOrder,
+  createErpCart,
+  findErpCartByReference,
+  listPendingErpCarts,
+  markErpCartLoaded,
+  markErpCartFailed,
+  cancelErpCart,
 } = require('./src/store')
 const { createTossDraftOrder } = require('./src/tossOrderClient')
 const { PostgresRateLimitStore } = require('./src/rateLimitStore')
@@ -845,6 +851,80 @@ app.get('/api/pos/queue', posQueueReadLimiter, posAuthLimiter, requireStoreToken
   })
 }))
 
+// --- 쉐보레 전산(ERP) "물건 담기" -> POS 플러그인 장바구니 중계 (POS-CART-BRIDGE §1) ---
+// POS 플러그인이 5초 폴링으로 가져가 posPluginSdk.draftOrder.addLineItem()에 그대로 넘길 수 있게
+// items를 파싱해서 내려준다. queue 폴링과 마찬가지로 인스턴스 기준 메모리 레이트리밋
+// (posQueueReadLimiter)으로 충분하다 -- 이미 토큰 인증이 붙어 있고, 폴링마다 DB round-trip을
+// 늘릴 이유가 없다.
+app.get('/api/pos/erp-carts', posQueueReadLimiter, posAuthLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  const rows = await listPendingErpCarts(req.store.id, 20)
+  const carts = []
+  for (const row of rows) {
+    let items
+    try {
+      items = JSON.parse(row.itemsJson)
+    } catch (e) {
+      // 손상된 itemsJson 한 건 때문에 이 매장의 폴링 응답 전체가 500으로 죽으면 안 된다 --
+      // 그 건만 건너뛰고 로그로 남겨서 나중에 원인을 조사할 수 있게 한다.
+      logger.error('[pos] ErpCart.itemsJson 파싱 실패 -- 이 건은 건너뜁니다.', { cartId: row.id, error: e.message })
+      continue
+    }
+    carts.push({
+      id: row.id,
+      referenceId: row.referenceId,
+      items,
+      totalAmount: row.totalAmount,
+      memo: row.memo,
+      autoPay: row.autoPay,
+      createdAt: row.createdAt,
+    })
+  }
+  return res.json({ ok: true, carts })
+}))
+
+// POS 플러그인이 addLineItem() 결과를 되돌려준다. posLimiter를 쓴다 -- 폴링(조회)이 아니라
+// "이 매장 전체 기준으로 한도를 두는 게 의미 있는" 상태 변경 액션이라 posQueueReadLimiter가 아닌
+// 기존 posLimiter(DB 기반)와 맞춘다.
+app.post('/api/pos/erp-carts/:id/consume', posLimiter, posAuthLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  const result = req.body?.result
+  if (result !== 'loaded' && result !== 'failed') {
+    return res.status(400).json({ ok: false, error: "result는 'loaded' 또는 'failed'여야 합니다." })
+  }
+
+  // 다른 매장 소유의 cart를 건드리지 못하게 storeId까지 확인한다 -- id만으로 조회하면 다른 매장
+  // POS 토큰으로도 남의 장바구니 상태를 바꿀 수 있게 되어버린다.
+  const cart = await prisma.erpCart.findUnique({ where: { id: req.params.id } })
+  if (!cart || cart.storeId !== req.store.id) {
+    return res.status(404).json({ ok: false, error: '장바구니를 찾을 수 없습니다.' })
+  }
+
+  if (cart.status !== 'pending') {
+    // POS가 네트워크 오류 등으로 같은 consume을 재시도해도 안전해야 한다 -- 이미 처리된 건이면
+    // 실패로 취급하지 않고 그대로 알려준다.
+    return res.json({ ok: true, alreadyProcessed: true, status: cart.status })
+  }
+
+  // 위에서 pending을 확인했더라도 이 사이에 다른 요청(POS 단말기 2대가 동시에 consume하는 경우)이
+  // 먼저 전이시켰을 수 있다 -- markErpCartLoaded/Failed 자체가 원자적 updateMany라 그 경쟁을
+  // 최종적으로 판정한다. 반환값(changed)이 false면 내가 아니라 그 사이의 다른 요청이 이겼다는
+  // 뜻이므로, 최신 상태를 다시 읽어 alreadyProcessed로 응답한다.
+  let changed
+  if (result === 'loaded') {
+    changed = await markErpCartLoaded(cart.id)
+  } else {
+    const errorMessage = req.body?.errorMessage !== undefined && req.body?.errorMessage !== null
+      ? String(req.body.errorMessage).slice(0, 500)
+      : null
+    changed = await markErpCartFailed(cart.id, errorMessage)
+  }
+
+  if (!changed) {
+    const latest = await prisma.erpCart.findUnique({ where: { id: cart.id } })
+    return res.json({ ok: true, alreadyProcessed: true, status: latest?.status })
+  }
+  return res.json({ ok: true, alreadyProcessed: false, status: result })
+}))
+
 // 특정 손님을 호출한다. POS 탭앱 쪽에서 "이 번호를 탭하면 바로 호출"이 되지 않도록
 // 반드시 명시적인 확인 동작(예: 2단계 확인 버튼) 뒤에만 이 엔드포인트를 호출해야 한다 —
 // 서버는 그 UX를 강제할 수 없으므로 프론트(탭앱) 쪽 책임이다.
@@ -1502,6 +1582,109 @@ app.get('/api/erp/draft-orders/:referenceId', erpLimiter, requireErpToken, async
     createdAt: order.createdAt,
     paidAt: order.paidAt,
   })
+}))
+
+// --- 쉐보레 전산(ERP) "물건 담기" -> POS 플러그인 장바구니 중계 (POS-CART-BRIDGE §1) ---
+// 위 /api/erp/draft-orders(토스 Open API로 주문 자체를 생성)와는 완전히 별개의 새 경로다 -- 그
+// 경로로 만든 주문은 POS에서 결제할 수 없다는 게 실증됐다(docs/ERP연동-결제경로-조사결과.md).
+// 여기는 토스와 아무것도 통신하지 않는다: 전산이 장바구니를 이 테이블(ErpCart)에 올려두면,
+// POS 플러그인이 GET /api/pos/erp-carts로 가져가 posPluginSdk.draftOrder.addLineItem()으로 POS
+// 자체 장바구니에 직접 옮겨 담고 startPayment()를 부른다. 인증/레이트리밋은 기존 draft-orders와
+// 동일하게 erpLimiter + requireErpToken(X-ERP-Token)을 그대로 재사용한다.
+
+app.post('/api/erp/carts', erpLimiter, requireErpToken, asyncHandler(async (req, res) => {
+  // validateDraftOrderBody를 그대로 재사용한다 -- storeCode/referenceId/items/totalAmount/memo
+  // 검증 규칙이 draft-orders와 완전히 동일해야 하고(전산 쪽이 같은 바디 스키마로 두 경로를
+  // 오갈 수 있어야 함), 이 검증 로직을 복제하면 나중에 한쪽만 고쳐서 규칙이 어긋날 위험이 있다.
+  const parsed = validateDraftOrderBody(req.body)
+  if (parsed.error) {
+    return res.status(400).json({ ok: false, error: parsed.error })
+  }
+  const { storeCode, referenceId, items, totalAmount, memo } = parsed
+  // autoPay는 draft-orders에는 없는 필드라 validateDraftOrderBody가 모르는 값이다 -- 여기서만
+  // 별도로 파싱한다. 안 보내면 true(담자마자 자동 결제 시도)가 기본값이다.
+  // Boolean()을 그대로 쓰지 않는 이유: 외부 전산이 JSON 불리언 대신 문자열 "false"를 보내는 일이
+  // 흔한데 Boolean('false')는 true라서, "자동결제 끄기"가 조용히 무시된 채 결제창이 떠버린다.
+  // 돈이 오가는 분기라 명시적으로 거짓값 목록을 나열한다.
+  const autoPayRaw = req.body?.autoPay
+  const autoPay = autoPayRaw === undefined || autoPayRaw === null
+    ? true
+    : !(autoPayRaw === false || autoPayRaw === 'false' || autoPayRaw === 0 || autoPayRaw === '0')
+
+  const store = await findStoreByErpCode(storeCode)
+  if (!store) {
+    return res.status(404).json({ ok: false, error: '등록되지 않은 매장 코드입니다.' })
+  }
+  if (store.status !== 'active') {
+    return res.status(403).json({ ok: false, error: '비활성화된 가맹점입니다.' })
+  }
+
+  // referenceId는 매장별이 아니라 **전역** 유일이다(@unique). 그래서 다른 매장이 이미 쓴 번호가
+  // 들어오면 아래 멱등 분기가 그 매장의 장바구니를 duplicate로 돌려주게 되고, 보낸 쪽은 성공
+  // 응답을 받았는데 실제로는 자기 매장에 아무것도 담기지 않는다 -- 조용히 사라지는 게 가장 나쁜
+  // 실패라 명시적으로 막는다. cancelled 건도 마찬가지다: 그냥 두면 createErpCart(upsert)가 그 로우의
+  // storeId를 다른 매장으로 바꿔치기해버린다.
+  const existingAnyStore = await findErpCartByReference(referenceId)
+  if (existingAnyStore && existingAnyStore.storeId !== store.id) {
+    return res.status(409).json({ ok: false, error: '이미 다른 매장에서 사용한 referenceId입니다.' })
+  }
+
+  // 멱등: 같은 referenceId가 이미 있고 cancelled가 아니면(pending/loaded/failed 어느 쪽이든)
+  // 그 상태를 그대로 돌려준다 -- 새로 만들면 POS가 같은 장바구니를 두 번 집어갈 수 있다.
+  // cancelled였다면 전산이 다시 담는 것이므로 새로 생성한다(취소된 건 재사용하지 않는다).
+  const existing = await findErpCartByReference(referenceId)
+  if (existing && existing.status !== 'cancelled') {
+    return res.json({ ok: true, cartId: existing.id, referenceId, status: existing.status, duplicate: true })
+  }
+
+  const cart = await createErpCart({
+    storeId: store.id,
+    referenceId,
+    itemsJson: JSON.stringify(items),
+    totalAmount,
+    memo,
+    autoPay,
+  })
+  return res.status(201).json({ ok: true, cartId: cart.id, referenceId, status: cart.status })
+}))
+
+// 전산이 담아둔 장바구니의 처리 상태(pending/loaded/failed/cancelled)를 재조회할 수 있게 한다.
+app.get('/api/erp/carts/:referenceId', erpLimiter, requireErpToken, asyncHandler(async (req, res) => {
+  const cart = await findErpCartByReference(req.params.referenceId)
+  if (!cart) {
+    return res.status(404).json({ ok: false, error: '요청하신 장바구니를 찾을 수 없습니다.' })
+  }
+  return res.json({
+    ok: true,
+    referenceId: cart.referenceId,
+    status: cart.status,
+    totalAmount: cart.totalAmount,
+    autoPay: cart.autoPay,
+    createdAt: cart.createdAt,
+    loadedAt: cart.loadedAt,
+    errorMessage: cart.errorMessage,
+  })
+}))
+
+// 전산이 주문을 취소할 때 쓴다. POS가 이미 가져간(loaded) 뒤라면 취소해도 POS 장바구니에는 이미
+// 반영돼 있으므로 조용히 넘기지 않고 409로 알려준다 -- 전산 쪽이 "취소했는데 실제로는 결제가
+// 진행 중일 수 있다"는 걸 알아야 한다.
+app.post('/api/erp/carts/:referenceId/cancel', erpLimiter, requireErpToken, asyncHandler(async (req, res) => {
+  const cart = await findErpCartByReference(req.params.referenceId)
+  if (!cart) {
+    return res.status(404).json({ ok: false, error: '요청하신 장바구니를 찾을 수 없습니다.' })
+  }
+  if (cart.status !== 'pending') {
+    return res.status(409).json({ ok: false, error: '대기중인 장바구니만 취소할 수 있습니다.', status: cart.status })
+  }
+  const changed = await cancelErpCart(req.params.referenceId)
+  if (!changed) {
+    // 조회와 취소 사이에 다른 요청(POS consume 등)이 먼저 상태를 바꿨을 수 있다 -- 그 사이 값을
+    // 다시 읽어 최신 상태를 알려준다.
+    const latest = await findErpCartByReference(req.params.referenceId)
+    return res.status(409).json({ ok: false, error: '대기중인 장바구니만 취소할 수 있습니다.', status: latest?.status })
+  }
+  return res.json({ ok: true, status: 'cancelled' })
 }))
 
 // --- 내부 배치 작업 (Cloud Scheduler 전용) ---
