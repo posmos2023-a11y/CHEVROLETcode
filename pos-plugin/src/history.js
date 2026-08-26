@@ -22,6 +22,20 @@ const promoEl = () => document.getElementById('history-promo')
 let shownCarNumber = ''
 
 export function initHistory(injected) {
+  // 최근 목록의 줄을 누르면 그 차량번호로 상세 조회한다. 목록은 다시 그려지므로 위임으로 받는다.
+  const bodyHost = document.getElementById('history-body')
+  if (bodyHost) {
+    bodyHost.addEventListener('click', (e) => {
+      const row = e.target.closest('.history-recent-row')
+      if (!row) return
+      const car = row.dataset.car
+      if (!car) return
+      const input = inputEl()
+      if (input) input.value = car
+      search(car)
+    })
+  }
+
   deps = injected
   const form = document.getElementById('history-form')
   if (!form) return
@@ -64,6 +78,17 @@ const STATUS_LABEL = {
   completed: '정비완료', cancelled: '취소됨',
 }
 
+// 이력 화면에는 두 갈래의 비동기 요청이 들어온다 — 화면에 들어갈 때 뜨는 최근 목록과,
+// 차량번호 검색. 둘이 겹치면 늦게 도착한 쪽이 이긴다. 대기 카드의 [이력]을 누르면 화면 전환과
+// 검색이 거의 동시에 일어나므로 실제로 겹친다. 순번을 붙여 마지막 요청만 화면에 쓰게 한다.
+let renderSeq = 0
+
+function claimRender() {
+  renderSeq += 1
+  const mine = renderSeq
+  return () => mine === renderSeq
+}
+
 function renderVisits(carNumber, visits) {
   const body = bodyEl()
   if (!body) return
@@ -103,7 +128,74 @@ function renderVisits(carNumber, visits) {
   }).join('')
 }
 
+// 화면에 들어올 때 부른다. 차량번호를 모르는 상태에서도 뭔가 보여야 이력 화면이다.
+export async function loadRecentHistory() {
+  const isLatest = claimRender()
+  const body = bodyEl()
+  if (!body) return
+  const input = inputEl()
+  // 검색어가 남아 있으면 그 차를 계속 보여준다 — 다른 화면 갔다 오면서 목록으로 튕기지 않게.
+  if (input && input.value.trim()) {
+    search(input.value)
+    return
+  }
+  const promo = promoEl()
+  if (promo) promo.hidden = true
+  body.innerHTML = '<div class="empty"><div class="empty-copy">불러오는 중...</div></div>'
+  try {
+    const { ok, status, body: res } = await deps.apiGet('/api/pos/history/recent')
+    if (!isLatest()) return
+    if (!ok) {
+      if (status === 401) {
+        deps.onUnauthorized(res.error)
+        return
+      }
+      body.innerHTML = `<div class="empty"><div class="empty-copy">${deps.escapeHtml(res.error || '최근 이력을 불러오지 못했습니다.')}</div></div>`
+      return
+    }
+    renderRecent(res.visits || [])
+  } catch {
+    if (!isLatest()) return
+    body.innerHTML = '<div class="empty"><div class="empty-copy">네트워크 연결을 확인한 뒤 다시 시도해주세요.</div></div>'
+  }
+}
+
+function renderRecent(visits) {
+  const body = bodyEl()
+  if (!body) return
+  if (!visits.length) {
+    body.innerHTML = `
+      <div class="empty">
+        <div class="empty-mark" aria-hidden="true">\u2713</div>
+        <div class="empty-title">아직 정비 이력이 없습니다</div>
+        <div class="empty-copy">정비가 끝나거나 전산 주문을 담으면 여기에 쌓입니다. 위에 차량번호를 넣어 찾아볼 수도 있습니다.</div>
+      </div>
+    `
+    return
+  }
+  body.innerHTML = `
+    <div class="history-recent-head">최근 ${visits.length}건 · 차량을 누르면 그 차의 전체 이력을 봅니다</div>
+    ${visits.map((v) => {
+      const names = (v.items || []).map((i) => i.name).join(', ')
+      return `
+        <button class="history-recent-row" type="button" data-car="${deps.escapeHtml(v.carNumber || '')}">
+          <span class="history-recent-car">${deps.escapeHtml(v.carNumber || '-')}</span>
+          <span class="history-recent-mid">
+            <span class="history-recent-desc">${deps.escapeHtml(v.serviceType || names || '정비')}</span>
+            <span class="history-recent-date">${deps.escapeHtml(formatDate(v.at))}</span>
+          </span>
+          <span class="history-recent-right">
+            ${v.totalAmount ? `<span class="history-recent-won">${formatWon(v.totalAmount)}</span>` : ''}
+            ${v.paid ? '<span class="history-badge paid">결제완료</span>' : ''}
+          </span>
+        </button>
+      `
+    }).join('')}
+  `
+}
+
 async function search(rawCarNumber) {
+  const isLatest = claimRender()
   const carNumber = String(rawCarNumber || '').trim()
   const body = bodyEl()
   if (!carNumber) {
@@ -124,6 +216,7 @@ async function search(rawCarNumber) {
       body.innerHTML = `<div class="empty"><div class="empty-copy">${deps.escapeHtml(res.error || '이력을 불러오지 못했습니다.')}</div></div>`
       return
     }
+    if (!isLatest()) return
     shownCarNumber = carNumber
     renderVisits(carNumber, res.visits || [])
     refreshPromo(carNumber)

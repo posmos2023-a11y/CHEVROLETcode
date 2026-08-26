@@ -1029,6 +1029,48 @@ async function getPosDailySummary(storeId, serviceDate, dateStart, dateEnd) {
 //
 // 전산 주문(ErpCart)을 함께 붙여야 "무엇을 갈았는지"가 나온다. 예약만으로는 정비 항목
 // (serviceType) 한 줄뿐이라 실제로 어떤 부품이 들어갔는지 알 수 없다.
+// 매장의 최근 정비 이력. 정비 이력 화면을 열었을 때 빈 화면 대신 보여준다 —
+// 차량번호를 이미 알고 있을 때만 쓸 수 있는 화면은 이력 화면이 아니라 검색창이다.
+//
+// 차량번호가 없는 건은 뺀다. 이력에서 차를 특정할 수 없으면 직원에게 아무 쓸모가 없고,
+// 목록만 길어진다.
+async function listRecentRepairHistory(storeId, limit = 20) {
+  const take = Math.min(Math.max(Number(limit) || 20, 1), 50)
+  // 보관기간(3년)과 별개로, 화면에 필요한 건 최근 것뿐이다. 범위를 좁혀 인덱스를 타게 한다.
+  const since = new Date(Date.now() - 180 * 24 * 60 * 60 * 1000)
+
+  const carts = await prisma.erpCart.findMany({
+    where: {
+      storeId,
+      status: { in: ['loaded', 'paid'] },
+      carNumber: { not: null },
+      createdAt: { gte: since },
+    },
+    orderBy: { createdAt: 'desc' },
+    take,
+    select: {
+      id: true, carNumber: true, itemsJson: true, totalAmount: true,
+      status: true, createdAt: true, paidAt: true, reservationId: true,
+    },
+  })
+
+  // 전산 주문 없이 정비만 끝난 건도 이력이다(부품 없이 점검만 한 경우).
+  const reservations = await prisma.reservation.findMany({
+    where: {
+      storeId,
+      status: 'completed',
+      anonymizedAt: null,
+      completedAt: { gte: since },
+      id: { notIn: carts.map((c) => c.reservationId).filter(Boolean) },
+    },
+    orderBy: { completedAt: 'desc' },
+    take,
+    select: { id: true, carNumber: true, serviceType: true, serviceDate: true, completedAt: true },
+  })
+
+  return { carts, reservations }
+}
+
 async function findRepairHistoryByCarNumber(storeId, carNumber, limit = 10) {
   const value = String(carNumber || '').replace(/[\s-]/g, '').trim()
   if (!value) return []
@@ -1397,6 +1439,7 @@ module.exports = {
   listErpCarts,
   getPosDailySummary,
   findRepairHistoryByCarNumber,
+  listRecentRepairHistory,
   findMarketingContactByCarNumber,
   findLastPromoSend,
   recordPromoSend,

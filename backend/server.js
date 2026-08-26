@@ -69,6 +69,7 @@ const {
   listErpCarts,
   getPosDailySummary,
   findRepairHistoryByCarNumber,
+  listRecentRepairHistory,
   findMarketingContactByCarNumber,
   findLastPromoSend,
   recordPromoSend,
@@ -1921,6 +1922,42 @@ app.post('/api/pos/promo/send', posIpFloodLimiter, posLimiter, requireStoreToken
     })
   }
   return res.json({ ok: true })
+}))
+
+// 매장의 최근 정비 이력. 이력 화면을 열자마자 보여줄 목록이다.
+//
+// 개별 조회와 같은 성격의 자료이므로 돌려주는 항목도 똑같이 최소로 한다 — 전화번호는 없다.
+app.get('/api/pos/history/recent', posIpFloodLimiter, posQueueReadLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  const { carts, reservations } = await listRecentRepairHistory(req.store.id, 20)
+
+  const visits = []
+  for (const c of carts) {
+    let items = []
+    try { items = JSON.parse(c.itemsJson) } catch { /* 손상된 건은 금액만 보여준다 */ }
+    visits.push({
+      kind: 'order',
+      carNumber: c.carNumber,
+      at: c.paidAt || c.createdAt,
+      paid: c.status === 'paid',
+      serviceType: null,
+      totalAmount: c.totalAmount,
+      items: items.map((i) => ({ name: i.name, quantity: i.quantity })),
+    })
+  }
+  for (const r of reservations) {
+    visits.push({
+      kind: 'reservation',
+      carNumber: r.carNumber,
+      at: r.completedAt,
+      paid: false,
+      serviceType: r.serviceType,
+      totalAmount: 0,
+      items: [],
+    })
+  }
+  visits.sort((a, b) => new Date(b.at) - new Date(a.at))
+
+  return res.json({ ok: true, visits: visits.slice(0, 20) })
 }))
 
 // 차량번호로 정비 이력을 조회한다. 직원이 "이 차 지난번에 뭐 갈았지?"를 POS에서 바로 본다.

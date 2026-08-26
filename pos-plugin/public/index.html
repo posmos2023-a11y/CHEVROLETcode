@@ -652,6 +652,57 @@
 
   .history-badge.paid { background: var(--green-soft); color: #008b5a; }
 
+  /* 최근 이력 목록. 한 줄에 차량번호·내용·금액이 한눈에 들어와야 직원이 스캔하듯 훑는다. */
+  .history-recent-head {
+    padding: 4px 2px 10px;
+    font-size: 12px;
+    color: var(--sub);
+  }
+  .history-recent-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    width: 100%;
+    min-height: 56px;
+    padding: 10px 14px;
+    margin-bottom: 8px;
+    border: 1px solid var(--line);
+    border-radius: 13px;
+    background: var(--surface);
+    text-align: left;
+    cursor: pointer;
+  }
+  .history-recent-row:hover { background: var(--canvas); }
+  .history-recent-car {
+    flex: 0 0 auto;
+    min-width: 84px;
+    font-size: 15px;
+    font-weight: 800;
+    letter-spacing: -0.04em;
+  }
+  .history-recent-mid {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .history-recent-desc {
+    font-size: 13px;
+    color: var(--ink);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .history-recent-date { font-size: 12px; color: var(--sub); }
+  .history-recent-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 0 0 auto;
+  }
+  .history-recent-won { font-size: 13px; font-weight: 700; }
+
   .history-service { margin-top: 5px; color: var(--sub); font-size: 13px; letter-spacing: -0.03em; }
 
   .history-items { margin: 8px 0 0; padding-left: 18px; color: var(--sub); font-size: 13px; line-height: 1.7; }

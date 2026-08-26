@@ -8,7 +8,7 @@ import { posPluginSdk } from '@tossplace/pos-plugin-sdk'
 import { initErpCarts, refreshErpCarts, applyErpCarts } from './erpCarts.js'
 // 차량번호로 지난 정비 내역을 보는 화면. 정비소에서 가장 자주 나오는 질문이라 대기 카드에서
 // 바로 열 수 있게 해뒀다.
-import { initHistory, openHistoryFor } from './history.js'
+import { initHistory, openHistoryFor, loadRecentHistory } from './history.js'
 // 좌측 메뉴와 화면 전환. 화면을 나누면 전산 주문이 메뉴 뒤로 숨는데, 그때 새 주문을
 // 놓치지 않게 배지와 토스트로 알리는 것도 이 모듈이 맡는다.
 import { initNav, switchTo, registerViewLoader, updateBadges, notifyNewErpCarts } from './nav.js'
@@ -546,6 +546,7 @@ initHistory({ apiGet, apiPost, notify, escapeHtml, onUnauthorized: handleUnautho
 initNav({ notify })
 
 // 오늘 현황은 폴링 대상이 아니다 — 화면을 열 때와 새로고침을 누를 때만 부른다.
+registerViewLoader('history', loadRecentHistory)
 registerViewLoader('today', loadTodaySummary)
 registerViewLoader('settings', renderSettings)
 

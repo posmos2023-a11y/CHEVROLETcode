@@ -1653,6 +1653,92 @@ testSerial('POS 오늘 현황: 다른 매장 숫자가 섞이지 않는다', asy
   assert.equal(res.body.received, 0)
 })
 
+// --- 최근 정비 이력 ------------------------------------------------------------
+// 이력 화면을 열자마자 보이는 목록. 이게 없으면 차량번호를 이미 아는 직원만 쓸 수 있는
+// 검색창이라 "이력이 안 남는다"로 읽힌다.
+
+function getRecent(store) {
+  return request(app).get('/api/pos/history/recent').set('X-Store-Token', store.posToken)
+}
+
+testSerial('최근 이력: 담긴 전산 주문이 차량번호와 함께 나온다', async () => {
+  const store = await createStore('recent-basic')
+  const body = validBody(store, { carNumber: '12가3456' })
+  assert.equal((await postCart(body)).status, 201)
+  const cartId = (await getPosCarts(store)).body.carts[0].id
+  await consumeCart(store, cartId, { result: 'loaded' })
+
+  const res = await getRecent(store)
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal(res.body.visits.length, 1)
+  const v = res.body.visits[0]
+  assert.equal(v.carNumber, '12가3456')
+  assert.equal(v.paid, false)
+  assert.equal(v.totalAmount, body.totalAmount)
+  assert.equal(v.items.length > 0, true)
+  assert.equal(typeof v.items[0].name, 'string')
+})
+
+testSerial('최근 이력: 아직 안 담은(pending) 주문은 나오지 않는다', async () => {
+  const store = await createStore('recent-pending')
+  assert.equal((await postCart(validBody(store, { carNumber: '12가3456' }))).status, 201)
+
+  const res = await getRecent(store)
+  assert.equal(res.body.visits.length, 0)
+})
+
+testSerial('최근 이력: 차량번호가 없는 주문은 나오지 않는다', async () => {
+  const store = await createStore('recent-nocar')
+  const body = validBody(store)
+  delete body.carNumber
+  assert.equal((await postCart(body)).status, 201)
+  const cartId = (await getPosCarts(store)).body.carts[0].id
+  await consumeCart(store, cartId, { result: 'loaded' })
+
+  const res = await getRecent(store)
+  assert.equal(res.body.visits.length, 0, '차를 특정할 수 없는 건은 이력에서 쓸모가 없다')
+})
+
+testSerial('최근 이력: 결제까지 끝난 건은 paid로 표시된다', async () => {
+  const store = await createStore('recent-paid')
+  assert.equal((await postCart(validBody(store, { carNumber: '12가3456' }))).status, 201)
+  const cartId = (await getPosCarts(store)).body.carts[0].id
+  await consumeCart(store, cartId, { result: 'loaded' })
+  await request(app).post(`/api/pos/erp-carts/${cartId}/paid`).set('X-Store-Token', store.posToken).send({})
+
+  const res = await getRecent(store)
+  assert.equal(res.body.visits.length, 1)
+  assert.equal(res.body.visits[0].paid, true)
+})
+
+testSerial('최근 이력: 다른 매장 건이 섞이지 않는다', async () => {
+  const storeA = await createStore('recent-a')
+  const storeB = await createStore('recent-b')
+  assert.equal((await postCart(validBody(storeA, { carNumber: '12가3456' }))).status, 201)
+  const cartId = (await getPosCarts(storeA)).body.carts[0].id
+  await consumeCart(storeA, cartId, { result: 'loaded' })
+
+  const res = await getRecent(storeB)
+  assert.equal(res.body.visits.length, 0)
+})
+
+testSerial('최근 이력: 전화번호는 절대 실려 나오지 않는다', async () => {
+  const store = await createStore('recent-privacy')
+  assert.equal((await postCart(validBody(store, { carNumber: '12가3456' }))).status, 201)
+  const cartId = (await getPosCarts(store)).body.carts[0].id
+  await consumeCart(store, cartId, { result: 'loaded' })
+
+  const res = await getRecent(store)
+  // 이용 목적은 "정비 이력 관리"다. 연락처는 그 목적에 필요하지 않으므로 나가면 안 된다.
+  assert.equal(JSON.stringify(res.body).includes('01012345678'), false)
+  assert.equal(JSON.stringify(res.body).includes('phone'), false)
+})
+
+testSerial('최근 이력: 매장 토큰 없이는 볼 수 없다', async () => {
+  const res = await request(app).get('/api/pos/history/recent')
+  assert.equal(res.status, 401)
+})
+
 testSerial('POS 오늘 현황: 매장 토큰 없이는 볼 수 없다', async () => {
   const res = await request(app).get('/api/pos/summary')
   assert.equal(res.status, 401)

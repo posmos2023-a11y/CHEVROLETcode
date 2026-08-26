@@ -373,7 +373,12 @@ async function runLoadCartToPos(cart) {
 
     // POS 장바구니는 순서가 있는 상태라 동시에 여러 addLineItem을 던졌을 때 어떤 순서로
     // 반영되는지 보장이 없다. 그래서 Promise.all이 아니라 for...of + await로 하나씩 순차 처리한다.
+    const total = (cart.items || []).length
+    let done = 0
     for (const item of cart.items || []) {
+      // 품목이 많으면(부품 열 개 넘는 경우가 있다) 순차 담기만으로도 몇 초가 걸린다.
+      // 몇 개 중 몇 개인지 보여야 직원이 멈춘 줄 알고 다시 누르지 않는다.
+      if (button) button.textContent = `담는 중... ${done}/${total}`
       const lineItem = buildLineItem({
         baseItem: base,
         title: item.name,
@@ -384,7 +389,9 @@ async function runLoadCartToPos(cart) {
       // addLineItem이 던지면 이 항목은 안 담긴 것이므로, 성공한 뒤에 되돌리기 목록에 넣는다.
       await draftOrder.addLineItem(lineItem)
       addedKeys.push(lineItem.key)
+      done += 1
     }
+    if (button) button.textContent = '서버에 알리는 중...'
 
     // ── 여기가 분기점이다 ──
     // 품목은 이미 POS 장바구니에 전부 들어갔다. 전산 입장에서 "옮기기"는 이 시점에 끝났다.
@@ -412,20 +419,25 @@ async function runLoadCartToPos(cart) {
       return
     }
 
-    // 보고가 끝났으니 화면에서 먼저 지운다. 결제 화면으로 넘어간 뒤에는 이 아래가 실행된다는
-    // 보장이 없기 때문이다.
-    removeCartFromView(cart.id)
-
     if (!cart.autoPay) {
+      removeCartFromView(cart.id)
       deps.notify('success', 'POS 장바구니에 담았습니다.')
       return
     }
 
-    deps.notify('success', '담았습니다. 결제 화면으로 넘어갑니다.')
+    // 이 아래 startPayment()는 POS가 결제 화면을 여는 동안 붙잡고 있어서 눈에 띄게 느리다.
+    // 그 시간 동안 카드를 미리 지워버리면 화면에 아무 표시도 없는 빈 구간이 생겨서 멈춘 것처럼
+    // 보인다. 버튼이 계속 무슨 일이 일어나는지 말하게 두고, 카드는 결제 화면이 열린 뒤에 지운다.
+    //
+    // 늦게 지워도 되살아나지 않는다 — 서버에는 이미 loaded로 보고돼서 다음 폴링에 안 실린다.
+    if (button) button.textContent = '결제 화면 여는 중...'
     try {
       await draftOrder.startPayment()
+      removeCartFromView(cart.id)
+      deps.notify('success', '담고 결제를 시작했습니다.')
     } catch (payError) {
       // 담기와 보고는 이미 끝난 뒤다. 되돌릴 것은 없고, 직접 결제하라고 알리기만 하면 된다.
+      removeCartFromView(cart.id)
       deps.notify('error', `결제 화면을 열지 못했습니다. [주문] 탭에서 직접 결제해주세요. (${payError.message || payError})`)
     }
   } catch (e) {
