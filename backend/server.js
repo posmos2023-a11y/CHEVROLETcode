@@ -67,6 +67,7 @@ const {
   markErpCartDismissed,
   markErpCartPaid,
   listErpCarts,
+  findRepairHistoryByCarNumber,
   completeReservationAfterPayment,
   findOpenReservationByCarNumber,
   cancelErpCart,
@@ -1790,6 +1791,59 @@ app.get('/api/erp/draft-orders/:referenceId', erpLimiter, requireErpToken, async
     createdAt: order.createdAt,
     paidAt: order.paidAt,
   })
+}))
+
+// 차량번호로 정비 이력을 조회한다. 직원이 "이 차 지난번에 뭐 갈았지?"를 POS에서 바로 본다.
+//
+// 손님에게 받은 동의의 이용 목적에 "정비 이력 관리"가 들어 있어야 쓸 수 있는 기능이다
+// (front-plugin의 동의 문구 참고). 목적 밖 이용이 되지 않도록 돌려주는 항목을 최소로 한다 —
+// 전화번호는 포함하지 않는다.
+app.get('/api/pos/history', posIpFloodLimiter, posQueueReadLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  const carNumber = String(req.query.carNumber || '').trim()
+  if (!carNumber) {
+    return res.status(400).json({ ok: false, error: '차량번호를 입력해주세요.' })
+  }
+
+  const { reservations, carts } = await findRepairHistoryByCarNumber(req.store.id, carNumber, 10)
+
+  // 방문 단위로 묶는다. 전산 주문은 예약에 이어져 있으면 그 예약 밑으로, 아니면 따로 세운다 —
+  // 예약 없이 그냥 온 손님도 정비는 받았으므로 이력에서 빠지면 안 된다.
+  const cartsByReservation = new Map()
+  const standalone = []
+  for (const c of carts) {
+    let items = []
+    try { items = JSON.parse(c.itemsJson) } catch { /* 손상된 건은 품목 없이 금액만 보여준다 */ }
+    const view = {
+      id: c.id,
+      items: items.map((i) => ({ name: i.name, quantity: i.quantity, unitPrice: i.unitPrice })),
+      totalAmount: c.totalAmount,
+      paid: c.status === 'paid',
+      at: c.paidAt || c.createdAt,
+    }
+    if (c.reservationId) {
+      const list = cartsByReservation.get(c.reservationId) || []
+      list.push(view)
+      cartsByReservation.set(c.reservationId, list)
+    } else {
+      standalone.push(view)
+    }
+  }
+
+  const visits = reservations.map((r) => ({
+    kind: 'reservation',
+    date: r.serviceDate,
+    serviceType: r.serviceType,
+    status: r.status,
+    at: r.completedAt || r.createdAt,
+    orders: cartsByReservation.get(r.id) || [],
+  }))
+  for (const c of standalone) {
+    visits.push({ kind: 'order', date: null, serviceType: null, status: null, at: c.at, orders: [c] })
+  }
+  // 최근 방문이 위로.
+  visits.sort((a, b) => new Date(b.at) - new Date(a.at))
+
+  return res.json({ ok: true, carNumber, visits: visits.slice(0, 10) })
 }))
 
 // POS에서 결제가 실제로 끝났을 때 탭앱이 알려준다(posPluginSdk.payment.on('paid')).

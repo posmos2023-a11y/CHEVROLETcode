@@ -935,6 +935,45 @@ async function markErpCartPaid(id, { paymentId, orderId }) {
   return result.count > 0
 }
 
+// 차량번호로 그 차의 정비 이력을 찾는다. POS 탭앱에서 직원이 "이 차 지난번에 뭐 갈았지?"를
+// 확인하는 용도다.
+//
+// 개인정보 관점에서 짚어둘 것:
+//   - 같은 매장(storeId) 것만 본다. 다른 매장 손님 이력은 보이지 않는다.
+//   - 보관기간이 지나 익명화된 건은 carNumber가 '삭제됨'으로 덮여 있어 애초에 검색되지 않는다.
+//     즉 파기 정책이 조회에도 그대로 적용된다 — 따로 거를 필요가 없다.
+//   - 전화번호는 돌려주지 않는다. 이력 확인에 필요 없고, 화면에 띄울 이유도 없다.
+//
+// 전산 주문(ErpCart)을 함께 붙여야 "무엇을 갈았는지"가 나온다. 예약만으로는 정비 항목
+// (serviceType) 한 줄뿐이라 실제로 어떤 부품이 들어갔는지 알 수 없다.
+async function findRepairHistoryByCarNumber(storeId, carNumber, limit = 10) {
+  const value = String(carNumber || '').replace(/[\s-]/g, '').trim()
+  if (!value) return []
+
+  const reservations = await prisma.reservation.findMany({
+    where: { storeId, carNumber: value, anonymizedAt: null },
+    orderBy: { createdAt: 'desc' },
+    take: Math.min(Math.max(Number(limit) || 10, 1), 50),
+    select: {
+      id: true, serviceType: true, serviceDate: true, status: true,
+      createdAt: true, completedAt: true,
+    },
+  })
+
+  // 같은 차의 전산 주문도 함께 본다(예약 없이 방문한 건도 잡힌다).
+  const carts = await prisma.erpCart.findMany({
+    where: { storeId, carNumber: value, status: { in: ['loaded', 'paid'] } },
+    orderBy: { createdAt: 'desc' },
+    take: 50,
+    select: {
+      id: true, reservationId: true, itemsJson: true, totalAmount: true,
+      status: true, createdAt: true, paidAt: true,
+    },
+  })
+
+  return { reservations, carts }
+}
+
 // 관리자 웹에서 전산 주문 이력을 보는 용도. 매장이 "전산에서 보냈는데 POS에 안 떴어요" 할 때
 // 본사가 확인할 방법이 지금까지 없었다 — 접수는 됐는지, POS가 가져갔는지, 실패했는지.
 // storeId가 없으면 전체(본사 관리자), 있으면 그 매장만 본다.
@@ -1250,6 +1289,7 @@ module.exports = {
   markErpCartDismissed,
   markErpCartPaid,
   listErpCarts,
+  findRepairHistoryByCarNumber,
   completeReservationAfterPayment,
   findOpenReservationByCarNumber,
   expireStaleErpCarts,

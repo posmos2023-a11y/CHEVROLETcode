@@ -554,6 +554,108 @@
   }
 
 
+  /* 정비 이력. 화면을 덮는 대신 목록 아래에 펼쳐지는 패널로 둔다 — POS는 터치라
+     모달을 띄우면 닫기 버튼을 못 찾고 헤매는 일이 잦다. */
+  .history-panel {
+    margin-top: 18px;
+    padding: 16px;
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    background: var(--surface);
+    box-shadow: var(--shadow);
+  }
+
+  .history-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 12px;
+  }
+
+  .history-head h2 { font-size: 17px; letter-spacing: -0.04em; }
+
+  .history-close {
+    width: 34px;
+    height: 34px;
+    padding: 0;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: var(--surface);
+    color: var(--sub);
+    font-size: 14px;
+    cursor: pointer;
+  }
+
+  .history-form { display: flex; gap: 8px; margin-bottom: 12px; }
+
+  .history-form input {
+    flex: 1 1 auto;
+    min-height: 44px;
+    padding: 0 12px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    font-size: 15px;
+  }
+
+  .history-form button {
+    min-height: 44px;
+    padding: 0 16px;
+    border: 0;
+    border-radius: 12px;
+    background: var(--blue);
+    color: #fff;
+    font-size: 14px;
+    font-weight: 700;
+    cursor: pointer;
+  }
+
+  .history-body { display: grid; gap: 10px; }
+
+  .history-visit {
+    padding: 14px;
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    background: var(--canvas);
+  }
+
+  .history-visit-top { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+  .history-date { font-size: 15px; font-weight: 750; letter-spacing: -0.04em; }
+
+  .history-badge {
+    display: inline-flex;
+    align-items: center;
+    min-height: 21px;
+    padding: 0 7px;
+    border-radius: 7px;
+    background: var(--blue-soft);
+    color: var(--blue-strong);
+    font-size: 11px;
+    font-weight: 700;
+  }
+
+  .history-badge.paid { background: var(--green-soft); color: #008b5a; }
+
+  .history-service { margin-top: 5px; color: var(--sub); font-size: 13px; letter-spacing: -0.03em; }
+
+  .history-items { margin: 8px 0 0; padding-left: 18px; color: var(--sub); font-size: 13px; line-height: 1.7; }
+  .history-qty { color: var(--muted); }
+
+  .history-total { margin-top: 8px; font-size: 16px; font-weight: 800; letter-spacing: -0.04em; }
+
+  /* 대기 카드의 [이력] 버튼. 호출/완료/취소와 달리 되돌릴 게 없는 조회라 확인 절차가 없다. */
+  .history-button {
+    min-height: 38px;
+    padding: 0 11px;
+    border: 1px solid var(--line);
+    border-radius: 11px;
+    background: var(--surface);
+    color: var(--sub);
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: -0.03em;
+    cursor: pointer;
+  }
+
   .sr-only {
     position: absolute;
     width: 1px;
@@ -758,6 +860,20 @@
       </div>
 
     </div>
+    <!-- 정비 이력. 평소에는 숨어 있고, 대기 카드의 [이력]을 누르거나 직접 검색할 때만 뜬다. -->
+    <section class="history-panel" id="history-panel" hidden>
+      <div class="history-head">
+        <h2>정비 이력</h2>
+        <button class="history-close" id="history-close" type="button" aria-label="닫기">✕</button>
+      </div>
+      <form class="history-form" id="history-form">
+        <input type="text" id="history-input" placeholder="차량번호 (예: 12가3456)"
+               maxlength="12" autocomplete="off" spellcheck="false" />
+        <button type="submit">조회</button>
+      </form>
+      <div class="history-body" id="history-body"></div>
+    </section>
+
     <p class="sr-only" id="page-status" role="status" aria-live="polite"></p>
   </main>
   <script src="./bundle.js"></script>

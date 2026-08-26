@@ -2,6 +2,9 @@ import { posPluginSdk } from '@tossplace/pos-plugin-sdk'
 // 전산(ERP)이 담아둔 장바구니를 POS로 옮기는 화면. 대기열 폴링/토큰 화면과 관심사가 달라
 // 별도 파일로 뒀다 — app.js에서는 초기화와 "같은 폴링 타이머에서 같이 불러오기"만 담당한다.
 import { initErpCarts, refreshErpCarts, applyErpCarts } from './erpCarts.js'
+// 차량번호로 지난 정비 내역을 보는 화면. 정비소에서 가장 자주 나오는 질문이라 대기 카드에서
+// 바로 열 수 있게 해뒀다.
+import { initHistory, openHistoryFor } from './history.js'
 
 // 실제 토스POS 단말기 밖(로컬 브라우저)에서 미리 볼 때는 posPluginSdk가 부모 프레임(POS 앱)과
 // 통신하지 못해 응답이 오지 않는다. 백엔드가 제공하는 미리보기에서는 같은 origin을 사용하고,
@@ -271,6 +274,8 @@ function render(reservations) {
               aria-label="${cancelConfirming ? '취소 확정(되돌릴 수 없음)' : '대기열에서 취소'} ${escapeHtml(r.carNumber)}"
               ${canCancel ? '' : 'disabled'}
             >${cancelConfirming ? '취소 확정' : '취소'}</button>
+            <button class="history-button" type="button" data-history="${escapeHtml(r.carNumber)}"
+              aria-label="${escapeHtml(r.carNumber)} 정비 이력 보기">이력</button>
           </div>
         </article>
       `
@@ -294,6 +299,11 @@ function escapeHtml(s) {
 }
 
 listEl.addEventListener('click', (e) => {
+  const historyBtn = e.target.closest('button[data-history]')
+  if (historyBtn) {
+    openHistoryFor(historyBtn.dataset.history)
+    return
+  }
   const btn = e.target.closest('button[data-action]')
   if (!btn || btn.disabled) return
   handleActionClick(btn.dataset.id, btn.dataset.action)
@@ -519,5 +529,6 @@ async function main() {
 // 401 처리(handleUnauthorized)를 그대로 주입받아 쓴다 — 같은 로직이 두 파일에 따로 생기는 것을
 // 막기 위해서다.
 initErpCarts({ apiGet, apiPost, notify, escapeHtml, onUnauthorized: handleUnauthorized })
+initHistory({ apiGet, escapeHtml, onUnauthorized: handleUnauthorized })
 
 main()

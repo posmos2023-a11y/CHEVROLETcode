@@ -1323,3 +1323,132 @@ testSerial('POS 응답: 차량번호와 예약 연결 여부가 카드에 실려
 
   assert.equal(reservation.id.length > 0, true)
 })
+
+// --- 정비 이력 조회 -----------------------------------------------------------
+// 직원이 "이 차 지난번에 뭐 갈았지?"를 POS에서 바로 본다. 손님 동의의 이용 목적에
+// "정비 이력 관리"가 들어 있어야 쓸 수 있는 기능이라, 돌려주는 항목을 최소로 유지한다.
+
+function getHistory(store, carNumber) {
+  return request(app)
+    .get('/api/pos/history?carNumber=' + encodeURIComponent(carNumber))
+    .set('X-Store-Token', store.posToken)
+}
+
+// 실제 흐름 그대로 한 번의 방문을 만든다: 예약(호출됨) -> 전산 주문 -> 담기 -> 결제.
+// 결제 시점에 예약이 자동으로 완료된다. 예약을 미리 'completed'로 만들어두면 주문이 연결되지
+// 않는다 — 끝난 정비에 새 주문이 붙으면 안 되므로 그게 올바른 동작이다.
+async function visitWithOrder(store, carNumber, serviceType) {
+  const today = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10)
+  const reservation = await prisma.reservation.create({
+    data: {
+      storeId: store.id, carNumber, phone: '01012345678',
+      serviceType, queueNumber: Math.floor(Math.random() * 9000) + 1000,
+      serviceDate: today, status: 'called', calledAt: new Date(),
+    },
+  })
+  const body = validBody(store, { carNumber })
+  const created = await postCart(body)
+  assert.equal(created.status, 201)
+  assert.equal(created.body.linkedReservation, true, '방문 생성 시 예약이 연결되지 않았습니다')
+
+  const cartId = (await getPosCarts(store)).body.carts[0].id
+  await consumeCart(store, cartId, { result: 'loaded' })
+  await request(app).post(`/api/pos/erp-carts/${cartId}/paid`).set('X-Store-Token', store.posToken).send({})
+  return { reservation, cartId }
+}
+
+testSerial('이력: 차량번호로 지난 방문과 품목이 나온다', async () => {
+  const store = await createStore('hist-basic')
+  await visitWithOrder(store, '12가3456', '엔진오일 교환')
+
+  const res = await getHistory(store, '12가3456')
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal(res.body.visits.length >= 1, true)
+
+  const visit = res.body.visits[0]
+  assert.equal(visit.serviceType, '엔진오일 교환')
+  assert.equal(visit.orders.length, 1)
+  assert.equal(visit.orders[0].items[0].name, '엔진오일 5W30 (4L)')
+  assert.equal(visit.orders[0].paid, true)
+})
+
+testSerial('이력: 전화번호는 돌려주지 않는다', async () => {
+  // 이력 확인에 필요 없는 개인정보다. 목적 밖 이용이 되지 않게 응답에서 뺀다.
+  const store = await createStore('hist-nophone')
+  await visitWithOrder(store, '22나2222', '타이어 교체')
+
+  const res = await getHistory(store, '22나2222')
+  const raw = JSON.stringify(res.body)
+  assert.equal(raw.includes('01012345678'), false, '전화번호가 응답에 들어 있습니다')
+  assert.equal(raw.includes('phone'), false, 'phone 필드가 응답에 있습니다')
+})
+
+testSerial('이력: 다른 매장 이력은 보이지 않는다', async () => {
+  const storeA = await createStore('hist-owner')
+  const storeB = await createStore('hist-other')
+  await visitWithOrder(storeA, '33다3333', '배터리 교체')
+
+  const res = await getHistory(storeB, '33다3333')
+  assert.equal(res.status, 200)
+  assert.deepEqual(res.body.visits, [])
+})
+
+testSerial('이력: 파기(익명화)된 건은 검색되지 않는다', async () => {
+  // 보관기간이 지나면 carNumber가 덮이므로 애초에 조회에 걸리지 않는다.
+  // "지웠다고 해놓고 조회에는 남아 있는" 상황이 구조적으로 생기지 않아야 한다.
+  const store = await createStore('hist-purged')
+  const { reservation } = await visitWithOrder(store, '44라4444', '정기점검')
+
+  const before = await getHistory(store, '44라4444')
+  assert.equal(before.body.visits.length >= 1, true)
+
+  await prisma.reservation.update({
+    where: { id: reservation.id },
+    data: { carNumber: '삭제됨', phone: '0100000000', anonymizedAt: new Date() },
+  })
+  await prisma.erpCart.updateMany({ where: { storeId: store.id }, data: { carNumber: null, memo: null } })
+
+  const after = await getHistory(store, '44라4444')
+  assert.deepEqual(after.body.visits, [], '파기된 기록이 아직 조회됩니다')
+})
+
+testSerial('이력: 표기가 달라도(공백) 같은 차로 찾는다', async () => {
+  const store = await createStore('hist-spaces')
+  await visitWithOrder(store, '55마5555', '브레이크 패드')
+  const res = await getHistory(store, '55마 5555')
+  assert.equal(res.body.visits.length >= 1, true)
+})
+
+testSerial('이력: 예약 없이 온 손님의 전산 주문도 이력에 남는다', async () => {
+  // 예약을 안 하고 그냥 온 손님도 정비는 받았다. 예약 기준으로만 묶으면 이 건이 사라진다.
+  const store = await createStore('hist-walkin')
+  const body = validBody(store, { carNumber: '66바6666' })
+  assert.equal((await postCart(body)).body.linkedReservation, false)
+  const cartId = (await getPosCarts(store)).body.carts[0].id
+  await consumeCart(store, cartId, { result: 'loaded' })
+
+  const res = await getHistory(store, '66바6666')
+  assert.equal(res.body.visits.length, 1)
+  assert.equal(res.body.visits[0].kind, 'order')
+  assert.equal(res.body.visits[0].orders[0].items.length, 1)
+})
+
+testSerial('이력: 담기지 않은(pending) 주문은 이력에 넣지 않는다', async () => {
+  // 아직 POS에 담기지도 않은 건은 "정비했다"고 볼 수 없다.
+  const store = await createStore('hist-pending')
+  assert.equal((await postCart(validBody(store, { carNumber: '77사7777' }))).status, 201)
+
+  const res = await getHistory(store, '77사7777')
+  assert.deepEqual(res.body.visits, [])
+})
+
+testSerial('이력: 차량번호 없이 부르면 400', async () => {
+  const store = await createStore('hist-nocar')
+  const res = await request(app).get('/api/pos/history').set('X-Store-Token', store.posToken)
+  assert.equal(res.status, 400)
+})
+
+testSerial('이력: 매장 토큰 없이는 볼 수 없다', async () => {
+  const res = await request(app).get('/api/pos/history?carNumber=12가3456')
+  assert.equal(res.status, 401)
+})
