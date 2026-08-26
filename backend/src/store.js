@@ -859,6 +859,20 @@ async function markErpCartFailed(id, errorMessage) {
   return result.count > 0
 }
 
+// 매장 직원이 POS 화면에서 이 주문을 치웠을 때. 잘못 온 주문(다른 손님 것, 전산 오조작)을
+// 직원이 없앨 방법이 없으면 pending으로 영원히 남아 화면에 계속 뜬다.
+//
+// 전산이 취소한 것(cancelled)과 구분해서 dismissed로 남긴다 -- 전산 입장에서 "우리가 취소했다"와
+// "매장이 거부했다"는 후속 조치가 다르다(후자는 왜 거부했는지 확인해야 한다).
+// 다른 전이와 같은 이유로 원자적 updateMany를 쓴다.
+async function markErpCartDismissed(id, reason) {
+  const result = await prisma.erpCart.updateMany({
+    where: { id, status: 'pending' },
+    data: { status: 'dismissed', errorMessage: reason ?? null },
+  })
+  return result.count > 0
+}
+
 // 전산 쪽에서 주문을 취소했을 때(POST /api/erp/carts/:referenceId/cancel). pending일 때만
 // cancelled로 전이한다 -- 이미 POS가 가져간(loaded) 뒤라면 취소해도 POS 장바구니에는 이미
 // 반영되어 있으므로 여기서 조용히 상태만 바꾸면 안 되고(호출부가 409로 알려야 함), 그 판단을
@@ -1072,5 +1086,6 @@ module.exports = {
   listPendingErpCarts,
   markErpCartLoaded,
   markErpCartFailed,
+  markErpCartDismissed,
   cancelErpCart,
 }

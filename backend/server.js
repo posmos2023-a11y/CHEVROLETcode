@@ -62,6 +62,7 @@ const {
   listPendingErpCarts,
   markErpCartLoaded,
   markErpCartFailed,
+  markErpCartDismissed,
   cancelErpCart,
 } = require('./src/store')
 const { createTossDraftOrder } = require('./src/tossOrderClient')
@@ -966,9 +967,11 @@ app.get('/api/pos/erp-carts', posIpFloodLimiter, posQueueReadLimiter, requireSto
 // "이 매장 전체 기준으로 한도를 두는 게 의미 있는" 상태 변경 액션이라 posQueueReadLimiter가 아닌
 // 기존 posLimiter(DB 기반)와 맞춘다.
 app.post('/api/pos/erp-carts/:id/consume', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  // dismissed = 매장 직원이 화면에서 이 주문을 치웠다(잘못 온 건). 전산이 취소한 cancelled와
+  // 구분해서 남긴다 -- 전산 입장에서 "우리가 취소"와 "매장이 거부"는 후속 조치가 다르다.
   const result = req.body?.result
-  if (result !== 'loaded' && result !== 'failed') {
-    return res.status(400).json({ ok: false, error: "result는 'loaded' 또는 'failed'여야 합니다." })
+  if (result !== 'loaded' && result !== 'failed' && result !== 'dismissed') {
+    return res.status(400).json({ ok: false, error: "result는 'loaded', 'failed', 'dismissed' 중 하나여야 합니다." })
   }
 
   // 다른 매장 소유의 cart를 건드리지 못하게 storeId까지 확인한다 -- id만으로 조회하면 다른 매장
@@ -988,14 +991,18 @@ app.post('/api/pos/erp-carts/:id/consume', posIpFloodLimiter, posLimiter, requir
   // 먼저 전이시켰을 수 있다 -- markErpCartLoaded/Failed 자체가 원자적 updateMany라 그 경쟁을
   // 최종적으로 판정한다. 반환값(changed)이 false면 내가 아니라 그 사이의 다른 요청이 이겼다는
   // 뜻이므로, 최신 상태를 다시 읽어 alreadyProcessed로 응답한다.
+  // errorMessage는 failed의 사유이자 dismissed의 사유(직원이 남긴 메모)로도 쓴다.
+  const note = req.body?.errorMessage !== undefined && req.body?.errorMessage !== null
+    ? String(req.body.errorMessage).slice(0, 500)
+    : null
+
   let changed
   if (result === 'loaded') {
     changed = await markErpCartLoaded(cart.id)
+  } else if (result === 'dismissed') {
+    changed = await markErpCartDismissed(cart.id, note)
   } else {
-    const errorMessage = req.body?.errorMessage !== undefined && req.body?.errorMessage !== null
-      ? String(req.body.errorMessage).slice(0, 500)
-      : null
-    changed = await markErpCartFailed(cart.id, errorMessage)
+    changed = await markErpCartFailed(cart.id, note)
   }
 
   if (!changed) {

@@ -773,3 +773,88 @@ testSerial('합친 응답: 전산 주문이 없으면 빈 배열이다(필드 �
   assert.equal(res.status, 200)
   assert.deepEqual(res.body.erpCarts, [])
 })
+
+// --- 매장이 잘못 온 주문을 치우는 경로 (dismissed) ---------------------------
+// 잘못 온 주문(다른 손님 것, 전산 오조작)을 직원이 없앨 방법이 없으면 pending으로 영원히 남아
+// POS 화면에 계속 뜬다. 전산이 취소한 cancelled와는 구분해서 남긴다 -- 전산 입장에서
+// "우리가 취소"와 "매장이 거부"는 후속 조치가 다르다.
+
+testSerial('지우기: POS가 dismissed로 보고하면 상태가 dismissed가 되고 목록에서 빠진다', async () => {
+  const store = await createStore('dismiss-basic')
+  const body = validBody(store)
+  assert.equal((await postCart(body)).status, 201)
+
+  const before = await getPosCarts(store)
+  assert.equal(before.body.carts.length, 1)
+  const cartId = before.body.carts[0].id
+
+  const res = await consumeCart(store, cartId, { result: 'dismissed', errorMessage: '매장에서 지움' })
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal(res.body.alreadyProcessed, false)
+
+  const stored = await prisma.erpCart.findUnique({ where: { id: cartId } })
+  assert.equal(stored.status, 'dismissed')
+  assert.equal(stored.errorMessage, '매장에서 지움')
+  assert.equal(stored.loadedAt, null) // 담긴 게 아니므로 loadedAt은 비어 있어야 한다
+
+  const after = await getPosCarts(store)
+  assert.deepEqual(after.body.carts, [])
+})
+
+testSerial('지우기: 전산이 상태를 조회하면 dismissed로 보인다', async () => {
+  const store = await createStore('dismiss-visible')
+  const body = validBody(store)
+  assert.equal((await postCart(body)).status, 201)
+  const cartId = (await getPosCarts(store)).body.carts[0].id
+  await consumeCart(store, cartId, { result: 'dismissed', errorMessage: '매장에서 지움' })
+
+  const res = await getCart(body.referenceId)
+  assert.equal(res.status, 200)
+  assert.equal(res.body.status, 'dismissed')
+  assert.equal(res.body.errorMessage, '매장에서 지움')
+})
+
+testSerial('지우기: 두 번 보내도 안전하다(멱등)', async () => {
+  const store = await createStore('dismiss-idempotent')
+  assert.equal((await postCart(validBody(store))).status, 201)
+  const cartId = (await getPosCarts(store)).body.carts[0].id
+
+  assert.equal((await consumeCart(store, cartId, { result: 'dismissed' })).body.alreadyProcessed, false)
+  const second = await consumeCart(store, cartId, { result: 'dismissed' })
+  assert.equal(second.status, 200)
+  assert.equal(second.body.alreadyProcessed, true)
+})
+
+testSerial('지우기: 이미 담긴(loaded) 건은 dismissed로 덮어쓰지 않는다', async () => {
+  const store = await createStore('dismiss-after-loaded')
+  assert.equal((await postCart(validBody(store))).status, 201)
+  const cartId = (await getPosCarts(store)).body.carts[0].id
+
+  await consumeCart(store, cartId, { result: 'loaded' })
+  const res = await consumeCart(store, cartId, { result: 'dismissed' })
+  assert.equal(res.body.alreadyProcessed, true)
+
+  const stored = await prisma.erpCart.findUnique({ where: { id: cartId } })
+  assert.equal(stored.status, 'loaded', '이미 POS에 담긴 건이 지움으로 바뀌면 안 됩니다')
+})
+
+testSerial('지우기: 다른 매장 토큰으로는 지울 수 없다', async () => {
+  const storeA = await createStore('dismiss-owner')
+  const storeB = await createStore('dismiss-other')
+  assert.equal((await postCart(validBody(storeA))).status, 201)
+  const cartId = (await getPosCarts(storeA)).body.carts[0].id
+
+  const res = await consumeCart(storeB, cartId, { result: 'dismissed' })
+  assert.equal(res.status, 404)
+
+  const stored = await prisma.erpCart.findUnique({ where: { id: cartId } })
+  assert.equal(stored.status, 'pending')
+})
+
+testSerial('지우기: result 값이 셋 중 하나가 아니면 400', async () => {
+  const store = await createStore('dismiss-badresult')
+  assert.equal((await postCart(validBody(store))).status, 201)
+  const cartId = (await getPosCarts(store)).body.carts[0].id
+  const res = await consumeCart(store, cartId, { result: 'deleted' })
+  assert.equal(res.status, 400)
+})

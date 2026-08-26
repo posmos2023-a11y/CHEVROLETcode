@@ -84,13 +84,18 @@ function renderErpCarts(incoming) {
   listEl.innerHTML = carts
     .map((cart) => {
       const buttonLabel = cart.autoPay ? '담고 결제 시작' : 'POS에 담기'
+      const dismissing = dismissConfirm.has(cart.id)
       return `
         <article class="erp-cart-item" data-cart-id="${deps.escapeHtml(cart.id)}">
           <div class="erp-cart-ref">${deps.escapeHtml(cart.referenceId || '')}</div>
           <strong class="erp-cart-memo">${deps.escapeHtml(cart.memo || '-')}</strong>
           <div class="erp-cart-summary">${summarizeItems(cart.items)}</div>
           <div class="erp-cart-total">${formatWon(cart.totalAmount)}</div>
-          <button class="erp-cart-button" type="button" data-cart-id="${deps.escapeHtml(cart.id)}">${buttonLabel}</button>
+          <div class="erp-cart-actions">
+            <button class="erp-cart-button" type="button" data-cart-id="${deps.escapeHtml(cart.id)}">${buttonLabel}</button>
+            <button class="erp-cart-dismiss${dismissing ? ' confirming' : ''}" type="button"
+                    data-cart-id="${deps.escapeHtml(cart.id)}">${dismissing ? '정말 지울까요?' : '지우기'}</button>
+          </div>
         </article>
       `
     })
@@ -133,7 +138,54 @@ function findButton(cartId) {
   return Array.from(listEl.querySelectorAll('button.erp-cart-button')).find((b) => b.dataset.cartId === cartId) || null
 }
 
+// [지우기]는 되돌릴 수 없다(전산이 다시 보내야 한다). 그래서 대기열의 호출/완료/취소와 같은
+// 방식으로, 한 번 누르면 "정말 지울까요?"로 바뀌고 3초 안에 한 번 더 눌러야 실제로 지운다.
+// 정비소 POS는 터치라 스쳐 눌리는 일이 잦다.
+const dismissConfirm = new Map()
+
+function clearDismissConfirm(cartId) {
+  const timeoutId = dismissConfirm.get(cartId)
+  if (timeoutId) clearTimeout(timeoutId)
+  dismissConfirm.delete(cartId)
+}
+
+function handleDismissClick(cartId) {
+  if (dismissConfirm.has(cartId)) {
+    clearDismissConfirm(cartId)
+    dismissCart(cartId)
+    return
+  }
+  // 다른 카드에 걸려 있던 확인 상태는 취소한다 — 화면에 "정말?"이 여러 개 떠 있으면 헷갈린다.
+  Array.from(dismissConfirm.keys()).forEach(clearDismissConfirm)
+  dismissConfirm.set(cartId, setTimeout(() => {
+    dismissConfirm.delete(cartId)
+    renderErpCarts(lastCarts)
+  }, 3000))
+  renderErpCarts(lastCarts)
+}
+
+async function dismissCart(cartId) {
+  const cart = lastCarts.find((c) => c.id === cartId)
+  inFlight.add(cartId)
+  try {
+    const { ok } = await reportConsume(cartId, { result: 'dismissed', errorMessage: '매장에서 지움' })
+    if (!ok) return // reportConsume이 이미 안내했다. 카드는 그대로 둬서 다시 시도할 수 있게 한다.
+    removeCartFromView(cartId)
+    deps.notify('success', `전산 주문을 지웠습니다${cart ? ` (${cart.referenceId})` : ''}. 전산에는 "매장에서 지움"으로 남습니다.`)
+  } finally {
+    inFlight.delete(cartId)
+    renderErpCarts(lastCarts)
+  }
+}
+
 function handleListClick(e) {
+  const dismissBtn = e.target.closest('button.erp-cart-dismiss')
+  if (dismissBtn && !dismissBtn.disabled) {
+    const id = dismissBtn.dataset.cartId
+    if (!inFlight.has(id) && !consumed.has(id)) handleDismissClick(id)
+    return
+  }
+
   const btn = e.target.closest('button.erp-cart-button')
   if (!btn || btn.disabled) return
   const cartId = btn.dataset.cartId

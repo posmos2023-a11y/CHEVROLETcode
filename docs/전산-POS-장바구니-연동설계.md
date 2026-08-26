@@ -73,7 +73,7 @@ model ErpCart {
   totalAmount  Int
   memo         String?             // "12가3456 김민준님"
   autoPay      Boolean   @default(true)
-  status       String    @default("pending")  // pending | loaded | failed | cancelled
+  status       String    @default("pending")  // pending | loaded | failed | dismissed | cancelled
   errorMessage String?
   createdAt    DateTime  @default(now())
   loadedAt     DateTime?
@@ -117,7 +117,11 @@ model ErpCart {
 | 메서드 | 경로 | 용도 |
 |---|---|---|
 | GET | `/api/pos/erp-carts` | pending 목록 (최대 20건) |
-| POST | `/api/pos/erp-carts/:id/consume` | 담기 결과 보고 (`loaded` / `failed`) |
+| POST | `/api/pos/erp-carts/:id/consume` | 담기 결과 보고 (`loaded` / `failed` / `dismissed`) |
+
+`dismissed`는 매장 직원이 잘못 온 주문을 화면에서 치운 것이다. 전산이 취소한 `cancelled`와
+구분해서 남긴다 — 전산 입장에서 "우리가 취소"와 "매장이 거부"는 후속 조치가 다르다.
+되돌릴 수 없으므로 POS 화면에서는 두 번 눌러야 확정된다(대기열의 취소와 같은 방식).
 
 **매장 격리**: `consume`은 `X-Store-Token`이 가리키는 매장 소유의 cart만 처리한다.
 다른 매장 것이면 404다 — 토큰 하나가 새어도 다른 매장 주문을 건드릴 수 없어야 한다.

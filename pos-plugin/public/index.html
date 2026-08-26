@@ -285,6 +285,41 @@
   .erp-cart-button:active { transform: scale(0.98); }
   .erp-cart-button:disabled { background: var(--muted); cursor: wait; }
 
+  /* 담기 버튼과 지우기 버튼을 한 줄에. 담기가 주 동작이라 남는 폭을 전부 가져가고,
+     지우기는 필요한 만큼만 차지하게 해서 실수로 누를 여지를 줄인다. */
+  .erp-cart-actions {
+    display: flex;
+    gap: 8px;
+    align-items: stretch;
+  }
+
+  .erp-cart-actions .erp-cart-button { flex: 1 1 auto; }
+
+  .erp-cart-dismiss {
+    flex: 0 0 auto;
+    min-height: 48px;
+    margin-top: 8px;
+    padding: 0 14px;
+    border: 1px solid var(--line);
+    border-radius: 13px;
+    background: var(--surface);
+    color: var(--sub);
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: -0.03em;
+    cursor: pointer;
+  }
+
+  .erp-cart-dismiss:active { transform: scale(0.98); }
+
+  /* 확인 대기 상태(3초). 되돌릴 수 없는 동작이므로 색으로 분명히 알린다 —
+     대기열의 취소 확인과 같은 빨강 계열을 써서 직원이 같은 의미로 읽게 한다. */
+  .erp-cart-dismiss.confirming {
+    border-color: var(--red-soft);
+    background: var(--red-soft);
+    color: var(--red);
+  }
+
   .queue-item {
     display: grid;
     grid-template-columns: 58px minmax(0, 1fr) auto;
