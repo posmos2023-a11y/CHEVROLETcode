@@ -44,7 +44,7 @@ const ERP_TOKEN = 'test-erp-cart-shared-token-0000'
 process.env.ERP_API_TOKEN = ERP_TOKEN
 
 const { hashPassword, signAdminToken } = require('../src/auth')
-const { prisma } = require('../src/store')
+const { prisma, expireStaleErpCarts, purgeExpiredPersonalData } = require('../src/store')
 const { app } = require('../server')
 
 const testSerial = (name, fn) => test(name, { concurrency: false }, fn)
@@ -857,4 +857,103 @@ testSerial('지우기: result 값이 셋 중 하나가 아니면 400', async () 
   const cartId = (await getPosCarts(store)).body.carts[0].id
   const res = await consumeCart(store, cartId, { result: 'deleted' })
   assert.equal(res.status, 400)
+})
+
+// --- 오래 방치된 주문 만료 + 개인정보 파기 ------------------------------------
+
+testSerial('만료: 하루가 지난 pending은 POS 목록에 뜨지 않는다', async () => {
+  // 전산이 보냈는데 매장이 그날 처리하지 않으면, 다음 날 아침 POS에 어제 주문이 그대로 뜬다.
+  // 직원이 오늘 손님 것으로 착각하고 담아 결제하면 잘못된 금액이 청구된다.
+  const store = await createStore('stale-hidden')
+  const body = validBody(store)
+  assert.equal((await postCart(body)).status, 201)
+
+  // 25시간 전에 들어온 것으로 되돌린다.
+  await prisma.erpCart.update({
+    where: { referenceId: body.referenceId },
+    data: { createdAt: new Date(Date.now() - 25 * 60 * 60 * 1000) },
+  })
+
+  const res = await getPosCarts(store)
+  assert.deepEqual(res.body.carts, [], '하루 지난 주문이 POS 목록에 남아 있습니다')
+
+  // 합친 응답(/api/pos/queue)에서도 마찬가지여야 한다.
+  const merged = await request(app).get('/api/pos/queue').set('X-Store-Token', store.posToken)
+  assert.deepEqual(merged.body.erpCarts, [])
+})
+
+testSerial('만료: 정리 잡이 돌면 상태가 expired가 되고 전산이 그걸 조회할 수 있다', async () => {
+  const store = await createStore('stale-expired')
+  const body = validBody(store)
+  assert.equal((await postCart(body)).status, 201)
+  await prisma.erpCart.update({
+    where: { referenceId: body.referenceId },
+    data: { createdAt: new Date(Date.now() - 25 * 60 * 60 * 1000) },
+  })
+
+  const count = await expireStaleErpCarts()
+  assert.equal(count >= 1, true)
+
+  const res = await getCart(body.referenceId)
+  assert.equal(res.body.status, 'expired')
+  assert.equal(typeof res.body.errorMessage, 'string')
+})
+
+testSerial('만료: 아직 하루가 안 된 주문은 건드리지 않는다', async () => {
+  const store = await createStore('stale-fresh')
+  const body = validBody(store)
+  assert.equal((await postCart(body)).status, 201)
+  await prisma.erpCart.update({
+    where: { referenceId: body.referenceId },
+    data: { createdAt: new Date(Date.now() - 3 * 60 * 60 * 1000) },
+  })
+
+  await expireStaleErpCarts()
+  const stored = await prisma.erpCart.findUnique({ where: { referenceId: body.referenceId } })
+  assert.equal(stored.status, 'pending')
+  assert.equal((await getPosCarts(store)).body.carts.length, 1)
+})
+
+testSerial('만료: 이미 담긴(loaded) 건은 만료되지 않는다', async () => {
+  const store = await createStore('stale-loaded')
+  const body = validBody(store)
+  assert.equal((await postCart(body)).status, 201)
+  const cartId = (await getPosCarts(store)).body.carts[0].id
+  await consumeCart(store, cartId, { result: 'loaded' })
+  await prisma.erpCart.update({
+    where: { id: cartId },
+    data: { createdAt: new Date(Date.now() - 48 * 60 * 60 * 1000) },
+  })
+
+  await expireStaleErpCarts()
+  const stored = await prisma.erpCart.findUnique({ where: { id: cartId } })
+  assert.equal(stored.status, 'loaded')
+})
+
+testSerial('개인정보 파기: 보관기간이 지나면 ErpCart.memo가 지워진다', async () => {
+  // memo에는 전산이 보낸 "12가3456 김민준님"이 들어간다 -- 차량번호와 고객명은 개인정보다.
+  const store = await createStore('purge-memo')
+  const body = validBody(store)
+  assert.equal((await postCart(body)).status, 201)
+  const old = new Date(Date.now() - 4000 * 24 * 60 * 60 * 1000) // 보관기간(기본 3년)보다 오래됨
+  await prisma.erpCart.update({ where: { referenceId: body.referenceId }, data: { createdAt: old } })
+
+  const result = await purgeExpiredPersonalData()
+  assert.equal(result.erpCarts >= 1, true, `파기 대상에 ErpCart가 포함되지 않았습니다: ${JSON.stringify(result)}`)
+
+  const stored = await prisma.erpCart.findUnique({ where: { referenceId: body.referenceId } })
+  assert.equal(stored.memo, null, 'memo가 남아 있습니다')
+  // 레코드 자체와 품목 정보는 남아야 한다(매장별 건수 통계가 깨지지 않게).
+  assert.equal(stored.totalAmount, body.totalAmount)
+  assert.equal(typeof stored.itemsJson, 'string')
+})
+
+testSerial('개인정보 파기: 보관기간 안의 건은 memo를 지우지 않는다', async () => {
+  const store = await createStore('purge-keep')
+  const body = validBody(store)
+  assert.equal((await postCart(body)).status, 201)
+
+  await purgeExpiredPersonalData()
+  const stored = await prisma.erpCart.findUnique({ where: { referenceId: body.referenceId } })
+  assert.equal(stored.memo, body.memo)
 })

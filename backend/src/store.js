@@ -829,8 +829,11 @@ function findErpCartByReference(referenceId) {
 
 // POS 플러그인 폴링(GET /api/pos/erp-carts) 전용. 오래 기다린 것부터 순서대로 최대 limit건.
 function listPendingErpCarts(storeId, limit) {
+  // 만료 잡은 하루 한 번 돌므로, 그 사이에 하루가 지난 건이 화면에 남을 수 있다. 조회에서도
+  // 같은 기준으로 걸러서 "어제 주문이 오늘 아침 POS에 떠 있는" 상황 자체를 막는다.
+  const staleBefore = new Date(Date.now() - ERP_CART_STALE_HOURS * 60 * 60 * 1000)
   return prisma.erpCart.findMany({
-    where: { storeId, status: 'pending' },
+    where: { storeId, status: 'pending', createdAt: { gte: staleBefore } },
     orderBy: { createdAt: 'asc' },
     take: limit,
   })
@@ -953,6 +956,48 @@ async function purgeExpiredPayments(cutoff) {
   return total
 }
 
+// ErpCart.memo에는 전산이 보낸 "12가3456 김민준님"이 그대로 들어간다 — 차량번호와 고객명은
+// 개인정보다. Reservation/Payment만 파기 대상에 넣어두면 이 테이블만 보관기간을 넘겨 남는다.
+// 여기서도 레코드는 남기고(매장별 전산 주문 건수 통계가 깨지지 않게) memo만 지운다.
+// itemsJson은 품목명·가격이라 개인정보가 아니므로 그대로 둔다.
+async function purgeExpiredErpCarts(cutoff) {
+  let total = 0
+  for (let i = 0; i < PURGE_MAX_ITERATIONS; i += 1) {
+    const targets = await prisma.erpCart.findMany({
+      where: { createdAt: { lt: cutoff }, memo: { not: null } },
+      select: { id: true },
+      take: PURGE_BATCH_SIZE,
+    })
+    if (!targets.length) break
+    const result = await prisma.erpCart.updateMany({
+      where: { id: { in: targets.map((t) => t.id) } },
+      data: { memo: null },
+    })
+    total += result.count
+    if (targets.length < PURGE_BATCH_SIZE) break
+  }
+  return total
+}
+
+// 매장이 가져가지 않은 채 오래 남은 전산 주문을 끝난 상태로 정리한다.
+//
+// 왜 필요한가: 전산이 보냈는데 매장이 그날 처리하지 않으면 pending으로 계속 남아, 다음 날
+// 아침에 POS 화면에 어제 주문이 그대로 뜬다. 직원이 오늘 손님 것으로 착각하고 담아 결제하면
+// 잘못된 금액이 청구된다. 정비 주문은 당일 처리가 원칙이라 하루를 넘기면 유효하지 않다고 본다.
+//
+// cancelled(전산이 취소)나 dismissed(매장이 지움)와 구분해 expired로 남긴다 — 전산 입장에서
+// "아무도 손대지 않아 만료됨"은 원인 파악이 다르다(매장에 안 떴을 수도, 직원이 못 봤을 수도).
+const ERP_CART_STALE_HOURS = 24
+
+async function expireStaleErpCarts(now) {
+  const cutoff = new Date((now ? now.getTime() : Date.now()) - ERP_CART_STALE_HOURS * 60 * 60 * 1000)
+  const result = await prisma.erpCart.updateMany({
+    where: { status: 'pending', createdAt: { lt: cutoff } },
+    data: { status: 'expired', errorMessage: `${ERP_CART_STALE_HOURS}시간 동안 처리되지 않아 만료됨` },
+  })
+  return result.count
+}
+
 // 개인정보 보관기간(기본 3년, DATA_RETENTION_DAYS) 경과 건을 물리 삭제 대신 "익명화"한다.
 // 레코드 자체를 지우면 매장별 매출/방문 통계가 깨지므로, 개인정보(전화번호/차량번호)만 식별
 // 불가능한 값으로 덮어써서 개인정보보호법상 파기 의무를 이행한다. 한 번에 최대 1000건씩, 최대
@@ -965,7 +1010,10 @@ async function purgeExpiredPersonalData(retentionDays) {
   const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000)
   const reservations = await purgeExpiredReservations(cutoff)
   const payments = await purgeExpiredPayments(cutoff)
-  return { reservations, payments }
+  const erpCarts = await purgeExpiredErpCarts(cutoff)
+  // 만료 처리는 보관기간(3년)과 무관하게 매일 돌아야 하는 짧은 주기의 정리라 같은 잡에 얹는다.
+  const expiredErpCarts = await expireStaleErpCarts()
+  return { reservations, payments, erpCarts, expiredErpCarts }
 }
 
 // 일별 요약(계약 v3 §5.1). 예약은 serviceDate 기준(접수일), 결제는 createdAt의 KST 하루 범위
@@ -1087,5 +1135,6 @@ module.exports = {
   markErpCartLoaded,
   markErpCartFailed,
   markErpCartDismissed,
+  expireStaleErpCarts,
   cancelErpCart,
 }

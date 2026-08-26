@@ -73,7 +73,7 @@ model ErpCart {
   totalAmount  Int
   memo         String?             // "12가3456 김민준님"
   autoPay      Boolean   @default(true)
-  status       String    @default("pending")  // pending | loaded | failed | dismissed | cancelled
+  status       String    @default("pending")  // pending | loaded | failed | dismissed | expired | cancelled
   errorMessage String?
   createdAt    DateTime  @default(now())
   loadedAt     DateTime?
