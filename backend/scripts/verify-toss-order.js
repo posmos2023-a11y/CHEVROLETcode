@@ -36,9 +36,12 @@ if (!accessKey || !secretKey || !merchantId) {
 const BASE = 'https://open-api.tossplace.com/api-public/openapi/v1'
 const orderKey = `posmos-verify-${crypto.randomUUID()}`
 
-// 공개 문서(https://docs.tossplace.com/reference/open-api/order/order-create.html) 기준 최소 구성:
-// - payments 없음 + requestedInfo 없음  → OPENED(미결제) 상태로 생성
-// - targetType AD_HOC + item.title      → 카탈로그 등록 없이 임의 상품
+// 구성 근거 — 토스 개발자센터 공식 답변(2026-08 승인 메일)으로 확정된 내용:
+// - payments는 **필수 필드**라 생략하면 안 되고, 미결제 주문은 빈 배열("payments": [])로 보낸다.
+//   (공개 문서만 보고 "생략하면 OPENED"로 오해하기 쉬운 지점 — 답변으로 정정됨)
+// - requestedInfo를 전달하지 않으면 OPENED(미결제) 상태로 생성된다.
+// - 카탈로그 미등록 상품은 targetType: "AD_HOC" + 상품 정보(item)를 함께 전달한다.
+// - 생성된 OPENED 주문은 토스 POS [현황] 탭에 표시되고, 매장에서 선택해 결제할 수 있다.
 // - diningOption은 필수인데 공개 문서에 enum 값이 없어 추정값을 넣는다. 400이 나오면 응답
 //   메시지에 허용값이 나올 것이므로 TOSS_DINING_OPTION 환경변수로 바꿔 재시도하면 된다.
 const body = {
@@ -63,6 +66,8 @@ const body = {
     ],
     chargePrice: 1000,
   },
+  // 미결제 주문이라도 payments 자체는 필수 — 빈 배열로 보낸다(토스 답변).
+  payments: [],
 }
 
 ;(async () => {
