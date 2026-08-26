@@ -640,3 +640,21 @@ testSerial('관리자 사업자번호: 본사 관리자가 아니면 거부된�
     .send({ businessNumber: '1234567890' })
   assert.equal(res.status, 401)
 })
+
+testSerial('자동연결: 형식에 맞지 않는 storeCode는 저장하지 않고 400', async () => {
+  // 자동 연결은 storeCode를 DB에 새로 쓰는 경로다. 관리자 웹과 같은 형식 검사를 하지 않으면
+  // 전산이 보낸 아무 문자열이나(공백·한글·수백 자) 매장 코드로 굳어버린다.
+  const store = await createStoreWithBiz('badcode', '777-77-77777')
+  for (const bad of ['한글코드', 'has space', 'x'.repeat(65)]) {
+    const res = await postCart({
+      storeCode: bad,
+      referenceId: unique('ERP-BADCODE'),
+      items: [{ productId: 'P-1', name: 'x', category: '부품', unitPrice: 1000, quantity: 1 }],
+      totalAmount: 1000,
+      businessNumber: '777-77-77777',
+    })
+    assert.equal(res.status, 400, `${bad} -> ${res.status}`)
+  }
+  const after = await prisma.store.findUnique({ where: { id: store.id } })
+  assert.equal(after.erpStoreCode, null) // 아무것도 붙지 않아야 한다
+})

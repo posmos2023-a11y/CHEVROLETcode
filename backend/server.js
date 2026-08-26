@@ -1653,6 +1653,14 @@ async function resolveErpStore(storeCode, rawBusinessNumber) {
     return { error: { status: 404, body: { ok: false, error: '등록되지 않은 매장 코드입니다.' } } }
   }
 
+  // 여기서부터는 storeCode를 **DB에 새로 저장**하는 경로다. 관리자 웹(POST .../erp-code)은 형식을
+  // 검사하는데 이 경로만 안 하면, 전산이 보낸 아무 문자열이나 매장 코드로 굳어버린다(공백·한글·
+  // 수백 자). 한 번 붙으면 그 매장은 그 값으로만 찾아지므로 나중에 고치기도 번거롭다.
+  // 두 경로가 같은 기준을 쓰도록 여기서도 같은 검사를 한다.
+  if (storeCode.length > 64 || !ERP_STORE_CODE_RE.test(storeCode)) {
+    return { error: { status: 400, body: { ok: false, error: 'storeCode는 64자 이하의 영문/숫자/하이픈(-)/밑줄(_)만 사용할 수 있습니다.' } } }
+  }
+
   const candidates = businessNumberCandidates(rawBusinessNumber)
   if (!candidates) {
     return { error: { status: 400, body: { ok: false, error: 'businessNumber는 숫자 10자리여야 합니다.' } } }
