@@ -494,6 +494,115 @@ testSerial('결제금액이 정수가 아니거나 범위를 벗어나면 400을
   assert.equal(ok.status, 200)
 })
 
+// --- 결제 영수증 개인정보 유출 방지 (실제 재현된 결함 수정) ---
+// merchantId(공개값) + 전화번호 + privacyConsent만으로 이 라우트를 호출할 수 있었고, 응답에
+// 예약과 연결된 차량번호/정비항목을 그대로 실어 보냈다 — 남의 전화번호만 알면 그 사람이 이
+// 매장에 어떤 차를 맡겼는지 알아낼 수 있었다. paymentKey를 필수로 만들고(실제 결제 없이는
+// 못 만드는 값), 응답에서 차량번호/정비항목을 빼는 것으로 막는다.
+
+testSerial('paymentKey 없이 결제 영수증을 요청하면 400을 반환하고 아무것도 저장하지 않는다', async () => {
+  const store = await createStore('payment-key-required')
+  const res = await request(app).post('/api/payments').send({
+    merchantId: store.merchantId,
+    phone: '01066660000',
+    amount: 10000,
+    privacyConsent: true,
+  })
+  assert.equal(res.status, 400)
+  assert.equal(await prisma.payment.count({ where: { storeId: store.id } }), 0)
+})
+
+testSerial('예약이 연결된 전화번호로 결제해도 응답에는 차량번호/정비항목이 실리지 않는다', async () => {
+  const store = await createStore('payment-no-car-leak')
+  const phone = '01077778888'
+
+  const reservation = await request(app).post('/api/reservations').send({
+    merchantId: store.merchantId,
+    carNumber: '99하1234',
+    phone,
+    serviceType: 'oil',
+    privacyConsent: true,
+  })
+  assert.equal(reservation.status, 200)
+
+  const payment = await request(app).post('/api/payments').send({
+    merchantId: store.merchantId,
+    phone,
+    amount: 30000,
+    paymentKey: unique('pay-no-leak'),
+    privacyConsent: true,
+  })
+  assert.equal(payment.status, 200)
+  // ok/id만 남아야 한다 — carNumber, serviceType 키 자체가 응답에 없어야 새 계약을 지킨 것이다.
+  assert.deepEqual(Object.keys(payment.body).sort(), ['id', 'ok'])
+  assert.ok(!JSON.stringify(payment.body).includes('99하1234'))
+  assert.ok(!JSON.stringify(payment.body).includes('엔진오일 교체'))
+
+  // 응답에서만 뺀 것이지, 저장(=영수증 알림톡 발송용)까지 빼면 안 된다.
+  const stored = await prisma.payment.findUnique({ where: { id: payment.body.id } })
+  assert.equal(stored.carNumber, '99하1234')
+  assert.equal(stored.serviceType, '엔진오일 교체')
+})
+
+testSerial('정상 결제 흐름(paymentKey+phone+동의)은 200을 반환하고 Payment를 생성한다', async () => {
+  const store = await createStore('payment-happy-path')
+  const paymentKey = unique('pay-happy')
+
+  const res = await request(app).post('/api/payments').send({
+    merchantId: store.merchantId,
+    phone: '01055556666',
+    amount: 20000,
+    paymentKey,
+    privacyConsent: true,
+  })
+  assert.equal(res.status, 200)
+  assert.equal(res.body.ok, true)
+  assert.equal(await prisma.payment.count({ where: { paymentKey } }), 1)
+})
+
+testSerial('같은 paymentKey로 다른 전화번호가 오면 결제 응답을 거부한다', async () => {
+  const store = await createStore('payment-key-phone-mismatch')
+  const paymentKey = unique('pay-mismatch')
+
+  const first = await request(app).post('/api/payments').send({
+    merchantId: store.merchantId,
+    phone: '01011112222',
+    amount: 10000,
+    paymentKey,
+    privacyConsent: true,
+  })
+  assert.equal(first.status, 200)
+
+  const second = await request(app).post('/api/payments').send({
+    merchantId: store.merchantId,
+    phone: '01033334444',
+    amount: 10000,
+    paymentKey,
+    privacyConsent: true,
+  })
+  assert.equal(second.status, 409)
+  assert.equal(await prisma.payment.count({ where: { paymentKey } }), 1)
+})
+
+testSerial('같은 전화번호로 영수증 요청이 한도를 넘으면 429를 반환한다', async () => {
+  const store = await createStore('payment-phone-rate-limit')
+  const phone = '01099998888'
+  const responses = []
+  for (let i = 0; i < 6; i += 1) {
+    responses.push(
+      await request(app).post('/api/payments').send({
+        merchantId: store.merchantId,
+        phone,
+        amount: 10000,
+        paymentKey: unique(`pay-rate-${i}`),
+        privacyConsent: true,
+      })
+    )
+  }
+  assert.deepEqual(responses.slice(0, 5).map((r) => r.status), Array(5).fill(200))
+  assert.equal(responses[5].status, 429)
+})
+
 // --- serviceDate day-scope (계약 §3.1, §3.6, §3.13) ---
 
 testSerial('peopleAhead와 POS 대기열은 오늘(KST) serviceDate만 집계하고, call-next도 어제 건은 호출하지 않는다', async () => {
@@ -684,6 +793,7 @@ testSerial('전자영수증 재발송(retry-receipt)이 성공하면 receipt_sen
     merchantId: store.merchantId,
     phone: '01099990000',
     amount: 10000,
+    paymentKey: unique('pay-retry-ok'),
     privacyConsent: true,
   })
   assert.equal(created.status, 200)
@@ -706,6 +816,7 @@ testSerial('전자영수증 재발송이 다시 실패해도 sent:false를 반�
     merchantId: store.merchantId,
     phone: '01099990001',
     amount: 10000,
+    paymentKey: unique('pay-retry-fail'),
     privacyConsent: true,
   })
   assert.equal(created.status, 200)

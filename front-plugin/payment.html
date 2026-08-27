@@ -197,14 +197,16 @@
           })
           const json = await res.json().catch(() => ({}))
 
-          const matched = [json.carNumber, json.serviceType].filter(Boolean).join(' · ')
-
+          // 서버는 응답에 차량번호/정비항목을 더 이상 싣지 않는다 — merchantId+전화번호만으로
+          // 호출되는 이 요청의 응답에 그 정보를 실으면, 남의 전화번호만 알아도 그 사람이 이
+          // 매장에 어떤 차를 맡겼는지 알아낼 수 있었다(실제 개인정보 유출 수정). 손님은 자기
+          // 차 번호를 이미 알고 있으니 알림톡 문구만으로 충분하다.
           sdk.template.renderResultPage({
             type: 'text',
             text: json.ok ? '영수증 발송 완료' : '영수증 발송 실패',
             title: '결제가 완료되었습니다',
             description: json.ok
-              ? (matched ? `${matched} · 알림톡을 확인해주세요` : '알림톡을 확인해주세요')
+              ? '알림톡을 확인해주세요'
               : '결제는 완료됐지만 영수증 발송에 실패했어요',
             timerMs: 5000,
             onTimeout: () => {

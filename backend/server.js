@@ -69,6 +69,7 @@ const {
   listErpCarts,
   getPosDailySummary,
   findRepairHistoryByCarNumber,
+  pingDatabaseReady,
   listRecentRepairHistory,
   findMarketingContactByCarNumber,
   findLastPromoSend,
@@ -507,6 +508,28 @@ const paymentLimiter = rateLimit({
   windowMs: 10 * 60 * 1000,
   limit: 10,
   store: new PostgresRateLimitStore(prisma, { prefix: 'payment', windowMs: 10 * 60 * 1000 }),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { ok: false, error: '요청이 너무 많습니다. 잠시 후 다시 시도해주세요.' },
+})
+
+// 위 paymentLimiter는 IP 기준 10회/10분이다 — 공격자가 IP를 바꿔가며(또는 IP가 여러 개인
+// 환경에서) 같은 피해자 전화번호로 반복 호출하면 이 한도로는 못 막고, 그 번호로 영수증
+// 알림톡만 계속 나간다(표적 스팸/괴롭힘). 그래서 전화번호 기준 한도를 따로 둔다.
+// posStoreRateKey(위 869줄)가 토큰을 해시해서 키로 쓰는 것과 같은 이유로, 전화번호 원문을
+// 그대로 레이트리밋 스토어에 남기지 않는다 — 평문 전화번호가 별도 테이블에 쌓이는 것 자체가
+// 또 다른 개인정보 노출 지점이 된다.
+function paymentPhoneRateKey(req) {
+  const phone = String(req.body?.phone ?? '').replace(/-/g, '').trim()
+  if (phone) return `phone:${crypto.createHash('sha256').update(phone).digest('hex').slice(0, 32)}`
+  return `ip:${rateLimit.ipKeyGenerator(req.ip)}`
+}
+
+const paymentPhoneLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  limit: 5,
+  keyGenerator: paymentPhoneRateKey,
+  store: new PostgresRateLimitStore(prisma, { prefix: 'payment-phone', windowMs: 10 * 60 * 1000 }),
   standardHeaders: true,
   legacyHeaders: false,
   message: { ok: false, error: '요청이 너무 많습니다. 잠시 후 다시 시도해주세요.' },
@@ -1139,13 +1162,22 @@ app.post('/api/pos/queue/:id/cancel', posIpFloodLimiter, posLimiter, requireStor
 // --- 결제 (전자영수증 + 3개월 후 프로모션) ---
 // paymentKey(토스프론트 sdk.payment.requestPayment 호출 시 발급한 값)를 함께 보내면
 // 같은 결제건에 대해 클라이언트가 재시도해도 영수증이 중복 발송되지 않는다.
-app.post('/api/payments', publicCors, paymentLimiter, requireStore, asyncHandler(async (req, res) => {
+app.post('/api/payments', publicCors, paymentLimiter, paymentPhoneLimiter, requireStore, asyncHandler(async (req, res) => {
   const storeId = req.store.id
-  const paymentKey = String(req.body?.paymentKey ?? '').trim() || null
+  const paymentKey = String(req.body?.paymentKey ?? '').trim()
   const phone = String(req.body?.phone ?? '').replace(/-/g, '').trim()
   const carNumberRaw = String(req.body?.carNumber ?? '').trim()
   const amountRaw = req.body?.amount
 
+  // 실제로 결제가 있었는지 서버가 확인할 수 있는 유일한 값이다(토스 SDK가 결제 성공 후 발급).
+  // 정상 흐름(front-plugin/payment.html)은 항상 이 값을 함께 보내므로 필수로 막아도 정상
+  // 결제는 깨지지 않는다 — 없이 들어오는 요청은 "전화번호+동의만 알면 되는" 조회성 악용이다.
+  if (!paymentKey) {
+    return res.status(400).json({ ok: false, error: 'paymentKey가 필요합니다.' })
+  }
+  if (paymentKey.length > 200) {
+    return res.status(400).json({ ok: false, error: 'paymentKey가 너무 깁니다.' })
+  }
   if (!PHONE_RE.test(phone)) {
     return res.status(400).json({ ok: false, error: '전화번호 형식이 올바르지 않습니다.' })
   }
@@ -1174,7 +1206,13 @@ app.post('/api/payments', publicCors, paymentLimiter, requireStore, asyncHandler
   try {
     const existing = await findPaymentByKey(paymentKey)
     if (existing) {
-      return res.json({ ok: true, id: existing.id, carNumber: existing.carNumber, serviceType: existing.serviceType })
+      // 진짜 결제 하나에는 전화번호가 하나뿐이어야 한다. 같은 paymentKey에 다른 전화번호가
+      // 오는 건 재시도가 아니라, 그 결제 건을 근거로 남의 번호로 조회/수신을 시도하는
+      // 경우이므로 막는다(계약과 무관하게 이번에 새로 추가하는 방어).
+      if (existing.phone !== phone) {
+        return res.status(409).json({ ok: false, error: '이미 다른 전화번호로 등록된 결제입니다.' })
+      }
+      return res.json({ ok: true, id: existing.id })
     }
 
     // 결제 화면에서 차량번호를 다시 입력받는 대신, 전화번호로 이 손님의 예약 기록을 찾아
@@ -1211,7 +1249,11 @@ app.post('/api/payments', publicCors, paymentLimiter, requireStore, asyncHandler
     // 영수증 발송에 실패해도 결제/DB 적재 자체는 성공으로 처리한다
   }
 
-  return res.json({ ok: true, id: payment.id, carNumber: payment.carNumber, serviceType: payment.serviceType })
+  // 차량번호/정비항목은 응답에 싣지 않는다 — 이 라우트는 merchantId(공개값)+전화번호+동의만으로도
+  // 호출되므로, 응답에 넣으면 남의 전화번호만 알아도 그 사람이 이 매장에 어떤 차를 맡겼는지
+  // 알아낼 수 있다(실제 재현된 개인정보 유출). 문자(알림톡)에는 그대로 넣는다 — 그건 전화번호
+  // 주인에게만 가므로 자기 차 번호를 보는 것과 같다.
+  return res.json({ ok: true, id: payment.id })
 }))
 
 // 결제 목록 (관리자 화면용). date는 createdAt의 KST 날짜 기준(계약 §3.5) — Payment에는 serviceDate가
@@ -2428,7 +2470,10 @@ app.get('/health', (req, res) => res.send('ok'))
 // 트래픽 라우팅 대상에서 빠지게 한다(liveness만 보면 "떠있지만 DB가 안 붙는" 상태를 못 거른다).
 app.get('/health/ready', asyncHandler(async (req, res) => {
   try {
-    await prisma.$queryRaw`SELECT 1`
+    // 상한을 두고 묻는다. 그냥 SELECT 1을 기다리면 DB가 느려졌을 때 레디니스 프로브 자체가
+    // 같이 매달려서, 정작 "이 인스턴스를 트래픽에서 빼야 한다"는 판단이 늦어진다.
+    // 쿼리 전체에 걸린 statement_timeout(기본 10초)보다 짧아야 의미가 있다.
+    await pingDatabaseReady()
     return res.json({ ok: true })
   } catch (e) {
     logger.error('[health] readiness 체크 실패', { error: e.message })
