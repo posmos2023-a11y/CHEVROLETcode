@@ -1,0 +1,6 @@
+# 셸 스크립트와 Dockerfile은 리눅스 컨테이너 안에서 실행된다. 윈도우에서 체크아웃하면
+# core.autocrlf=true가 줄바꿈을 CRLF로 바꿔놓는데, 그 상태로 이미지를 빌드하면 셔뱅이
+# `#!/bin/sh\r`가 되어 "no such file or directory"로 컨테이너가 아예 뜨지 않는다.
+# 파일은 멀쩡해 보이고 오류 메시지도 엉뚱해서 원인을 찾기 어렵다. 여기서 못박는다.
+*.sh text eol=lf
+Dockerfile text eol=lf

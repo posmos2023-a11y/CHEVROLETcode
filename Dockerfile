@@ -28,6 +28,8 @@ RUN cd backend && npm ci --omit=dev
 COPY backend/ ./backend/
 COPY front-plugin/ ./front-plugin/
 COPY --from=pos-plugin-build /app/pos-plugin/dist ./pos-plugin/dist
+COPY docker-entrypoint.sh /app/docker-entrypoint.sh
+RUN chmod +x /app/docker-entrypoint.sh
 
 RUN cd backend && npx prisma generate
 
@@ -35,13 +37,18 @@ ENV NODE_ENV=production
 ENV PORT=8080
 
 # 컨테이너 부팅 시 `npx prisma migrate deploy`를 실행할지 여부.
-# 기본값 true는 기존 배포 방식과 동일하다(하위 호환). 하지만 Cloud Run처럼 동시에 여러 인스턴스가
-# 콜드스타트되는 환경에서는 매 부팅마다 마이그레이션을 시도하면:
-#   - 동시 인스턴스들이 Prisma의 advisory lock을 두고 경합한다
-#   - 마이그레이션 자체가 실패하면(예: 잘못된 SQL, 락 타임아웃) 그 인스턴스는 기동에 실패하고,
-#     Cloud Run이 계속 재시작을 시도하면서 크래시 루프에 빠진다(모든 인스턴스가 트래픽을 못 받음)
-# 운영 권장 구성: 배포 파이프라인에서 `npx prisma migrate deploy`를 별도 사전 단계(Cloud Run Job 등)로
-# 한 번만 실행하고, 이 값을 false로 설정해 컨테이너는 마이그레이션 없이 바로 기동하게 한다.
+# 기본값 true는 기존 배포 방식과 동일하다(하위 호환). 아직 별도의 마이그레이션 사전 단계가
+# 파이프라인에 없어서(cloudbuild.yaml 등이 이 저장소에 없다) 당장은 컨테이너 자체가
+# 마이그레이션을 책임져야 한다 — 그래서 true를 유지한다.
+# 운영 권장 구성은 여전히: 배포 파이프라인에서 `npx prisma migrate deploy`를 별도 사전 단계
+# (Cloud Run Job 등)로 한 번만 실행하고, 이 값을 false로 설정해 컨테이너는 마이그레이션 없이
+# 바로 기동하게 하는 것. 그 전까지는 아래 docker-entrypoint.sh가 안전장치 역할을 한다:
+#   - 동시 인스턴스들이 Prisma의 advisory lock을 두고 경합하는 것 자체는 막지 못한다.
+#   - 하지만 `migrate deploy`가 락 경합으로 실패했을 때 곧바로 exit 1로 죽지 않고,
+#     `migrate status`로 스키마가 실제로 최신인지 다시 확인한다. 최신이면(= 다른 인스턴스가
+#     이미 적용했고 나는 락 경합에서 졌을 뿐) 그대로 서버를 띄우고, 여전히 미적용
+#     마이그레이션이 남아있으면(= 진짜로 깨졌다) 그때 exit 1로 죽는다.
+#   - 자세한 판단 로직은 docker-entrypoint.sh의 주석 참고.
 ENV RUN_MIGRATIONS_ON_BOOT=true
 
 EXPOSE 8080
@@ -60,10 +67,15 @@ WORKDIR /app/backend
 RUN chown -R node:node /app
 USER node
 
-# ⚠️ 마지막이 반드시 `exec node`여야 한다.
+# 마이그레이션 실행(및 락 경합/실패 판단) 로직은 docker-entrypoint.sh로 뺐다 — CMD에
+# 한 줄로 욱여넣기엔 "실패해도 status로 재확인한다"는 분기가 더 이상 한 줄짜리가 아니다.
+#
+# ⚠️ docker-entrypoint.sh의 마지막 줄은 반드시 `exec node server.js`여야 한다.
 # `sh -c "... && node server.js"` 형태로 쓰면 PID 1이 sh로 남고 node는 그 자식 프로세스가 된다.
 # Cloud Run은 인스턴스를 내릴 때 SIGTERM을 PID 1에게만 보내는데, POSIX sh는 그 시그널을 자식에게
 # 전달하지 않는다. 그러면 server.js의 graceful shutdown(진행 중 요청 마무리 + prisma.$disconnect())이
 # 아예 실행되지 않고, 유예시간이 끝난 뒤 SIGKILL로 강제 종료되면서 처리 중이던 요청과
 # DB 커넥션이 그대로 끊긴다. exec로 node가 sh를 대체해 PID 1이 되면 SIGTERM을 직접 받는다.
-CMD ["sh", "-c", "if [ \"$RUN_MIGRATIONS_ON_BOOT\" = \"true\" ]; then npx prisma migrate deploy || exit 1; fi; exec node server.js"]
+# (CMD가 스크립트를 sh 인자로 실행하든 실행권한으로 직접 실행하든, exec는 그 시점의 프로세스를
+# 대체하는 것이라 PID 1은 그대로 유지된다 — 관건은 스크립트 안에서 exec를 쓰는지다.)
+CMD ["/app/docker-entrypoint.sh"]
