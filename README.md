@@ -10,15 +10,15 @@
 매장에 설치된 **토스프론트 결제 단말기**에서 실제로 동작하는 Front Plugin과, 브라우저 어디서나 접속 가능한
 **독립 웹페이지** 두 가지 형태로 제공됩니다.
 
-- 🔗 저장소: https://github.com/one030728-cloud/CHEVROLETcode
-<!-- TODO(운영): 정본 확정 필요 — 아래 표시는 잠정 값이다. Dockerfile/Cloud Run 인프라가 최신이고
-     TODO.md의 GCP 이전 작업이 Cloud Run을 대상으로 진행 중이라 정본 후보로 표시해뒀지만, 실제로 손님이
-     접속하는 운영 트래픽이 지금 Render/Cloud Run 중 어느 쪽인지는 운영 담당자만 확정할 수 있다.
-     결정되면 이 주석을 지우고 레거시 쪽 항목은 "폐기됨" 또는 삭제로 정리할 것. -->
-- ☁️ **정본(source of truth, 잠정) — GCP Cloud Run**: https://chevrolet-api-813801981857.asia-northeast3.run.app
-- 🌐 **레거시/롤백 대상 — Render**: https://chevroletcode.onrender.com
-  (GCP 전환 이전의 운영 배포. Cloud Run 장애 시 롤백처로 당분간 유지하고, 정본이 확정되면
-  [`TODO.md`](TODO.md)에 폐기 시점을 기록할 것)
+- 🔗 저장소: https://github.com/posmos2023-a11y/CHEVROLETcode
+- ☁️ **운영 정본 — GCP Cloud Run**: https://chevrolet-api-813801981857.asia-northeast3.run.app
+  (가장 최신 운영 문서인 [`운영-참고.txt`](운영-참고.txt)가 관리자 웹·API·배포 절차 전부를 이
+  주소 하나로만 기록하고 있어 정본으로 확정한다. `main`에 push하면 Cloud Build가 자동으로
+  이 서비스에 빌드·배포한다)
+- 🌐 **Render(레거시)**: https://chevroletcode.onrender.com — GCP 전환 이전 운영 주소.
+  `운영-참고.txt`에는 더 이상 등장하지 않는다. **이 서비스가 실제로 아직 켜져 있는지, 폐기
+  시점을 언제로 할지는 이 저장소만으로는 확인할 수 없다 — 운영 담당자 확인 필요.** 폐기가
+  결정되면 아래 [Render 배포](#render-배포) 절도 함께 정리할 것
 
 ## 목차
 
@@ -60,19 +60,29 @@
 
 ## 빠른 시작
 
+로컬 DB는 SQLite가 아니라 **PostgreSQL**입니다 — `backend/prisma/schema.prisma`의 provider가
+이미 `postgresql`이고 `.env.example`의 `DATABASE_URL` 기본값도 Postgres 연결 문자열입니다.
+아래는 이 저장소에서 실제로 재현해 확인한 절차입니다.
+
 ```bash
-git clone https://github.com/one030728-cloud/CHEVROLETcode.git
+git clone https://github.com/posmos2023-a11y/CHEVROLETcode.git
 cd CHEVROLETcode/backend
 npm install
-cp .env.example .env   # 값은 비워둬도 서버는 뜹니다 (알림톡 발송만 실패, 예약/결제 접수는 정상 처리됨)
-npx prisma migrate deploy   # 로컬 SQLite DB(backend/prisma/dev.db) 생성 (계정 발급 불필요)
+
+# 로컬 Postgres 컨테이너. 최초 1회만 생성하면 되고, 이후에는 docker start chevrolet-test-pg로 재사용
+docker run --name chevrolet-test-pg -e POSTGRES_PASSWORD=devpass -e POSTGRES_DB=devdb -p 5432:5432 -d postgres:16-alpine
+# (컨테이너를 이미 만들어뒀는데 꺼져 있다면 위 대신: docker start chevrolet-test-pg)
+
+cp .env.example .env   # DATABASE_URL 기본값이 위 컨테이너와 그대로 맞음. 그 외 값은 비워둬도 서버는 뜹니다
+                        # (알림톡 발송만 실패, 예약/결제 접수는 정상 처리됨)
+npx prisma migrate deploy   # devdb에 스키마 생성 (계정 발급 불필요)
 npm start
 ```
 
-필요한 것은 **Node.js 18 이상**뿐입니다. DB는 로컬 SQLite 파일(`prisma/dev.db`)을 그대로 쓰므로 외부 서비스 계정 없이도
-로컬에서 예약·결제 접수 흐름을 바로 테스트할 수 있고, 이제 서버를 재시작해도 데이터가 남아있습니다
-(알림톡 발송만 솔라피 키가 있어야 실제로 나갑니다). 운영 배포 시 Postgres로 전환하는 방법은
-[`docs/multi-store-architecture-review.md`](docs/multi-store-architecture-review.md) 참고.
+필요한 것은 **Node.js 18 이상**과 로컬에서 돌아가는 **Docker**(Postgres 컨테이너용)뿐입니다.
+컨테이너를 지우지 않는 한 서버를 재시작해도 데이터가 남아있습니다(알림톡 발송만 솔라피 키가
+있어야 실제로 나갑니다). 백엔드 테스트(`npm test`)는 같은 컨테이너/DB를 그대로 쓰며, 테스트
+전용 안전장치(운영 DB 오사용 방지 등)는 [`backend/TESTING.md`](backend/TESTING.md) 참고.
 
 | 접속 주소 | 내용 |
 | --- | --- |
@@ -474,13 +484,18 @@ npm run zip             # build 후 chevrolet-pos-plugin.zip 생성
 필요한 환경변수(`TOSS_OPENAPI_ACCESS_KEY`/`TOSS_OPENAPI_SECRET_KEY`/`ERP_API_TOKEN`/`TOSS_DINING_OPTION`)는
 `backend/.env.example`에 설명과 함께 정리되어 있습니다.
 
+**전산 트래픽이 몰릴 때 만질 수 있는 손잡이**도 `backend/.env.example`에 있습니다 —
+`ERP_STORE_LIMIT_PER_MIN`(매장 하나당 분당 요청 상한, 기본 120)과 `ERP_IP_LIMIT_PER_MIN`
+(그걸 우회하는 폭주를 막는 IP 기준 백스톱, 기본 3000)입니다. 정상적인 매장 요청까지 429로
+막히는 것 같으면 이 두 값을 먼저 확인·조정하세요.
+
 ## 환경 변수 / 알림톡 설정
 
 ```env
 PORT=3000
 
-# DB. 로컬은 SQLite 파일 그대로, 운영은 Postgres 연결 문자열로 교체.
-DATABASE_URL="file:./dev.db"
+# DB. 로컬·운영 모두 PostgreSQL 연결 문자열(§빠른 시작 참고, 로컬은 devdb 컨테이너로 대체 가능).
+DATABASE_URL="postgresql://postgres:devpass@localhost:5432/devdb?schema=public"
 
 # 관리자 로그인(JWT) 서명 키. 운영에서는 반드시 긴 랜덤 문자열로 고정. 비워두면 로컬 개발용 임시값 자동 생성.
 JWT_SECRET=
@@ -498,6 +513,7 @@ SOLAPI_KAKAO_TEMPLATE_RESERVATION=   # 예약 접수 안내 (모든 예약)
 SOLAPI_KAKAO_TEMPLATE_QUEUE_TURN=    # "고객님의 순서입니다" 순서 호출
 SOLAPI_KAKAO_TEMPLATE_RECEIPT=       # 결제 전자영수증
 SOLAPI_KAKAO_TEMPLATE_PROMO=         # 결제 3개월 후 홍보
+SOLAPI_TIMEOUT_MS=10000              # 알림톡/문자 발송 API 호출 타임아웃(ms). 발송 실패가 급증하면 의심해볼 것
 ```
 
 카카오 알림톡은 채널 개설 + 템플릿 승인이 필요해서 보통 1~3영업일이 걸립니다. `SOLAPI_KAKAO_PFID`와 각 템플릿 ID가
@@ -564,7 +580,7 @@ SOLAPI_KAKAO_TEMPLATE_PROMO=         # 결제 3개월 후 홍보
 
 이미 https://chevroletcode.onrender.com 에 연결되어 있습니다. 새로 설정할 경우:
 
-1. Render → New → Web Service → 이 저장소(`one030728-cloud/CHEVROLETcode`) 연결
+1. Render → New → Web Service → 이 저장소(`posmos2023-a11y/CHEVROLETcode`) 연결
 2. Root Directory: 비워두기 (저장소 루트)
 3. Build Command: `cd backend && npm install && npx prisma migrate deploy && cd ../pos-plugin && npm install && npm run build`
 4. Start Command: `cd backend && npm start`
@@ -616,9 +632,9 @@ Secret Manager 이전, 운영 데이터 마이그레이션, Toss ACL 전환, 부
   `retry-receipt`)와 취소 API, 개인정보 수집·광고 수신 동의 수집 + 보관기간 경과 파기 작업
   (`purge-expired`), `npm ci` 기반 재현 가능한 Docker 빌드, Cloud Run 크래시 루프 방지용
   `RUN_MIGRATIONS_ON_BOOT` 옵션, CI에 POS 번들 빌드 검증/구문 검사 추가까지 반영했습니다.
-  **아직 안 된 것**: 개인정보·광고 문구 법무 검토, Render/Cloud Run 중 운영 정본 확정,
-  Redis/Cloud Armor 등 인스턴스 간 공유 레이트리밋, 실제 부하 테스트 — 자세한 남은 작업은
-  [`TODO.md`](TODO.md) 참고.
+  **아직 안 된 것**: 개인정보·광고 문구 법무 검토, Redis/Cloud Armor 등 인스턴스 간 공유
+  레이트리밋, 실제 부하 테스트 — 자세한 남은 작업은 [`TODO.md`](TODO.md) 참고. (운영 정본은
+  GCP Cloud Run으로 확정됨 — 이 문서 상단 참고)
 - **GCP용 DB 전환 기반 완료 (PostgreSQL, Prisma).** `backend/prisma/schema.prisma`의 provider를
   PostgreSQL로 전환하고 `backend/prisma/migrations/20260805120000_init_postgresql/` 운영 migration을
   추가했습니다. Cloud Run 컨테이너는 `DATABASE_URL`로 Cloud SQL에 연결합니다. 운영 데이터 export/import,
@@ -664,8 +680,8 @@ Secret Manager 이전, 운영 데이터 마이그레이션, Toss ACL 전환, 부
 
 **TODO**
 
-- [ ] **운영 정본 배포(Render vs GCP Cloud Run) 확정** — 이 문서 상단 배포 주소의
-      `TODO(운영)` 주석 참고, 결정되면 레거시 쪽 항목 정리
+- [ ] **Render(레거시) 실제 폐기 여부·시점 확인** — 운영 정본은 GCP Cloud Run으로 확정됨
+      (이 문서 상단 참고). 남은 건 Render 서비스 자체를 언제 내릴지 확인하는 것뿐
 - [ ] 개인정보 수집·이용 동의 문구, 광고 수신동의/수신거부 문구(`PROMO_OPT_OUT_TEXT`),
       보관기간(`DATA_RETENTION_DAYS`) 법무 검토 (§개인정보·광고성 정보 처리)
 - [ ] 솔라피 알림톡 키/템플릿 4종 발급받아 Render Environment와 로컬 `.env`에 채우기

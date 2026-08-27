@@ -5,7 +5,7 @@
 실패하도록 되어 있습니다.
 
 ```powershell
-docker run --name chevrolet-test-postgres `
+docker run --name chevrolet-test-pg `
   -e POSTGRES_PASSWORD=devpass -e POSTGRES_DB=devdb `
   -p 5432:5432 -d postgres:16-alpine
 
@@ -15,7 +15,7 @@ npm test
 ```
 
 GitHub Actions에서는 동일한 PostgreSQL 서비스 컨테이너를 사용합니다. 테스트 종료 후 컨테이너가
-필요 없으면 `docker rm -f chevrolet-test-postgres`로 제거하세요.
+필요 없으면 `docker rm -f chevrolet-test-pg`로 제거하세요.
 
 ## production 전용 부팅 가드는 테스트에 영향 없음
 
