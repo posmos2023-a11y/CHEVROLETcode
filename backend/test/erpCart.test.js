@@ -43,6 +43,14 @@ process.env.TOSS_WEBHOOK_SECRET = ''
 const ERP_TOKEN = 'test-erp-cart-shared-token-0000'
 process.env.ERP_API_TOKEN = ERP_TOKEN
 
+// 매장별/IP 한도 -- server.js가 모듈 로드 시점에 읽으므로 require보다 먼저 세팅해야 한다.
+// 매장 한도(ERP_STORE_LIMIT_PER_MIN)는 DB 기반(RateLimitHit)이라 beforeEach의 TRUNCATE로
+// 테스트마다 리셋되므로 낮게 잡아도 된다. IP 백스톱(ERP_IP_LIMIT_PER_MIN)은 메모리 기반이라
+// 이 파일 전체 실행 동안 누적되므로, 낮게 잡으면 이 파일의 다른(무관한) 테스트들이 쌓아온
+// 요청 수 때문에 뒤쪽 테스트가 이유 없이 429로 걸린다 -- 그래서 이쪽은 넉넉히 둔다.
+process.env.ERP_STORE_LIMIT_PER_MIN = '5'
+process.env.ERP_IP_LIMIT_PER_MIN = '100000'
+
 const { hashPassword, signAdminToken } = require('../src/auth')
 const { prisma, expireStaleErpCarts, purgeExpiredPersonalData } = require('../src/store')
 const { app } = require('../server')
@@ -723,6 +731,72 @@ testSerial('무차별 대입 방어: 토큰을 아예 안 보내도 실패로 �
   assert.equal(res.status, 401)
   const rows = await prisma.$queryRawUnsafe('SELECT "count" FROM "RateLimitHit"')
   assert.equal(rows.length, 1)
+})
+
+// --- 전산(ERP) 요청 한도: 매장 단위 (400개 매장이 중계 서버 IP 하나를 공유하는 문제 대응) ---
+// 이 파일 상단에서 ERP_STORE_LIMIT_PER_MIN을 5로 낮춰뒀다(erpLimiter는 DB 기반이라
+// beforeEach의 TRUNCATE로 테스트마다 리셋된다).
+
+testSerial('전산 한도: 한 매장이 한도를 넘겨도 다른 매장은 정상이다', async () => {
+  const storeA = await createStore('erp-limit-a')
+  const storeB = await createStore('erp-limit-b')
+
+  const codesA = []
+  for (let i = 0; i < 8; i += 1) {
+    codesA.push((await postCart(validBody(storeA))).status)
+  }
+  assert.equal(codesA.some((c) => c === 429), true, `storeA가 한도에 걸리지 않았습니다: ${codesA}`)
+
+  // storeA가 자기 몫을 다 썼어도 storeB는 자기 몫이 그대로 남아 있어야 한다 -- 예전처럼
+  // IP 기준으로 공유하는 한도였다면 여기서도 429가 났을 것이다. 이게 이 작업의 핵심이다.
+  const resB = await postCart(validBody(storeB))
+  assert.equal(resB.status, 201, `storeB가 storeA 때문에 막혔습니다: ${resB.status}`)
+})
+
+testSerial('전산 한도: 같은 매장이 한도를 넘기면 429가 나온다', async () => {
+  const store = await createStore('erp-limit-single')
+  const codes = []
+  for (let i = 0; i < 8; i += 1) {
+    codes.push((await postCart(validBody(store))).status)
+  }
+  // 테스트 한도가 5이니 앞 5회는 성공(201)하고 6번째부터 429여야 한다.
+  assert.equal(codes.slice(0, 5).every((c) => c === 201), true, `앞 5회가 201이 아님: ${codes}`)
+  const first429 = codes.indexOf(429)
+  assert.equal(first429, 5, `6번째부터 429여야 하는데 ${first429 + 1}번째: ${codes}`)
+})
+
+testSerial('전산 한도: 조회/취소도 주문별로 나뉜다 -- 한 건을 두드려도 다른 건은 멀쩡하다', async () => {
+  // 이 라우트들은 바디에 storeCode가 없다. IP로 폴백하면 400개 매장이 바구니 하나를 나눠 쓰게
+  // 되어 원래 버그가 여기만 그대로 남는다 -- 전산이 상태를 폴링하는 순간 바로 한도를 넘긴다.
+  const store = await createStore('erp-limit-ref')
+  const a = validBody(store)
+  const b = validBody(store)
+  assert.equal((await postCart(a)).status, 201)
+  assert.equal((await postCart(b)).status, 201)
+
+  const codesA = []
+  for (let i = 0; i < 8; i += 1) {
+    codesA.push((await getCart(a.referenceId)).status)
+  }
+  assert.equal(codesA.some((c) => c === 429), true, `a가 한도에 걸리지 않았습니다: ${codesA}`)
+
+  const resB = await getCart(b.referenceId)
+  assert.equal(resB.status, 200, `다른 주문(b)이 a 때문에 막혔습니다: ${resB.status}`)
+})
+
+testSerial('전산 한도: storeCode가 없는 라우트(IP 폴백)도 정상 동작한다', async () => {
+  const store = await createStore('erp-limit-fallback')
+  const body = validBody(store)
+  const created = await postCart(body)
+  assert.equal(created.status, 201)
+
+  // 조회(GET)와 취소(POST cancel)는 바디에 storeCode가 없다 -- 매장 키를 못 만들어 IP로
+  // 폴백해도 요청 자체는 정상 처리돼야 한다(폴백 자체가 깨지면 안 된다).
+  const got = await getCart(body.referenceId)
+  assert.equal(got.status, 200, `IP 폴백 조회가 실패했습니다: ${got.status}`)
+
+  const cancelled = await cancelCart(body.referenceId)
+  assert.equal(cancelled.status, 200, `IP 폴백 취소가 실패했습니다: ${cancelled.status}`)
 })
 
 // --- 폴링 요청 합치기 (매장당 요청 수를 절반으로) -----------------------------

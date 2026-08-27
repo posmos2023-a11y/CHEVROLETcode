@@ -1636,12 +1636,70 @@ function requireErpToken(req, res, next) {
 }
 
 // 전산 쪽 시스템이 오작동해 짧은 시간에 대량 요청을 보내도 DB/토스 API를 보호할 수 있도록
-// 매장 관리 라우트들과 동일한 DB 기반 레이트리밋을 쓴다(분당 120 -- 전산은 사람이 아니라
-// 배치/큐 처리라 사람 조작 API보다 한도를 넉넉히 둔다).
+// 매장 관리 라우트들과 동일한 DB 기반 레이트리밋을 쓴다. 다만 쉐보레 전산은 중계 서버 하나
+// (IP 하나)를 통해 가맹점 400여 곳 요청이 전부 들어온다 -- 예전처럼 키 없이(=IP 기준) 세면
+// 그 한도를 400개 매장이 통째로 나눠 쓰는 꼴이 되어, 한 매장이 같은 주문을 실수로 재시도만
+// 해도 나머지 399개 매장은 [담기]를 눌러도 POS에 주문이 뜨지 않는다. posStoreRateKey와 같은
+// 방식으로 매장 단위로 쪼갠다 -- 다만 여기는 인증 전 토큰이 아니라 요청 바디의 storeCode를
+// 키로 쓴다(express.json이 이 라우트들보다 앞서(196줄) 등록돼 있어 keyGenerator에서도
+// req.body를 읽을 수 있다). storeCode가 없는 라우트(재조회 GET, 취소 POST)는 IP로 폴백한다.
+const DEFAULT_ERP_STORE_LIMIT_PER_MIN = 120
+const configuredErpStoreLimit = Number(process.env.ERP_STORE_LIMIT_PER_MIN)
+const ERP_STORE_LIMIT_PER_MIN = Number.isFinite(configuredErpStoreLimit) && configuredErpStoreLimit > 0
+  ? configuredErpStoreLimit
+  : DEFAULT_ERP_STORE_LIMIT_PER_MIN
+
+function erpStoreRateKey(req) {
+  const storeCode = String(req.body?.storeCode ?? '').trim()
+  // POS 쪽(store:/ip:) 관례를 그대로 따른다 -- 매장 키와 폴백 키가 같은 카운터에서 섞이지
+  // 않게 접두사를 붙인다. storeCode는 토큰과 달리 비밀값이 아니므로 해시하지 않고, 길이만
+  // 방어적으로 잘라 스토리지 키가 과도하게 커지는 것만 막는다.
+  if (storeCode) return `store:${storeCode.slice(0, 200)}`
+
+  // 바디에 storeCode가 없는 라우트(재조회 GET, 취소 POST)는 referenceId로 쪼갠다.
+  // 여기서 IP로 폴백하면 400개 매장이 다시 바구니 하나를 나눠 쓰게 되어, 지금 고치는 바로 그
+  // 버그가 이 라우트들에만 그대로 남는다 -- 전산이 주문 처리 상태를 폴링하는 순간(그러라고
+  // 만든 라우트다) 분당 한도를 바로 넘긴다.
+  // referenceId 단위로 나누면 매장끼리 간섭하지 않으면서, 재시도 폭주는 그대로 걸린다 --
+  // 폭주는 대개 같은 referenceId를 반복해서 두드리기 때문이다.
+  const referenceId = String(req.params?.referenceId ?? '').trim()
+  if (referenceId) return `ref:${referenceId.slice(0, 200)}`
+
+  return `ip:${rateLimit.ipKeyGenerator(req.ip)}`
+}
+
 const erpLimiter = rateLimit({
   windowMs: 60 * 1000,
-  limit: 120,
+  limit: ERP_STORE_LIMIT_PER_MIN,
+  keyGenerator: erpStoreRateKey,
   store: new PostgresRateLimitStore(prisma, { prefix: 'erp', windowMs: 60 * 1000 }),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { ok: false, error: '요청이 너무 많습니다. 잠시 후 다시 시도해주세요.' },
+})
+
+// storeCode(또는 referenceId)를 계속 바꿔가며 두드리면 위 한도는 새 키가 계속 생겨 우회된다.
+// posIpFloodLimiter와 같은 목적의 백스톱을 여기도 둔다.
+//
+// 값을 정하는 기준: 매장별 한도(120)는 "한 매장이 넘어서면 안 되는 천장"이지 "예상 유량"이
+// 아니다. 400 * 120 = 48000 같은 식으로 잡으면 초당 800건이 되어 백스톱이 아무것도 못 막는다
+// -- 그러면 우회 경로가 그대로 열려 있는 것과 같다.
+// 실제 유량으로 잡는다:
+//   정상       하루 8,000건을 영업 10시간에 = 분당 약 13건
+//   비관적 피크 몰림 + 전산의 상태 폴링까지 겹쳐도 분당 500건 안쪽
+//   백스톱     그 6배인 분당 3,000건(초당 50건)
+// 버그로 인한 재시도 폭주는 초당 수백 건이라 몇 초 만에 여기 걸린다. 반대로 이 한도가 걸리면
+// 400개 매장이 한꺼번에 막히므로, 오탐이 나지 않게 넉넉히 잡되 폭주는 확실히 끊는 값이다.
+// 메모리 기준이라 DB를 전혀 건드리지 않는다.
+const DEFAULT_ERP_IP_LIMIT_PER_MIN = 3000
+const configuredErpIpLimit = Number(process.env.ERP_IP_LIMIT_PER_MIN)
+const ERP_IP_LIMIT_PER_MIN = Number.isFinite(configuredErpIpLimit) && configuredErpIpLimit > 0
+  ? configuredErpIpLimit
+  : DEFAULT_ERP_IP_LIMIT_PER_MIN
+
+const erpIpFloodLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: ERP_IP_LIMIT_PER_MIN,
   standardHeaders: true,
   legacyHeaders: false,
   message: { ok: false, error: '요청이 너무 많습니다. 잠시 후 다시 시도해주세요.' },
@@ -1714,7 +1772,7 @@ function deriveTossOrderKey(referenceId) {
   return `erp-${referenceId}`
 }
 
-app.post('/api/erp/draft-orders', erpLimiter, requireErpToken, asyncHandler(async (req, res) => {
+app.post('/api/erp/draft-orders', erpIpFloodLimiter, erpLimiter, requireErpToken, asyncHandler(async (req, res) => {
   const parsed = validateDraftOrderBody(req.body)
   if (parsed.error) {
     return res.status(400).json({ ok: false, error: parsed.error })
@@ -1783,7 +1841,7 @@ app.post('/api/erp/draft-orders', erpLimiter, requireErpToken, asyncHandler(asyn
 }))
 
 // 전산이 결과를 재조회할 수 있게 한다(§4.3).
-app.get('/api/erp/draft-orders/:referenceId', erpLimiter, requireErpToken, asyncHandler(async (req, res) => {
+app.get('/api/erp/draft-orders/:referenceId', erpIpFloodLimiter, erpLimiter, requireErpToken, asyncHandler(async (req, res) => {
   const order = await findErpOrderByReference(req.params.referenceId)
   if (!order) {
     return res.status(404).json({ ok: false, error: '요청하신 주문을 찾을 수 없습니다.' })
@@ -2143,7 +2201,7 @@ async function resolveErpStore(storeCode, rawBusinessNumber) {
   return { store: { ...store, erpStoreCode: storeCode } }
 }
 
-app.post('/api/erp/carts', erpLimiter, requireErpToken, asyncHandler(async (req, res) => {
+app.post('/api/erp/carts', erpIpFloodLimiter, erpLimiter, requireErpToken, asyncHandler(async (req, res) => {
   // validateDraftOrderBody를 그대로 재사용한다 -- storeCode/referenceId/items/totalAmount/memo
   // 검증 규칙이 draft-orders와 완전히 동일해야 하고(전산 쪽이 같은 바디 스키마로 두 경로를
   // 오갈 수 있어야 함), 이 검증 로직을 복제하면 나중에 한쪽만 고쳐서 규칙이 어긋날 위험이 있다.
@@ -2222,7 +2280,7 @@ app.post('/api/erp/carts', erpLimiter, requireErpToken, asyncHandler(async (req,
 }))
 
 // 전산이 담아둔 장바구니의 처리 상태(pending/loaded/failed/cancelled)를 재조회할 수 있게 한다.
-app.get('/api/erp/carts/:referenceId', erpLimiter, requireErpToken, asyncHandler(async (req, res) => {
+app.get('/api/erp/carts/:referenceId', erpIpFloodLimiter, erpLimiter, requireErpToken, asyncHandler(async (req, res) => {
   const cart = await findErpCartByReference(req.params.referenceId)
   if (!cart) {
     return res.status(404).json({ ok: false, error: '요청하신 장바구니를 찾을 수 없습니다.' })
@@ -2242,7 +2300,7 @@ app.get('/api/erp/carts/:referenceId', erpLimiter, requireErpToken, asyncHandler
 // 전산이 주문을 취소할 때 쓴다. POS가 이미 가져간(loaded) 뒤라면 취소해도 POS 장바구니에는 이미
 // 반영돼 있으므로 조용히 넘기지 않고 409로 알려준다 -- 전산 쪽이 "취소했는데 실제로는 결제가
 // 진행 중일 수 있다"는 걸 알아야 한다.
-app.post('/api/erp/carts/:referenceId/cancel', erpLimiter, requireErpToken, asyncHandler(async (req, res) => {
+app.post('/api/erp/carts/:referenceId/cancel', erpIpFloodLimiter, erpLimiter, requireErpToken, asyncHandler(async (req, res) => {
   const cart = await findErpCartByReference(req.params.referenceId)
   if (!cart) {
     return res.status(404).json({ ok: false, error: '요청하신 장바구니를 찾을 수 없습니다.' })
