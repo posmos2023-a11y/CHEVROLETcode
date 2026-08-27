@@ -12,21 +12,56 @@ function getService() {
   return service
 }
 
+const DEFAULT_TIMEOUT_MS = 10000
+
+// solapi SDK는 fetch를 직접 호출하지 않아 AbortController를 그대로 넘길 수 없다(tossOrderClient.js와
+// 다른 이유). 대신 타이머로 감싸 레이스시킨다 -- 문자 회사가 응답을 안 주면 요청 경로가 무한정
+// 매달려 Cloud Run 슬롯을 잠가버리고, 400개 가맹점이 슬롯을 공유하므로 POS 폴링까지 멈춘다.
+//
+// 한계: 우리가 기다리기를 그만둘 뿐, SDK가 띄운 요청 자체는 계속 살아 있다(취소할 방법이 없다).
+// 목적은 "요청 경로를 풀어주는 것"이라 이걸로 충분하지만, 문자 회사가 오래 죽어 있으면 소켓이
+// 쌓인다. 그때는 SDK를 걷어내고 fetch로 직접 부르면서 AbortController를 써야 한다.
+function withTimeout(promise, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`Solapi 발송 시간 초과 (${timeoutMs / 1000}초)`))
+    }, timeoutMs)
+    promise.then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      (error) => {
+        clearTimeout(timer)
+        reject(error)
+      }
+    )
+  })
+}
+
 // 카카오 알림톡용 pfId/템플릿ID가 아직 없으면(템플릿 승인 전) 일반 문자(SMS/LMS)로 대신 보낸다.
 // 알림톡 템플릿이 승인되고 .env에 SOLAPI_KAKAO_PFID + 템플릿ID를 채우면 자동으로 알림톡으로 전환된다.
 async function sendAlimtalk({ phone, text, templateId, variables, storeId, recordId, recordType }) {
   const pfId = process.env.SOLAPI_KAKAO_PFID
   const useKakao = Boolean(pfId && templateId)
+  // 0/빈값/글자는 기본값으로 빠지지만 음수는 그대로 통과해 setTimeout이 즉시 발화한다.
+  // 그러면 모든 발송이 시간 초과로 죽는데, 로그만 보면 "문자 회사가 느리다"로 읽혀서
+  // 환경변수 오타 하나가 원인이라는 걸 찾기 어렵다. 양수만 받는다.
+  const configured = Number(process.env.SOLAPI_TIMEOUT_MS)
+  const timeoutMs = Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_TIMEOUT_MS
 
   try {
-    const result = await getService().send({
-      to: phone,
-      from: process.env.SOLAPI_SENDER,
-      text,
-      ...(useKakao
-        ? { kakaoOptions: { pfId, templateId, variables, disableSms: true } }
-        : {}),
-    })
+    const result = await withTimeout(
+      getService().send({
+        to: phone,
+        from: process.env.SOLAPI_SENDER,
+        text,
+        ...(useKakao
+          ? { kakaoOptions: { pfId, templateId, variables, disableSms: true } }
+          : {}),
+      }),
+      timeoutMs
+    )
 
     const failed = result?.failedMessageList ?? result?.failed
     if (failed?.length) {
