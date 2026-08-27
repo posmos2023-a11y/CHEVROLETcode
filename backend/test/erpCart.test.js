@@ -1032,6 +1032,99 @@ testSerial('개인정보 파기: 보관기간 안의 건은 memo를 지우지 �
   assert.equal(stored.memo, body.memo)
 })
 
+testSerial('개인정보 파기: 보관기간이 지나면 ErpCart.carNumber도 지워진다', async () => {
+  // carNumber는 memo(사람이 읽는 자유 문자열)보다 식별성이 높은데도 그동안 영구 보존됐다.
+  const store = await createStore('purge-carnumber')
+  const body = validBody(store, { carNumber: '77허7777' })
+  assert.equal((await postCart(body)).status, 201)
+  const old = new Date(Date.now() - 4000 * 24 * 60 * 60 * 1000) // 보관기간(기본 3년)보다 오래됨
+  await prisma.erpCart.update({ where: { referenceId: body.referenceId }, data: { createdAt: old } })
+
+  const result = await purgeExpiredPersonalData()
+  assert.equal(result.erpCarts >= 1, true, `파기 대상에 ErpCart가 포함되지 않았습니다: ${JSON.stringify(result)}`)
+
+  const stored = await prisma.erpCart.findUnique({ where: { referenceId: body.referenceId } })
+  assert.equal(stored.carNumber, null, 'carNumber가 남아 있습니다')
+  assert.equal(stored.memo, null, 'memo도 함께 지워져야 합니다')
+})
+
+testSerial('개인정보 파기: 보관기간 안의 ErpCart는 carNumber를 지우지 않는다', async () => {
+  const store = await createStore('purge-carnumber-keep')
+  const body = validBody(store, { carNumber: '77허7777' })
+  assert.equal((await postCart(body)).status, 201)
+
+  await purgeExpiredPersonalData()
+  const stored = await prisma.erpCart.findUnique({ where: { referenceId: body.referenceId } })
+  assert.equal(stored.carNumber, '77허7777')
+})
+
+testSerial('개인정보 파기: 보관기간이 지난 ErpOrder는 memo·itemsJson이 지워지고 anonymizedAt이 찍힌다', async () => {
+  // ErpOrder는 그동안 파기 대상에 아예 없었다 -- ErpCart와 같은 이유(memo/items[].name에
+  // 차량번호·고객명)로 이제 파기 대상에 넣는다. HTTP 경로(/api/erp/draft-orders)를 타면
+  // 토스 목 서버 설정까지 필요해 이 테스트의 관심사가 아니므로, prisma로 직접 로우를 만든다.
+  const store = await createStore('purge-erporder')
+  const old = new Date(Date.now() - 4000 * 24 * 60 * 60 * 1000) // 보관기간(기본 3년)보다 오래됨
+  const order = await prisma.erpOrder.create({
+    data: {
+      storeId: store.id,
+      referenceId: unique('ERP-ORDER-REF'),
+      tossOrderKey: unique('toss-order-key'),
+      totalAmount: 45000,
+      itemsJson: JSON.stringify([{ name: '12가3456 김민준님 엔진오일', unitPrice: 45000, quantity: 1 }]),
+      memo: '12가3456 김민준님',
+      createdAt: old,
+    },
+  })
+
+  const result = await purgeExpiredPersonalData()
+  assert.equal(result.erpOrders >= 1, true, `파기 대상에 ErpOrder가 포함되지 않았습니다: ${JSON.stringify(result)}`)
+
+  const stored = await prisma.erpOrder.findUnique({ where: { id: order.id } })
+  assert.equal(stored.memo, null, 'memo가 남아 있습니다')
+  assert.equal(stored.itemsJson, '[]', 'itemsJson이 지워지지 않았습니다')
+  assert.notEqual(stored.anonymizedAt, null, 'anonymizedAt이 찍혀야 합니다')
+  // 레코드 자체와 집계값(매장별 주문 건수/매출 통계용)은 남아야 한다.
+  assert.equal(stored.totalAmount, 45000)
+  assert.equal(stored.status, 'created')
+})
+
+testSerial('개인정보 파기: 보관기간 안의 ErpOrder는 지우지 않는다', async () => {
+  const store = await createStore('purge-erporder-keep')
+  const order = await prisma.erpOrder.create({
+    data: {
+      storeId: store.id,
+      referenceId: unique('ERP-ORDER-REF'),
+      tossOrderKey: unique('toss-order-key'),
+      totalAmount: 10000,
+      itemsJson: JSON.stringify([{ name: '와이퍼', unitPrice: 10000, quantity: 1 }]),
+      memo: '34나7777',
+    },
+  })
+
+  await purgeExpiredPersonalData()
+  const stored = await prisma.erpOrder.findUnique({ where: { id: order.id } })
+  assert.equal(stored.memo, '34나7777')
+  assert.equal(stored.anonymizedAt, null)
+})
+
+testSerial('개인정보 파기: 보관기간이 지난 WebhookEvent는 행 자체가 삭제된다', async () => {
+  // WebhookEvent는 개인정보 필드가 없어 다른 모델처럼 값만 비울 수 없다 -- 무한 증가가
+  // 문제이므로 보관기간이 지나면 행 자체를 지운다.
+  const old = new Date(Date.now() - 4000 * 24 * 60 * 60 * 1000) // 보관기간(기본 3년)보다 오래됨
+  await prisma.webhookEvent.create({
+    data: { id: unique('webhook-old'), eventType: 'PAYMENT_STATUS_CHANGED', receivedAt: old },
+  })
+  const recentId = unique('webhook-recent')
+  await prisma.webhookEvent.create({ data: { id: recentId, eventType: 'PAYMENT_STATUS_CHANGED' } })
+
+  const result = await purgeExpiredPersonalData()
+  assert.equal(result.webhookEvents >= 1, true, `파기 대상에 WebhookEvent가 포함되지 않았습니다: ${JSON.stringify(result)}`)
+
+  const remaining = await prisma.webhookEvent.findMany()
+  assert.equal(remaining.length, 1, '오래된 건은 삭제되어 행 자체가 없어야 합니다')
+  assert.equal(remaining[0].id, recentId, '보관기간 안의 최근 건은 남아 있어야 합니다')
+})
+
 // --- 결제 완료 기록 + 예약 자동완료 ------------------------------------------
 // 이게 없으면 전산 주문은 "담김(loaded)"에서 멈춘다 — 전산은 결제가 됐는지 모르고 우리 집계에도
 // 안 잡힌다. POS 탭앱이 posPluginSdk.payment.on('paid')로 받아 서버에 알려준다.

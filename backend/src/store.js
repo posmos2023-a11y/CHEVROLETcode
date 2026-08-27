@@ -9,7 +9,87 @@ const { PrismaClient } = require('@prisma/client')
 const crypto = require('node:crypto')
 const { hashPassword } = require('./auth')
 
-const prisma = new PrismaClient()
+// 인스턴스당 커넥션 풀 상한.
+//
+// Prisma 기본값은 `물리 CPU 수 * 2 + 1`이라 1 vCPU면 3, 2 vCPU면 5, 4 vCPU면 9다. 문제는
+// 인스턴스마다 자기 풀을 따로 잡는다는 것 — 실제로 DB가 감당해야 하는 건
+// `인스턴스 수 × 풀 크기`다. Cloud SQL max_connections가 100 안팎(.env.example 참고)이므로
+// 기본값 그대로 두면 1 vCPU는 33대, 2 vCPU는 20대, 4 vCPU는 11대에서 커넥션이 바닥나고,
+// 그 순간 전 매장이 동시에 실패한다.
+//
+// ⚠️ 이 값만으로는 못 막는다. Cloud Run은 최대 인스턴스 수를 정하지 않으면 100대까지 늘어나므로
+// **최대 인스턴스 수를 반드시 콘솔에서 정해야** 이 계산이 성립한다. 정해야 할 값은
+//   connection_limit ≤ (Cloud SQL max_connections - 여유분) ÷ Cloud Run 최대 인스턴스 수
+// 이고, 여유분은 마이그레이션·관리 접속용으로 20 정도를 빼둔다.
+//
+// 기본값 5의 근거: docs/gcp-migration-and-scale-plan.md의 배포 계획이 최대 인스턴스 5대이고
+// .env.example도 connection_limit=5를 예시로 쓴다. 5대 × 5 = 25로 한도(~100)에 크게 여유가
+// 있고, 나중에 16대까지 늘려도 80이라 여유분 안에 들어온다.
+// DATABASE_URL에 이미 값이 박혀 있으면(운영자가 직접 조정해둔 경우) 그 값을 존중한다.
+// DB_CONNECTION_LIMIT 환경변수로도 조정할 수 있다.
+const DEFAULT_DB_CONNECTION_LIMIT = 5
+
+// 쿼리 하나가 DB 쪽에서 응답 없이 멈추면(예: 락 대기, DB 과부하) 그 쿼리를 붙든 커넥션이 영원히
+// 반환되지 않아 풀이 마르고, 결국 같은 DB를 보는 모든 인스턴스의 /health/ready가 동시에 죽어
+// 우회할 인스턴스가 없어진다. Prisma 5.22에는 "쿼리 타임아웃" 옵션이 PrismaClient 생성자에
+// 없다(트랜잭션 timeout/maxWait만 있고 일반 쿼리엔 적용 안 됨 — node_modules/@prisma/client의
+// 타입 정의로 확인). 대신 Postgres 연결 문자열의 `options=-c statement_timeout=<ms>` libpq
+// 파라미터로 세션 자체에 상한을 걸면 Postgres가 서버 쪽에서 직접 쿼리를 취소한다(클라이언트가
+// 기다리다 포기하는 게 아니라 진짜로 취소되어 커넥션이 즉시 반환됨) — pg_sleep(6)에
+// statement_timeout=2000을 걸어 실측: 약 2초 뒤 `error 57014 canceling statement due to
+// statement timeout`로 취소되고, 같은 커넥션이 바로 다음 쿼리에 재사용 가능함을 확인했다(작업
+// 보고 참고). 참고로 Prisma가 인식하는 `socket_timeout` 파라미터도 시도해봤으나, 그건 클라이언트가
+// 응답을 기다리다 포기할 뿐 Postgres 쪽 쿼리 자체는 취소되지 않아(pg_stat_activity로 확인)
+// 커넥션이 실제로 풀리지 않는다 — 그래서 채택하지 않았다.
+const DEFAULT_DB_STATEMENT_TIMEOUT_MS = 10000
+
+// DATABASE_URL은 Secret Manager에서 오므로(운영 환경변수) 코드에서 connection_limit/
+// statement_timeout을 붙이는 게 맞다 — 이미 값이 있으면(운영자가 직접 튜닝해둔 경우) 그대로 둔다.
+function buildDatabaseUrl() {
+  const raw = process.env.DATABASE_URL
+  if (!raw) return raw // 없으면 Prisma가 자체적으로 명확한 에러를 던지게 둔다.
+
+  let url
+  try {
+    url = new URL(raw)
+  } catch {
+    return raw // 파싱 안 되는 값이면 그대로 넘겨 Prisma의 에러 메시지를 보게 한다.
+  }
+
+  if (!url.searchParams.has('connection_limit')) {
+    const limit = Number(process.env.DB_CONNECTION_LIMIT) || DEFAULT_DB_CONNECTION_LIMIT
+    url.searchParams.set('connection_limit', String(limit))
+  }
+  if (!url.searchParams.has('options')) {
+    const timeoutMs = Number(process.env.DB_STATEMENT_TIMEOUT_MS) || DEFAULT_DB_STATEMENT_TIMEOUT_MS
+    url.searchParams.set('options', `-c statement_timeout=${timeoutMs}`)
+  }
+  return url.toString()
+}
+
+const prisma = new PrismaClient({ datasources: { db: { url: buildDatabaseUrl() } } })
+
+// /health/ready의 DB 핑 전용. 위 statement_timeout이 이미 모든 쿼리(이 핑 포함)에 상한을
+// 걸어두지만, 레디니스 프로브는 그보다 더 짧고 확정적인 상한이 필요하다(그 값까지 기다리면
+// 이미 느려진 인스턴스를 트래픽에서 빼는 게 늦어진다). 그래서 JS 쪽에서 한 번 더 Promise.race로
+// 감싼다 — 다만 이 race는 클라이언트가 기다리길 포기하는 것뿐이고 언더라잉 쿼리 취소는 여전히
+// 위 statement_timeout에 의존한다(SELECT 1 하나라 실질적 위험은 낮음). server.js의
+// /health/ready 배선은 이번 작업 범위가 아니라(동시 작업 중) 여기서는 export만 해둔다.
+const DEFAULT_HEALTH_PING_TIMEOUT_MS = 3000
+async function pingDatabaseReady(timeoutMs) {
+  const ms = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : DEFAULT_HEALTH_PING_TIMEOUT_MS
+  let timer
+  try {
+    await Promise.race([
+      prisma.$queryRaw`SELECT 1`,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`DB ping이 ${ms}ms 안에 응답하지 않았습니다.`)), ms)
+      }),
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
 
 // 매장 영업일은 한국 시간(KST, UTC+9) 자정 기준으로 리셋되어야 한다. `new Date().toISOString()`을
 // 그대로 쓰면 UTC 자정(=KST 오전 9시) 기준이 되어 새벽 시간대 예약의 날짜 경계가 어긋난다.
@@ -397,17 +477,34 @@ async function listPaymentsPage({ storeId, dateStart, dateEnd, statuses, q, limi
 // 이미 호출까지 끝난(더 이상 "새로 호출"할 대상이 아닌) 이월 건만 예외로 섞는다 — 어제 waiting
 // (노쇼로 추정되는 건)은 여전히 여기 뜨지 않는다. serviceDate 오름차순을 앞세워 이월 건이
 // 위쪽에 보이게 하고, 그 안에서는 queueNumber 오름차순을 유지한다.
-function listActiveQueueForStore(storeId, serviceDate) {
-  return prisma.reservation.findMany({
-    where: {
-      storeId,
-      status: { notIn: CLOSED_RESERVATION_STATUSES },
-      OR: [
-        { serviceDate },
-        { status: { in: ['called', 'notify_failed'] } },
-      ],
-    },
-    orderBy: [{ serviceDate: 'asc' }, { queueNumber: 'asc' }],
+//
+// 원래는 이 조건을 `(serviceDate=오늘 OR status IN(called,notify_failed))` 하나의 OR로 걸어
+// 한 번의 findMany로 받았다. 문제: OR로 묶이면 `@@index([storeId, serviceDate, status])`를
+// 안정적으로 타지 못한다 — 3년치(21,920행)를 시드해 통계(ANALYZE)가 없는 상태로 EXPLAIN
+// ANALYZE를 떠보면 "Rows Removed by Filter: 21898"까지 나온다(20건 받으려고 그 매장 예약을
+// 거의 다 훑음). 예약은 절대 삭제되지 않으므로(purgeExpiredReservations는 익명화만 함) 매장이
+// 오래될수록 이 스캔량은 계속 커진다. OR을 없애 두 번의 findMany로 나누면 각각 인덱스의
+// (storeId, serviceDate) / (storeId, status) 접두어를 그대로 태울 수 있다. 결과는 20~40건
+// 수준이라 JS에서 합쳐 정렬하는 비용은 무시할 만하다(구체적 EXPLAIN ANALYZE 전/후 수치는
+// 작업 보고 참고).
+async function listActiveQueueForStore(storeId, serviceDate) {
+  const [todayItems, carriedOverItems] = await Promise.all([
+    // 오늘(serviceDate) 접수분 중 아직 끝나지 않은 것 전부.
+    prisma.reservation.findMany({
+      where: { storeId, serviceDate, status: { notIn: CLOSED_RESERVATION_STATUSES } },
+    }),
+    // 다른 날짜에서 넘어온 이월 건(called/notify_failed만). serviceDate로 좁히지 않는다 —
+    // 이월 건은 원래 접수일과 무관하게 걸러야 하는 게 계약이라(위 주석 참고), 오늘 것과
+    // 겹치지 않게 serviceDate != 오늘만 뺀다(중복 방지, 위 todayItems 쪽에서 이미 잡힘).
+    prisma.reservation.findMany({
+      where: { storeId, status: { in: ['called', 'notify_failed'] }, serviceDate: { not: serviceDate } },
+    }),
+  ])
+
+  // 원래 쿼리의 정렬(serviceDate asc, 그 안에서 queueNumber asc)을 그대로 유지한다.
+  return [...todayItems, ...carriedOverItems].sort((a, b) => {
+    if (a.serviceDate !== b.serviceDate) return a.serviceDate < b.serviceDate ? -1 : 1
+    return a.queueNumber - b.queueNumber
   })
 }
 
@@ -1210,20 +1307,68 @@ async function purgeExpiredPayments(cutoff) {
 
 // ErpCart.memo에는 전산이 보낸 "12가3456 김민준님"이 그대로 들어간다 — 차량번호와 고객명은
 // 개인정보다. Reservation/Payment만 파기 대상에 넣어두면 이 테이블만 보관기간을 넘겨 남는다.
-// 여기서도 레코드는 남기고(매장별 전산 주문 건수 통계가 깨지지 않게) memo만 지운다.
-// itemsJson은 품목명·가격이라 개인정보가 아니므로 그대로 둔다.
+// 여기서도 레코드는 남기고(매장별 전산 주문 건수 통계가 깨지지 않게) memo·carNumber만 지운다.
+// carNumber는 findRepairHistoryByCarNumber/listRecentRepairHistory가 조회에 쓰는 필드라
+// memo(사람이 읽는 자유 문자열)보다 식별성이 높은데도 그동안 영구 보존됐다 — 이제 memo와
+// 같은 기준으로 지운다(지우고 나면 그 정비 이력 조회가 이 건을 못 찾게 되는데, 3년이 지난
+// 건이므로 그게 맞는 동작이다). itemsJson은 품목명·가격이라 개인정보가 아니므로 그대로 둔다.
 async function purgeExpiredErpCarts(cutoff) {
   let total = 0
   for (let i = 0; i < PURGE_MAX_ITERATIONS; i += 1) {
     const targets = await prisma.erpCart.findMany({
-      where: { createdAt: { lt: cutoff }, memo: { not: null } },
+      where: { createdAt: { lt: cutoff }, OR: [{ memo: { not: null } }, { carNumber: { not: null } }] },
       select: { id: true },
       take: PURGE_BATCH_SIZE,
     })
     if (!targets.length) break
     const result = await prisma.erpCart.updateMany({
       where: { id: { in: targets.map((t) => t.id) } },
-      data: { memo: null },
+      data: { memo: null, carNumber: null },
+    })
+    total += result.count
+    if (targets.length < PURGE_BATCH_SIZE) break
+  }
+  return total
+}
+
+// 전산 주문(ErpOrder)은 그동안 파기 대상에 아예 없었다 — memo에 ErpCart와 같은 방식으로
+// 차량번호·고객명이 들어가고, items[].name도 전산이 형식 제약 없이 보내는 자유 텍스트라
+// (server.js validateDraftOrderBody — 1~100자 문자열이면 통과) 개인정보가 섞여 들어올 수 있다.
+// 레코드와 집계값(totalAmount, status)은 남기고 memo·itemsJson만 지운다 — itemsJson은
+// NOT NULL 컬럼이라 null 대신 빈 배열 JSON으로 대체한다(형식은 유지하되 내용만 비움).
+async function purgeExpiredErpOrders(cutoff) {
+  let total = 0
+  for (let i = 0; i < PURGE_MAX_ITERATIONS; i += 1) {
+    const targets = await prisma.erpOrder.findMany({
+      where: { createdAt: { lt: cutoff }, anonymizedAt: null },
+      select: { id: true },
+      take: PURGE_BATCH_SIZE,
+    })
+    if (!targets.length) break
+    const result = await prisma.erpOrder.updateMany({
+      where: { id: { in: targets.map((t) => t.id) } },
+      data: { memo: null, itemsJson: '[]', anonymizedAt: new Date() },
+    })
+    total += result.count
+    if (targets.length < PURGE_BATCH_SIZE) break
+  }
+  return total
+}
+
+// 웹훅 이벤트(WebhookEvent)는 개인정보라기보다 무한 증가가 문제다 — id가 토스 웹훅 id일 뿐이고
+// 익명화할 전화번호/차량번호 같은 필드 자체가 없다. 다른 모델처럼 필드만 비우는 게 아니라
+// 보관기간이 지난 행 자체를 지운다(중복 수신 방지라는 목적이 그 기간이 지나면 의미가 없어짐).
+async function purgeExpiredWebhookEvents(cutoff) {
+  let total = 0
+  for (let i = 0; i < PURGE_MAX_ITERATIONS; i += 1) {
+    const targets = await prisma.webhookEvent.findMany({
+      where: { receivedAt: { lt: cutoff } },
+      select: { id: true },
+      take: PURGE_BATCH_SIZE,
+    })
+    if (!targets.length) break
+    const result = await prisma.webhookEvent.deleteMany({
+      where: { id: { in: targets.map((t) => t.id) } },
     })
     total += result.count
     if (targets.length < PURGE_BATCH_SIZE) break
@@ -1276,6 +1421,7 @@ async function expireStaleErpCarts(now) {
 // 불가능한 값으로 덮어써서 개인정보보호법상 파기 의무를 이행한다. 한 번에 최대 1000건씩, 최대
 // 10회(=최대 1만 건) 반복한다 — 대상이 그보다 많으면 다음 스케줄 실행에서 나머지를 처리한다
 // (배치 잡 하나가 너무 오래 걸려 Cloud Scheduler의 타임아웃에 걸리는 걸 막기 위함).
+// 예외적으로 WebhookEvent는 익명화할 개인정보 필드가 없어 행 자체를 지운다(무한 증가 방지).
 async function purgeExpiredPersonalData(retentionDays) {
   const days = Number.isFinite(retentionDays) && retentionDays > 0
     ? retentionDays
@@ -1284,11 +1430,15 @@ async function purgeExpiredPersonalData(retentionDays) {
   const reservations = await purgeExpiredReservations(cutoff)
   const payments = await purgeExpiredPayments(cutoff)
   const erpCarts = await purgeExpiredErpCarts(cutoff)
+  // 전산 주문(ErpOrder)도 ErpCart와 같은 이유(memo/items[].name에 차량번호·고객명)로 파기 대상이다.
+  const erpOrders = await purgeExpiredErpOrders(cutoff)
   // 홍보 발송 기록에도 전화번호·차량번호가 남는다. 같은 기준으로 지운다.
   const promoSends = await purgeExpiredPromoSends(cutoff)
+  // 웹훅 이벤트는 개인정보가 아니라 무한 증가가 문제라 별도로 지운다(보관기간은 같은 값을 재사용).
+  const webhookEvents = await purgeExpiredWebhookEvents(cutoff)
   // 만료 처리는 보관기간(3년)과 무관하게 매일 돌아야 하는 짧은 주기의 정리라 같은 잡에 얹는다.
   const expiredErpCarts = await expireStaleErpCarts()
-  return { reservations, payments, erpCarts, promoSends, expiredErpCarts }
+  return { reservations, payments, erpCarts, erpOrders, promoSends, webhookEvents, expiredErpCarts }
 }
 
 // 일별 요약(계약 v3 §5.1). 예약은 serviceDate 기준(접수일), 결제는 createdAt의 KST 하루 범위
@@ -1373,6 +1523,7 @@ async function getDailySummary({ storeId, date, dateStart, dateEnd }) {
 
 module.exports = {
   prisma,
+  pingDatabaseReady,
   kstDateString,
   kstDateRangeUtc,
   ensureDefaultStore,
