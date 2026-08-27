@@ -119,27 +119,65 @@ function updateSummary(reservations) {
 
 function updateLastUpdated() {
   const time = new Intl.DateTimeFormat('ko-KR', { hour: '2-digit', minute: '2-digit' }).format(new Date())
-  lastUpdatedEl.textContent = `${time} 기준 · 5초마다 자동 업데이트`
+  // 실제 주기는 고정 5초가 아니라 POLL_MIN_MS(5초)~POLL_MAX_MS(15초) 사이를 오가는 적응형
+  // 간격(pollIntervalMs)이다. 예전엔 "5초마다"로 못 박혀 있어 한산한 시간대에 간격이 늘어나도
+  // 화면 표시는 그대로였다 — 지금 값을 그대로 반영한다.
+  const seconds = Math.round(pollIntervalMs / 1000)
+  lastUpdatedEl.textContent = `${time} 기준 · ${seconds}초마다 자동 업데이트`
 }
 
+// fetch에 상한을 두지 않으면, 서버가 응답을 영영 안 주는 순간(다운/과부하) 그 요청도 영영 안
+// 끝난다 — 아래 loadQueue의 "이전 요청이 안 끝났으면 새로 시작하지 않는다" 가드를 넣어도, 그
+// 가드가 붙들고 있는 요청 자체가 안 풀리면 가드도 영원히 풀리지 않는다. 그래서 조회/변경 요청
+// 둘 다 AbortController로 상한을 건다. 값은 용도에 따라 다르게 뒀다(아래 각 함수 주석 참고).
+//
+// 조회(GET)는 실패해도 다음 폴링에서 다시 물어보면 그만이라 짧게 끊어도 손해가 없다. 폴링
+// 최소 간격(POLL_MIN_MS, 5초)보다는 넉넉히 길게 잡아, 그냥 좀 느린 정상 응답을 타임아웃으로
+// 오인해 "네트워크 연결 확인" 오류를 괜히 띄우지 않게 한다.
+const GET_TIMEOUT_MS = 8000
+
+// 상태 변경(POST: 호출/완료/취소, 그리고 erpCarts.js가 같은 apiPost로 보내는 담기/결제 보고)은
+// 얘기가 다르다. 요청이 서버에 도착해 처리(알림톡 발송, 결제 확정 등)까지 끝났는데 응답만
+// 못 받은 경우, 여기서 "실패"로 단정해버리면 직원이 같은 조작을 다시 시도해 중복 처리(알림톡
+// 중복 발송, 결제 중복 등)로 이어질 수 있다. 그래서 GET보다 훨씬 길게 잡아 어지간히 느린
+// 응답은 성공으로 받아내고, 정말 응답이 없는(연결이 끊긴) 경우에만 포기한다. 그래도 무한정
+// 기다리게 두면 ①의 가드가 영원히 안 풀리는 건 GET과 마찬가지라 상한 자체는 반드시 둔다.
+const POST_TIMEOUT_MS = 20000
+
 async function apiGet(path) {
-  const res = await fetch(`${API_BASE}${path}`, {
-    headers: { 'X-Store-Token': getStoreToken() },
-  })
-  const body = await res.json().catch(() => ({}))
-  return { ok: res.ok && body.ok, status: res.status, body }
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), GET_TIMEOUT_MS)
+  try {
+    const res = await fetch(`${API_BASE}${path}`, {
+      headers: { 'X-Store-Token': getStoreToken() },
+      signal: controller.signal,
+    })
+    const body = await res.json().catch(() => ({}))
+    return { ok: res.ok && body.ok, status: res.status, body }
+  } finally {
+    // 성공/실패/타임아웃 어느 경로로 끝나든 타이머를 반드시 지운다 — 안 지우면 이미 끝난 요청의
+    // abort()가 나중에 불필요하게 예약돼 있는 채로 남는다.
+    clearTimeout(timer)
+  }
 }
 
 // body 기본값을 {}로 둬서 기존 호출부(call/complete/cancel — 전부 빈 바디)는 그대로 동작하고,
 // ERP 장바구니 결과 보고(consume)처럼 실제 바디가 필요한 곳만 두 번째 인자를 넘기면 된다.
 async function apiPost(path, body = {}) {
-  const res = await fetch(`${API_BASE}${path}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Store-Token': getStoreToken() },
-    body: JSON.stringify(body),
-  })
-  const responseBody = await res.json().catch(() => ({}))
-  return { ok: res.ok && responseBody.ok, status: res.status, body: responseBody }
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), POST_TIMEOUT_MS)
+  try {
+    const res = await fetch(`${API_BASE}${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Store-Token': getStoreToken() },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    })
+    const responseBody = await res.json().catch(() => ({}))
+    return { ok: res.ok && responseBody.ok, status: res.status, body: responseBody }
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 // 토큰이 만료/폐기됐을 때의 처리를 한 곳에 모은다 — 대기열(runAction/loadQueue)과 전산 주문
@@ -190,7 +228,19 @@ const ACTION_SUCCESS_MESSAGE = {
 async function runAction(id, action) {
   // 직원이 뭔가를 눌렀다는 건 지금 바쁘다는 뜻이다 -- 폴링을 다시 빠르게 되돌린다.
   noteActivity()
-  const { ok, status, body } = await apiPost(ACTION_PATH[action](id))
+  let ok, status, body
+  try {
+    ;({ ok, status, body } = await apiPost(ACTION_PATH[action](id)))
+  } catch {
+    // 네트워크 오류이거나 POST_TIMEOUT_MS 타임아웃이다. 위 주석대로 이 시점엔 요청이 서버에
+    // 도달해 실제로는 처리됐을 수도 있어 "실패"라고 단정하지 않는다 — 안내만 하고, 아래
+    // loadQueue()로 서버의 실제 최신 상태를 다시 받아와 화면을 맞춘다. 여기서 catch 없이
+    // 그냥 던지면 crashGuard의 unhandledrejection이 잡아 전체 화면이 오류 패널로 덮인다
+    // (버튼 하나 눌렀다고 화면 전체가 하얘지면 안 된다).
+    notify('error', '네트워크 연결을 확인해주세요. 처리 여부는 목록에서 다시 확인해주세요.')
+    await loadQueue()
+    return
+  }
   if (!ok) {
     if (status === 401) {
       // 요청 도중 토큰이 회전/폐기됐을 수 있다. 저장된 값을 지우고 재입력을 받는다.
@@ -331,7 +381,17 @@ function applyQueueResponse(body) {
   render(body.reservations || [])
 }
 
+// setInterval(아래 startPolling)은 콜백이 끝났는지 신경 쓰지 않고 다음 콜백을 그대로 실행한다.
+// 서버가 느려지면 한 단말기에서 응답 못 받은 요청이 계속 쌓이고, 가맹점 400곳이 동시에 그
+// 상태가 되면 서버가 회복되려는 순간 쌓여있던 요청이 한꺼번에 몰려 회복을 방해한다(자기 증폭).
+// 그래서 이전 요청이 아직 안 끝났으면 새 요청을 시작하지 않는다. 다만 사람이 직접 누른
+// 새로고침(manual)은 예외로 통과시킨다 — 자동 폴링과 드물게 겹치는 것보다, 버튼을 눌렀는데
+// 화면이 그대로라 "안 눌렸나?" 싶은 상황이 매장에서는 더 나쁘다.
+let queueLoadInFlight = false
+
 async function loadQueue({ manual = false } = {}) {
+  if (queueLoadInFlight && !manual) return false
+  queueLoadInFlight = true
   if (manual || !lastReservations.length) setConnection('checking')
   try {
     const { ok, status, body } = await apiGet('/api/pos/queue')
@@ -362,6 +422,10 @@ async function loadQueue({ manual = false } = {}) {
     setConnection('error')
     if (!lastReservations.length) renderError('네트워크 연결을 확인한 뒤 다시 시도해주세요.')
     return false
+  } finally {
+    // 어느 return 경로로 빠지든(성공/401/서버오류/네트워크오류·타임아웃) 반드시 풀어준다 —
+    // 안 풀면 이번 요청 이후로 자동 폴링이 영원히 스스로를 건너뛰게 된다.
+    queueLoadInFlight = false
   }
 }
 
