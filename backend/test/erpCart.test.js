@@ -1653,6 +1653,99 @@ testSerial('POS 오늘 현황: 다른 매장 숫자가 섞이지 않는다', asy
   assert.equal(res.body.received, 0)
 })
 
+// --- 매장 격리 --------------------------------------------------------------
+// 400개 가맹점이 한 서버를 쓴다. 남의 매장 레코드 id를 들고 왔을 때 막지 못하면
+// 남의 주문을 처리완료로 만들거나 남의 대기열을 지울 수 있다. id가 UUID라 추측이 어렵다는 것은
+// 방어가 아니다 — 로그·화면·전산 연동 어디서든 새어나올 수 있다.
+
+testSerial('격리: 남의 매장 전산 주문을 consume 할 수 없다', async () => {
+  const victim = await createStore('iso-victim-1')
+  const attacker = await createStore('iso-attacker-1')
+  assert.equal((await postCart(validBody(victim))).status, 201)
+  const victimCartId = (await getPosCarts(victim)).body.carts[0].id
+
+  const res = await consumeCart(attacker, victimCartId, { result: 'loaded' })
+  assert.equal(res.status === 200, false, `남의 주문을 처리했다: ${res.status} ${JSON.stringify(res.body)}`)
+
+  // 피해 매장 쪽은 아무 일도 없어야 한다.
+  const after = await getPosCarts(victim)
+  assert.equal(after.body.carts.length, 1, '피해 매장의 주문이 사라졌다')
+})
+
+testSerial('격리: 남의 매장 전산 주문을 결제완료로 만들 수 없다', async () => {
+  const victim = await createStore('iso-victim-2')
+  const attacker = await createStore('iso-attacker-2')
+  assert.equal((await postCart(validBody(victim))).status, 201)
+  const victimCartId = (await getPosCarts(victim)).body.carts[0].id
+  await consumeCart(victim, victimCartId, { result: 'loaded' })
+
+  const res = await request(app)
+    .post(`/api/pos/erp-carts/${victimCartId}/paid`)
+    .set('X-Store-Token', attacker.posToken)
+    .send({})
+  assert.equal(res.status === 200, false, `남의 주문을 결제완료로 만들었다: ${res.status}`)
+
+  const cart = await prisma.erpCart.findUnique({ where: { id: victimCartId } })
+  assert.equal(cart.status, 'loaded', `상태가 바뀌었다: ${cart.status}`)
+})
+
+testSerial('격리: 남의 매장 대기 손님을 완료/취소/호출할 수 없다', async () => {
+  const victim = await createStore('iso-victim-3')
+  const attacker = await createStore('iso-attacker-3')
+  const today = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10)
+  const reservation = await prisma.reservation.create({
+    data: {
+      storeId: victim.id, carNumber: '12가3456', phone: '01012345678',
+      serviceType: 'oil', queueNumber: 7, serviceDate: today, status: 'waiting',
+      privacyConsentAt: new Date(),
+    },
+  })
+
+  for (const action of ['call', 'complete', 'cancel']) {
+    const res = await request(app)
+      .post(`/api/pos/queue/${reservation.id}/${action}`)
+      .set('X-Store-Token', attacker.posToken)
+      .send({})
+    assert.equal(res.status === 200, false, `남의 대기 손님에 ${action}이 통했다: ${res.status}`)
+  }
+
+  const after = await prisma.reservation.findUnique({ where: { id: reservation.id } })
+  assert.equal(after.status, 'waiting', `상태가 바뀌었다: ${after.status}`)
+})
+
+testSerial('격리: 남의 매장 차량 이력을 조회할 수 없다', async () => {
+  const victim = await createStore('iso-victim-4')
+  const attacker = await createStore('iso-attacker-4')
+  assert.equal((await postCart(validBody(victim, { carNumber: '12가3456' }))).status, 201)
+  const cartId = (await getPosCarts(victim)).body.carts[0].id
+  await consumeCart(victim, cartId, { result: 'loaded' })
+
+  const res = await request(app)
+    .get('/api/pos/history?carNumber=' + encodeURIComponent('12가3456'))
+    .set('X-Store-Token', attacker.posToken)
+  assert.equal(res.status, 200)
+  assert.equal(res.body.visits.length, 0, '남의 매장 손님 이력이 보였다')
+})
+
+testSerial('격리: 남의 매장 손님에게 홍보문자를 보낼 수 없다', async () => {
+  const victim = await createStore('iso-victim-5')
+  const attacker = await createStore('iso-attacker-5')
+  const today = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10)
+  await prisma.reservation.create({
+    data: {
+      storeId: victim.id, carNumber: '12가3456', phone: '01012345678',
+      serviceType: 'oil', queueNumber: 8, serviceDate: today, status: 'completed',
+      privacyConsentAt: new Date(), marketingConsentAt: new Date(), completedAt: new Date(),
+    },
+  })
+
+  const res = await request(app)
+    .post('/api/pos/promo/send')
+    .set('X-Store-Token', attacker.posToken)
+    .send({ carNumber: '12가3456' })
+  assert.equal(res.status === 200, false, `남의 손님에게 문자를 보냈다: ${res.status} ${JSON.stringify(res.body)}`)
+})
+
 // --- 최근 정비 이력 ------------------------------------------------------------
 // 이력 화면을 열자마자 보이는 목록. 이게 없으면 차량번호를 이미 아는 직원만 쓸 수 있는
 // 검색창이라 "이력이 안 남는다"로 읽힌다.
