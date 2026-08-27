@@ -141,6 +141,8 @@ export function applyErpCarts(carts) {
   const list = Array.isArray(carts) ? carts : []
   renderErpCarts(list)
   stampUpdated(list.filter((c) => !consumed.has(c.id)).length)
+  // 통보가 밀린 결제 건이 있으면 이 기회에 다시 보낸다(retryPendingPaid 주석 참고).
+  retryPendingPaid()
 }
 
 // 서버가 erpCarts 필드를 아직 안 내려주는 경우(배포 과도기)의 폴백. 이 API가 없거나 실패해도
@@ -282,14 +284,68 @@ function rememberLoadedCart(cartId) {
   savePendingPaid([...entries, { id: cartId, at: Date.now() }])
 }
 
-// 결제 완료 통보. 실패해도 재시도하지 않는다 — 담기(consume)와 달리 이건 기록용이라,
-// 놓치면 전산에 loaded로 남을 뿐 중복 결제 같은 사고로는 이어지지 않는다.
+// 결제를 시작하지도 못한 채 끝난 주문(다른 단말기가 이미 처리/거부한 경우)의 대기 기록을
+// 지운다. 남겨두면 이 단말기에서 나중에 벌어지는 아무 결제에나 이 주문이 딸려가서
+// "결제완료"로 잘못 보고된다 — 실제로는 여기서 결제한 적이 없는데도.
+function forgetPendingPaid(cartId) {
+  savePendingPaid(loadPendingPaid().filter((e) => e.id !== cartId))
+}
+
+// 결제 완료 통보. reportConsume과 같은 수준(2회 재시도, 4xx는 재시도 안 함, 401 처리,
+// 네트워크 예외를 값으로 변환)으로 맞춘다 — 담기(consume)만 재시도하고 이쪽은 안 하면,
+// 결제는 끝났는데 전산만 모르는 상태가 조용히 남는다. 여러 건을 한 번에 보고할 수 있어
+// (initPaymentWatch가 Promise.all로 묶는다) 실패를 여기서 개별 notify하지 않고 결과값만
+// 돌려준다 — 그래야 호출부가 여러 건의 실패를 한 번의 안내로 모을 수 있다.
 async function reportPaid(cartId, paymentId, orderId) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    let ok, status, body
+    try {
+      ;({ ok, status, body } = await deps.apiPost(`/api/pos/erp-carts/${cartId}/paid`, { paymentId, orderId }))
+    } catch {
+      continue
+    }
+    if (ok) return { ok, status, body }
+    if (status === 401) {
+      deps.onUnauthorized(body.error)
+      return { ok, status, body }
+    }
+    // 4xx는 재시도해도 같은 답이 온다. 5xx/네트워크 오류만 한 번 더 시도한다.
+    if (status && status < 500) return { ok, status, body }
+  }
+  return { ok: false }
+}
+
+// 통보에 실패해 남아 있는 결제 건을 다시 보낸다. 폴링(applyErpCarts)이 부르므로 5~15초마다
+// 기회가 온다.
+//
+// 'paid' 이벤트가 날 때만 재시도하면, 한산한 매장에서는 10분 유효시간 안에 다음 결제가 없어서
+// 그대로 만료된다 - 직원에게 "다시 시도합니다"라고 안내해놓고 실제로는 안 하는 것이다.
+// 여기서 재시도해야 그 안내가 사실이 된다.
+//
+// 대상은 paymentId가 이미 붙은 항목뿐이다. 그게 없는 항목은 아직 결제가 끝나지 않은 건이라
+// 보고할 것 자체가 없다.
+let retryingPaid = false
+
+async function retryPendingPaid() {
+  if (retryingPaid) return
+  const pending = loadPendingPaid().filter((e) => e.paymentId)
+  if (!pending.length) return
+
+  retryingPaid = true
   try {
-    const { ok } = await deps.apiPost(`/api/pos/erp-carts/${cartId}/paid`, { paymentId, orderId })
-    return ok
+    const results = await Promise.all(
+      pending.map((e) => reportPaid(e.id, e.paymentId, e.orderId).then((r) => ({ id: e.id, ok: r.ok })))
+    )
+    const done = new Set(results.filter((r) => r.ok).map((r) => r.id))
+    if (!done.size) return
+    // 기다리는 동안 새 항목이 생겼을 수 있으니 지금 시점 기록을 다시 읽는다.
+    savePendingPaid(loadPendingPaid().filter((e) => !done.has(e.id)))
+    deps.notify('success', `결제 완료를 전산에 알렸습니다 (${done.size}건).`)
   } catch {
-    return false
+    // 재시도는 실패해도 조용히 넘어간다 - 폴링마다 오류를 띄우면 화면이 안내로 뒤덮인다.
+    // 유효시간이 지나면 어차피 만료되고, 그 전에 직원은 이미 한 번 안내를 받았다.
+  } finally {
+    retryingPaid = false
   }
 }
 
@@ -298,11 +354,41 @@ function initPaymentWatch() {
     posPluginSdk.payment.on('paid', (paymentId, orderId) => {
       const entries = loadPendingPaid()
       if (!entries.length) return
-      // 먼저 지운다 — 통보가 실패해도 다음 결제 때 엉뚱한 건이 딸려가지 않게 한다.
-      savePendingPaid([])
-      Promise.all(entries.map((e) => reportPaid(e.id, paymentId, orderId)))
+      // 이번 결제로 막 담긴 항목(paymentId가 아직 없다)은 방금 받은 paymentId/orderId를 쓴다.
+      // 예전에 통보가 실패해 남아 있던 항목(paymentId가 이미 있다)은 그때 확정된 자기 값을
+      // 그대로 다시 써야 한다 — 지금 결제와는 다른 건이라, 새 값을 붙이면 전산에 엉뚱한
+      // 결제 건으로 기록된다.
+      const tasks = entries.map((e) => {
+        const usePaymentId = e.paymentId || paymentId
+        const useOrderId = e.orderId || orderId
+        return reportPaid(e.id, usePaymentId, useOrderId).then((r) => ({ entry: e, paymentId: usePaymentId, orderId: useOrderId, ...r }))
+      })
+      Promise.all(tasks)
         .then((results) => {
-          if (results.some(Boolean)) deps.notify('success', '결제 완료를 전산에 알렸습니다.')
+          const succeededIds = new Set(results.filter((r) => r.ok).map((r) => r.entry.id))
+          const failed = results.filter((r) => !r.ok)
+          // 대기하는 동안 새로 담긴 항목이 있을 수 있으니 지금 시점 기록을 다시 읽는다.
+          // 성공한 것은 지우고, 실패한 것은 이번에 확정된 paymentId/orderId를 붙여 남긴다 —
+          // 그래야 다음 결제 때 같은 건을 같은 결제 참조로 다시 보고할 수 있다. 기록에는
+          // 10분 유효시간(PENDING_PAID_TTL_MS)이 있어 계속 실패해도 무한히 쌓이지는 않는다.
+          const failedById = new Map(failed.map((r) => [r.entry.id, r]))
+          const current = loadPendingPaid()
+          const remaining = current
+            .filter((e) => !succeededIds.has(e.id))
+            .map((e) => {
+              const f = failedById.get(e.id)
+              return f ? { id: e.id, at: e.at, paymentId: f.paymentId, orderId: f.orderId } : e
+            })
+          savePendingPaid(remaining)
+          if (succeededIds.size) deps.notify('success', '결제 완료를 전산에 알렸습니다.')
+          if (failed.length) {
+            // 결제 자체는 이미 끝났다 — 취소하라는 뜻이 아니라, 전산이 아직 모른다는 뜻이다.
+            deps.notify(
+              'error',
+              `결제는 완료됐지만 전산에는 알리지 못했습니다 (${failed.length}건). 결제를 취소하지 마세요 — ` +
+              '잠시 후 자동으로 다시 시도합니다. 계속 실패하면 [주문] 탭 내역과 대조해 전산에 직접 확인해주세요.'
+            )
+          }
         })
         .catch(() => {})
     })
@@ -416,6 +502,42 @@ async function runLoadCartToPos(cart) {
         '담기는 됐지만 서버에 알리지 못했습니다. [주문] 탭에 품목이 들어가 있으니 거기서 결제해주세요. ' +
         '이 주문은 목록에 남습니다 — 다시 누르지 마시고, 결제 후 [지우기]로 정리해주세요.'
       )
+      return
+    }
+
+    // ── 단말기가 2대 이상일 때의 분기 ──
+    // consume은 원자적 updateMany라 딱 한 단말기만 인정된다. 진 쪽에도 ok:true가 오지만
+    // body.alreadyProcessed가 true로 붙는다 — 이걸 안 보면 이 단말기도 그대로 결제까지
+    // 밀어붙여서 같은 주문이 두 번 결제된다(치명적). 방금 이 화면에서 담은 품목은 이 주문
+    // 몫이 아니게 됐으니 결제를 시작하면 안 되고, 방금 담아버린 것만 되돌린다
+    // (handleLoadFailure와 같은 방식 — addedKeys만 지운다, 원래 있던 항목은 그대로 둔다).
+    if (reported.body && reported.body.alreadyProcessed) {
+      for (const key of addedKeys) {
+        try {
+          await draftOrder.deleteLineItem(key)
+        } catch {
+          console.error('[erp-cart] 되돌리기 실패 — POS 장바구니를 직접 확인해주세요.', key)
+        }
+      }
+      // 이 단말기에서는 결제를 시작하지 않으므로 결제 대기 기록도 지운다 — 남겨두면 나중에
+      // 이 단말기에서 벌어지는 다른 결제에 이 주문이 딸려가 "결제완료"로 잘못 보고된다.
+      forgetPendingPaid(cart.id)
+      removeCartFromView(cart.id)
+      if (reported.body.status === 'dismissed') {
+        // status가 dismissed라는 건 다른 단말기가 이 주문을 "지우기"로 거부했다는 뜻이다.
+        // 거부된 주문을 결제하면 전산과 어긋난다 — 별도 문구로 확실히 구분해서 안내한다.
+        deps.notify(
+          'error',
+          `다른 단말기에서 이미 거부한 주문입니다 (${cart.referenceId || cart.id}). ` +
+          '방금 담은 품목은 되돌렸습니다. 이 주문은 결제하지 말고 전산에서 다시 확인해주세요.'
+        )
+      } else {
+        deps.notify(
+          'error',
+          `다른 단말기에서 이미 처리한 주문입니다 (${cart.referenceId || cart.id}). ` +
+          '방금 담은 품목은 되돌렸습니다. 이 주문은 결제하지 마세요 — 이미 다른 단말기에서 처리됐습니다.'
+        )
+      }
       return
     }
 
