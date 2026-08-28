@@ -238,7 +238,11 @@ async function runAction(id, action) {
     // 그냥 던지면 crashGuard의 unhandledrejection이 잡아 전체 화면이 오류 패널로 덮인다
     // (버튼 하나 눌렀다고 화면 전체가 하얘지면 안 된다).
     notify('error', '네트워크 연결을 확인해주세요. 처리 여부는 목록에서 다시 확인해주세요.')
-    await loadQueue()
+    // bypassGuard: 자동 폴링이 마침 진행 중이면 가드에 걸려 조용히 아무 일도 안 하고, 방금 누른
+    // 버튼의 결과가 화면에 반영되지 않는다 — 직원은 "안 눌렸나?" 하고 다시 누르게 된다. manual은
+    // 안 쓴다(사람이 새로고침을 누른 게 아니라 방금 뜬 토스트를 화면과 맞추는 것뿐이라, 여기서
+    // setConnection('checking')까지 깜빡이면 방금 본 결과를 의심하게 만드는 군더더기다).
+    await loadQueue({ bypassGuard: true })
     return
   }
   if (!ok) {
@@ -251,7 +255,8 @@ async function runAction(id, action) {
   } else {
     notify('success', ACTION_SUCCESS_MESSAGE[action](body.alreadyProcessed))
   }
-  await loadQueue()
+  // 위와 같은 이유로 bypassGuard만 쓴다.
+  await loadQueue({ bypassGuard: true })
 }
 
 let lastReservations = []
@@ -384,14 +389,28 @@ function applyQueueResponse(body) {
 // setInterval(아래 startPolling)은 콜백이 끝났는지 신경 쓰지 않고 다음 콜백을 그대로 실행한다.
 // 서버가 느려지면 한 단말기에서 응답 못 받은 요청이 계속 쌓이고, 가맹점 400곳이 동시에 그
 // 상태가 되면 서버가 회복되려는 순간 쌓여있던 요청이 한꺼번에 몰려 회복을 방해한다(자기 증폭).
-// 그래서 이전 요청이 아직 안 끝났으면 새 요청을 시작하지 않는다. 다만 사람이 직접 누른
-// 새로고침(manual)은 예외로 통과시킨다 — 자동 폴링과 드물게 겹치는 것보다, 버튼을 눌렀는데
-// 화면이 그대로라 "안 눌렸나?" 싶은 상황이 매장에서는 더 나쁘다.
+// 그래서 이전 요청이 아직 안 끝났으면 새 요청을 시작하지 않는다. 다만 "사람이 방금 뭔가 해서
+// 지금 당장 최신 상태를 보여줘야 하는" 호출(bypassGuard)은 예외로 통과시킨다 — 자동 폴링과
+// 드물게 겹치는 것보다, 버튼을 눌렀는데 화면이 그대로라 "안 눌렸나?" 싶은 상황이 매장에서는
+// 더 나쁘다.
+//
+// 처음엔 manual 하나로 "가드 통과 여부"와 "queueLoadInFlight 플래그를 만질지"를 같이 결정했는데,
+// 그러면 가드를 우회한 호출이 먼저 끝나는 순간 finally에서 플래그를 false로 내려버려 아직 안 끝난
+// 자동 폴링 요청의 팻말을 떼는 사고가 났다(그 직후 폴링 틱이 가드 없이 통과 -> 자동 요청이 겹침).
+// 그래서 지금은 가드를 지키는(자동 폴링) 호출만 플래그를 만지고, bypassGuard로 우회하는 호출은
+// 플래그를 아예 건드리지 않는다 — 남의 팻말을 못 떼게.
+//
+// manual과 bypassGuard는 별개다. manual은 "새로고침 버튼을 사람이 눌렀다"는 뜻으로 setConnection
+// ('checking') 표시까지 겸한다(눌렀는데 아무 표시도 안 바뀌면 그것도 "안 눌렸나?"로 보인다).
+// runAction 사후 갱신과 visibilitychange 복귀는 성공/오류 토스트가 이미 떴거나 그냥 화면을 다시 본
+// 것뿐이라 여기서 또 커넥션 점(dot)을 'checking'으로 깜빡이면 방금 본 성공 결과를 의심하게 만드는
+// 군더더기 신호가 된다 — 그래서 이 둘은 bypassGuard만 쓰고 manual은 쓰지 않는다.
 let queueLoadInFlight = false
 
-async function loadQueue({ manual = false } = {}) {
-  if (queueLoadInFlight && !manual) return false
-  queueLoadInFlight = true
+async function loadQueue({ manual = false, bypassGuard = false } = {}) {
+  const skipGuard = manual || bypassGuard
+  if (queueLoadInFlight && !skipGuard) return false
+  if (!skipGuard) queueLoadInFlight = true
   if (manual || !lastReservations.length) setConnection('checking')
   try {
     const { ok, status, body } = await apiGet('/api/pos/queue')
@@ -425,7 +444,8 @@ async function loadQueue({ manual = false } = {}) {
   } finally {
     // 어느 return 경로로 빠지든(성공/401/서버오류/네트워크오류·타임아웃) 반드시 풀어준다 —
     // 안 풀면 이번 요청 이후로 자동 폴링이 영원히 스스로를 건너뛰게 된다.
-    queueLoadInFlight = false
+    // skipGuard였으면 애초에 세우지도 않았으니 여기서도 건드리지 않는다(남의 팻말을 뗄 수 있어서).
+    if (!skipGuard) queueLoadInFlight = false
   }
 }
 
@@ -506,7 +526,11 @@ document.addEventListener('visibilitychange', () => {
   }
   if (tokenScreenEl.hidden) {
     noteActivity()
-    loadQueue()
+    // bypassGuard: 화면을 다시 봤을 때 자동 폴링이 마침 진행 중이면 가드에 걸려 이 즉시-갱신이
+    // 조용히 씹히고, 바로 위 주석의 "최대 15초 낡은 목록" 상황이 그대로 재현된다. manual은 안
+    // 쓴다 — 사람이 새로고침 버튼을 누른 게 아니라 탭/화면을 다시 본 것뿐이라 커넥션 점을
+    // 'checking'으로 깜빡일 이유가 없다.
+    loadQueue({ bypassGuard: true })
     startPolling()
   }
 })
@@ -595,6 +619,9 @@ async function main() {
   }
 
   showMainView()
+  // 여긴 guard/manual/bypassGuard를 신경 쓸 필요가 없다 — startPolling()이 아직 호출 전이라
+  // 자동 폴링 자체가 존재하지 않고(겹칠 상대가 없음), queueLoadInFlight도 항상 false로 시작한다.
+  // 이 호출이 세우는 팻말은 이 호출 자신만 떼므로 남의 것을 건드릴 일이 없다.
   await loadQueue()
   // loadQueue가 401을 받으면 내부에서 이미 stopPolling()과 함께 토큰 화면으로 전환했다 — 토큰
   // 없이는 어차피 폴링해봐야 401만 반복되므로 그 상태에서는 폴링을 켜지 않는다. 그 외의 실패
