@@ -217,7 +217,21 @@
   .erp-code-set { display: flex; gap: 6px; align-items: center; }
   .erp-code-input { width: 130px; }
   .muted { color: var(--muted); }
-  .erp-cart-filter { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }
+  .erp-cart-filter { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
+  /* 매장 검색창(store-mgmt-filter)도 erp-cart-filter와 같은 줄 배치를 재사용한다 -- 새 레이아웃을
+     또 만들지 않고 filterbar의 검색창(input[type="search"])과 같은 크기/스타일만 가져왔다. */
+  .erp-cart-filter input[type="search"] {
+    padding: 8px 10px;
+    font-size: 13px;
+    border: 1.5px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface);
+    color: var(--ink);
+    outline: none;
+    font-family: inherit;
+    width: 220px;
+  }
+  .erp-cart-filter input[type="search"]:focus { border-color: var(--blue); background: #fff; }
   /* 상태를 한눈에 구분하려고 색을 나눈다 — 목록이 길어지면 글자만으로는 안 읽힌다. */
   .erp-status { display: inline-block; padding: 2px 7px; border-radius: 6px; font-size: 11px; font-weight: 700; }
   .erp-status.pending { background: #fff5dc; color: #8a6100; }
@@ -323,6 +337,11 @@
       <strong>사업자번호</strong>를 채워두면 전산 코드를 손으로 넣지 않아도 됩니다 — 전산이 주문에
       사업자번호를 함께 보내오면 서버가 매장을 찾아 코드를 자동으로 붙입니다.
     </p>
+    <div class="erp-cart-filter" id="store-mgmt-filter" style="display:none">
+      <input type="search" id="store-search-input" placeholder="매장명 또는 merchantId 검색" />
+      <button class="row-btn" id="store-search-btn" type="button">검색</button>
+      <button class="row-btn" id="store-search-clear-btn" type="button">지우기</button>
+    </div>
     <div id="pos-token-body"></div>
   </details>
 
@@ -437,6 +456,14 @@ let currentTab = 'reservations'
 let pollTimer = null
 let stores = []
 let currentStoreId = '' // '' = 전체 매장(본사 뷰). store_admin은 항상 자기 storeId로 고정된다.
+// 매장 목록(드롭다운 + POS 토큰 관리 표가 같은 stores 배열을 공유한다) 페이지네이션/검색 상태.
+// 예약/결제 목록과 같은 이유(400개를 한 번에 그릴 수 없음)로 서버가 이제 페이지 단위로만 준다 --
+// 그래서 매장 선택 드롭다운도 "로드된 매장만" 보여준다. 찾는 매장이 안 보이면 검색하거나
+// 더 보기로 불러오면 된다(예약/결제 검색이 이미 이런 방식이라 새로운 동작 방식이 아니다).
+const STORE_PAGE_LIMIT = 100 // GET /api/admin/stores의 서버 클램프(1~500)와 같은 기준.
+let storesTotal = 0
+let storesHasMore = false
+let storeSearchQuery = ''
 
 // --- 목록 필터/페이지네이션 상태 ---
 // 서버가 이미 createdAt desc로 정렬해서 주므로 클라이언트에서는 절대 재정렬하지 않는다.
@@ -493,6 +520,10 @@ const statusFilterSelect = document.getElementById('status-filter')
 const failedToggleBtn = document.getElementById('failed-toggle-btn')
 const filterNote = document.getElementById('filter-note')
 const posTokenBody = document.getElementById('pos-token-body')
+const storeMgmtFilter = document.getElementById('store-mgmt-filter')
+const storeSearchInput = document.getElementById('store-search-input')
+const storeSearchBtn = document.getElementById('store-search-btn')
+const storeSearchClearBtn = document.getElementById('store-search-clear-btn')
 const searchInput = document.getElementById('search-input')
 const searchBtn = document.getElementById('search-btn')
 const searchClearBtn = document.getElementById('search-clear-btn')
@@ -535,6 +566,8 @@ async function showApp() {
   const isHq = adminRole === 'hq_admin'
   storeAddPanel.style.display = isHq ? '' : 'none'
   storeAdminAddPanel.style.display = isHq ? '' : 'none'
+  // store_admin은 매장이 자기 것 하나뿐이라 검색/더보기가 필요 없다(renderPosTokens의 else 분기).
+  storeMgmtFilter.style.display = isHq ? '' : 'none'
 
   if (isHq) {
     await loadStores()
@@ -556,12 +589,26 @@ async function showApp() {
   pollTimer = setInterval(() => loadAll({ mode: 'refresh' }), 15000)
 }
 
-async function loadStores() {
+// mode: 'reset' -- 검색어 변경/최초 진입 등으로 offset 0부터 다시 불러온다(기존 목록 교체).
+// mode: 'append' -- "더 보기"로 다음 페이지를 이어붙인다.
+async function loadStores({ mode = 'reset' } = {}) {
+  const offset = mode === 'append' ? stores.length : 0
+  const params = new URLSearchParams()
+  params.set('limit', String(STORE_PAGE_LIMIT))
+  params.set('offset', String(offset))
+  if (storeSearchQuery) params.set('q', storeSearchQuery)
   try {
-    const data = await api('/api/admin/stores')
-    stores = data.stores || []
+    const data = await api(`/api/admin/stores?${params.toString()}`)
+    const items = data.stores || []
+    stores = mode === 'append' ? stores.concat(items) : items
+    storesTotal = data.total || 0
+    storesHasMore = !!data.hasMore
   } catch (e) {
-    stores = []
+    if (mode !== 'append') {
+      stores = []
+      storesTotal = 0
+      storesHasMore = false
+    }
   }
   renderStoreSelect()
   renderPosTokens()
@@ -711,12 +758,52 @@ function formatWhen(v) {
          `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }
 
-async function loadErpCarts() {
-  erpCartBody.innerHTML = '<div class="empty">불러오는 중...</div>'
+// 서버 기본 페이지 크기(listErpCarts limit=50, 최대 200)와 맞춘다. pending/failed 건이 이 값을
+// 넘으면 예전엔 오래된 문제 건이 화면에서 조용히 사라져 "이 매장엔 문제가 없다"고 오판하게
+// 됐다 -- 이제 total/hasMore로 "더 있는지"를 알 수 있으니 더보기 버튼을 붙인다.
+const ERP_CART_PAGE_LIMIT = 50
+let erpCartsList = []
+let erpCartsTotal = 0
+let erpCartsHasMore = false
+
+function renderErpCarts() {
+  if (!erpCartsList.length) {
+    erpCartBody.innerHTML = '<div class="empty">해당하는 전산 주문이 없습니다.</div>'
+    return
+  }
+  erpCartBody.innerHTML = `<table>
+      <thead><tr>
+        <th>접수</th><th>참조번호</th><th>매장</th><th>차량</th>
+        <th>금액</th><th>상태</th><th>담김/결제</th>
+      </tr></thead>
+      <tbody>${erpCartsList.map((c) => `<tr>
+        <td>${escapeHtml(formatWhen(c.createdAt))}</td>
+        <td><code>${escapeHtml(c.referenceId)}</code><br>
+            <span class="muted">${c.itemCount}개 품목</span></td>
+        <td>${escapeHtml(c.storeName || '-')}<br>
+            <span class="muted">${escapeHtml(c.erpStoreCode || '')}</span></td>
+        <td>${escapeHtml(c.carNumber || '-')}
+            ${c.linkedReservation ? '<br><span class="muted">예약 연결됨</span>' : ''}</td>
+        <td>${Number(c.totalAmount).toLocaleString('ko-KR')}원</td>
+        <td><span class="erp-status ${escapeHtml(c.status)}">${escapeHtml(ERP_STATUS_LABEL[c.status] || c.status)}</span>
+            ${c.errorMessage ? `<br><span class="muted">${escapeHtml(c.errorMessage)}</span>` : ''}</td>
+        <td>${escapeHtml(formatWhen(c.loadedAt))}<br>
+            <span class="muted">${escapeHtml(formatWhen(c.paidAt))}</span></td>
+      </tr>`).join('')}</tbody>
+    </table>${erpCartsHasMore ? '<div class="load-more-wrap"><button class="row-btn load-more" id="erp-cart-load-more" type="button">더 보기 (' + erpCartsList.length + ' / ' + erpCartsTotal + ')</button></div>' : ''}`
+}
+
+// mode: 'reset' -- 조회/필터 변경 시 offset 0부터 다시 불러온다.
+// mode: 'append' -- "더 보기"로 다음 페이지를 이어붙인다.
+async function loadErpCarts({ mode = 'reset' } = {}) {
+  if (mode !== 'append') erpCartBody.innerHTML = '<div class="empty">불러오는 중...</div>'
+  const offset = mode === 'append' ? erpCartsList.length : 0
   const params = new URLSearchParams()
   if (erpCartStatus.value) params.set('status', erpCartStatus.value)
   // 본사 관리자가 상단에서 특정 매장을 고른 상태면 그 매장만 본다(currentStoreId, '' = 전체).
   if (adminRole === 'hq_admin' && currentStoreId) params.set('storeId', currentStoreId)
+  params.set('limit', String(ERP_CART_PAGE_LIMIT))
+  params.set('offset', String(offset))
   try {
     const res = await fetch(`/api/admin/erp-carts?${params.toString()}`, {
       headers: { authorization: 'Bearer ' + token },
@@ -731,39 +818,23 @@ async function loadErpCarts() {
       erpCartBody.innerHTML = `<div class="empty">${escapeHtml(body.error || '불러오지 못했습니다.')}</div>`
       return
     }
-    if (!body.carts.length) {
-      erpCartBody.innerHTML = '<div class="empty">해당하는 전산 주문이 없습니다.</div>'
-      return
-    }
-    erpCartBody.innerHTML = `<table>
-      <thead><tr>
-        <th>접수</th><th>참조번호</th><th>매장</th><th>차량</th>
-        <th>금액</th><th>상태</th><th>담김/결제</th>
-      </tr></thead>
-      <tbody>${body.carts.map((c) => `<tr>
-        <td>${escapeHtml(formatWhen(c.createdAt))}</td>
-        <td><code>${escapeHtml(c.referenceId)}</code><br>
-            <span class="muted">${c.itemCount}개 품목</span></td>
-        <td>${escapeHtml(c.storeName || '-')}<br>
-            <span class="muted">${escapeHtml(c.erpStoreCode || '')}</span></td>
-        <td>${escapeHtml(c.carNumber || '-')}
-            ${c.linkedReservation ? '<br><span class="muted">예약 연결됨</span>' : ''}</td>
-        <td>${Number(c.totalAmount).toLocaleString('ko-KR')}원</td>
-        <td><span class="erp-status ${escapeHtml(c.status)}">${escapeHtml(ERP_STATUS_LABEL[c.status] || c.status)}</span>
-            ${c.errorMessage ? `<br><span class="muted">${escapeHtml(c.errorMessage)}</span>` : ''}</td>
-        <td>${escapeHtml(formatWhen(c.loadedAt))}<br>
-            <span class="muted">${escapeHtml(formatWhen(c.paidAt))}</span></td>
-      </tr>`).join('')}</tbody>
-    </table>`
+    erpCartsList = mode === 'append' ? erpCartsList.concat(body.carts) : body.carts
+    erpCartsTotal = body.total || 0
+    erpCartsHasMore = !!body.hasMore
+    renderErpCarts()
   } catch (err) {
     erpCartBody.innerHTML = '<div class="empty">요청 중 오류가 발생했습니다.</div>'
   }
 }
 
+erpCartBody.addEventListener('click', (e) => {
+  if (e.target.id === 'erp-cart-load-more') loadErpCarts({ mode: 'append' })
+})
+
 if (erpCartPanel) {
   erpCartPanel.addEventListener('toggle', () => { if (erpCartPanel.open) loadErpCarts() })
-  erpCartReload.addEventListener('click', loadErpCarts)
-  erpCartStatus.addEventListener('change', loadErpCarts)
+  erpCartReload.addEventListener('click', () => loadErpCarts())
+  erpCartStatus.addEventListener('change', () => loadErpCarts())
 }
 
 // --- POS 토큰 관리 (본사는 전체 매장, 매장관리자는 자기 매장만) ---
@@ -809,14 +880,17 @@ function businessNumberCell(businessNumber, editable) {
   </td>`
 }
 
-function posTokenRow(storeId, name, merchantId, posToken, canRegen, erpStoreCode, businessNumber) {
+// posToken: 이미 값을 아는 경우에만 채워서 넘긴다(store_admin 자기 매장, 또는 hq_admin이
+// 한 번 "보기"/"복사"로 이미 받아온 매장). hasToken: 목록 응답의 hasPosToken -- 값 자체는
+// 없지만 토큰이 있기는 한지(빈 매장과 구분)는 알아야 "(없음)"과 "불러와야 함"을 구분할 수 있다.
+function posTokenRow(storeId, name, merchantId, posToken, hasToken, canRegen, erpStoreCode, businessNumber) {
   return `<tr data-store-id="${escapeHtml(storeId)}">
     <td>${escapeHtml(name)}</td>
     <td>${escapeHtml(merchantId)}</td>
     ${businessNumberCell(businessNumber, canRegen)}
     ${erpCodeCell(erpStoreCode, canRegen)}
     <td>
-      <code class="pos-token-value" data-token="${escapeHtml(posToken || '')}" data-visible="false">${maskedToken()}</code>
+      <code class="pos-token-value" data-token="${escapeHtml(posToken || '')}" data-visible="false" data-has-token="${hasToken ? 'true' : 'false'}">${maskedToken()}</code>
       <button class="row-btn pos-token-toggle" type="button">보기</button>
       <button class="row-btn pos-token-copy" type="button">복사</button>
     </td>
@@ -839,27 +913,49 @@ function posTokenRow(storeId, name, merchantId, posToken, canRegen, erpStoreCode
 function renderPosTokens() {
   if (adminRole === 'hq_admin') {
     if (!stores.length) {
-      posTokenBody.innerHTML = '<div class="empty">등록된 매장이 없습니다.</div>'
+      posTokenBody.innerHTML = storeSearchQuery
+        ? '<div class="empty">검색 결과가 없습니다.</div>'
+        : '<div class="empty">등록된 매장이 없습니다.</div>'
       return
     }
     posTokenBody.innerHTML = `<table>
       <thead><tr><th>매장</th><th>merchantId</th><th>사업자번호</th><th>전산 코드</th><th>POS 토큰</th><th>동작</th></tr></thead>
-      <tbody>${stores.map(s => posTokenRow(s.id, s.name, s.merchantId, s.posToken, true, s.erpStoreCode, s.businessNumber)).join('')}</tbody>
-    </table>`
+      <tbody>${stores.map(s => posTokenRow(s.id, s.name, s.merchantId, s.posToken, s.hasPosToken, true, s.erpStoreCode, s.businessNumber)).join('')}</tbody>
+    </table>${storesHasMore ? '<div class="load-more-wrap"><button class="row-btn load-more" id="store-load-more" type="button">더 보기 (' + stores.length + ' / ' + storesTotal + ')</button></div>' : ''}`
   } else {
     if (!myStoreInfo) {
       posTokenBody.innerHTML = '<div class="empty">매장 정보를 불러오지 못했습니다.</div>'
       return
     }
     // store_admin은 토큰 재발급/전산 코드 지정 권한이 없다(둘 다 hq 전용 엔드포인트) —
-    // 버튼 대신 현재 값만 보여준다.
+    // 버튼 대신 현재 값만 보여준다. /api/admin/me가 이미 실제 토큰 값을 포함해 주므로
+    // (자기 매장뿐이라 안전) hq_admin 목록처럼 따로 불러올 필요가 없다.
     posTokenBody.innerHTML = `<table>
-      <tbody>${posTokenRow(myStoreInfo.id, myStoreInfo.name, myStoreInfo.merchantId, myStoreInfo.posToken, false, myStoreInfo.erpStoreCode, myStoreInfo.businessNumber)}</tbody>
+      <tbody>${posTokenRow(myStoreInfo.id, myStoreInfo.name, myStoreInfo.merchantId, myStoreInfo.posToken, Boolean(myStoreInfo.posToken), false, myStoreInfo.erpStoreCode, myStoreInfo.businessNumber)}</tbody>
     </table>`
   }
 }
 
+// 목록 응답엔 posToken 값 자체가 없다(hasPosToken만 있음) -- "보기"/"복사"를 처음 누르는
+// 순간에만 단건 조회로 실제 값을 받아 캐시한다. 이미 받아온 적 있으면(codeEl.dataset.token
+// 또는 stores 배열의 값) 다시 요청하지 않는다.
+async function ensurePosTokenLoaded(tr, storeId, codeEl) {
+  if (codeEl.dataset.token) return codeEl.dataset.token
+  if (codeEl.dataset.hasToken !== 'true') return ''
+  const data = await api(`/api/admin/stores/${storeId}/pos-token`)
+  const value = data.posToken || ''
+  codeEl.dataset.token = value
+  const store = stores.find(s => s.id === storeId)
+  if (store) store.posToken = value
+  return value
+}
+
 posTokenBody.addEventListener('click', async (e) => {
+  if (e.target.id === 'store-load-more') {
+    await loadStores({ mode: 'append' })
+    return
+  }
+
   const tr = e.target.closest('tr')
   if (!tr) return
   const storeId = tr.dataset.storeId
@@ -867,14 +963,47 @@ posTokenBody.addEventListener('click', async (e) => {
 
   if (e.target.classList.contains('pos-token-toggle')) {
     const visible = codeEl.dataset.visible === 'true'
-    codeEl.textContent = visible ? maskedToken() : (codeEl.dataset.token || '(없음)')
-    codeEl.dataset.visible = visible ? 'false' : 'true'
-    e.target.textContent = visible ? '보기' : '숨기기'
+    if (visible) {
+      codeEl.textContent = maskedToken()
+      codeEl.dataset.visible = 'false'
+      e.target.textContent = '보기'
+      return
+    }
+    e.target.disabled = true
+    try {
+      const value = await ensurePosTokenLoaded(tr, storeId, codeEl)
+      codeEl.textContent = value || '(없음)'
+      codeEl.dataset.visible = 'true'
+      e.target.textContent = '숨기기'
+    } catch (err) {
+      if (err.message === 'UNAUTHORIZED') {
+        clearSession()
+        showLogin('세션이 만료되었거나 권한이 없습니다. 다시 로그인해주세요.')
+        return
+      }
+      alert('토큰을 불러오지 못했습니다.')
+    } finally {
+      e.target.disabled = false
+    }
     return
   }
 
   if (e.target.classList.contains('pos-token-copy')) {
-    const tokenVal = codeEl.dataset.token
+    e.target.disabled = true
+    let tokenVal
+    try {
+      tokenVal = await ensurePosTokenLoaded(tr, storeId, codeEl)
+    } catch (err) {
+      e.target.disabled = false
+      if (err.message === 'UNAUTHORIZED') {
+        clearSession()
+        showLogin('세션이 만료되었거나 권한이 없습니다. 다시 로그인해주세요.')
+        return
+      }
+      alert('토큰을 불러오지 못했습니다.')
+      return
+    }
+    e.target.disabled = false
     if (!tokenVal) return
     try {
       await navigator.clipboard.writeText(tokenVal)
@@ -1016,6 +1145,24 @@ function renderStoreSelect() {
 storeSelect.addEventListener('change', () => {
   currentStoreId = storeSelect.value
   loadAll({ mode: 'reset' })
+})
+
+// 매장 검색(본사 전용) -- 예약/결제 검색(searchInput/searchBtn)과 같은 방식이다.
+function runStoreSearch() {
+  storeSearchQuery = storeSearchInput.value.trim()
+  loadStores({ mode: 'reset' })
+}
+storeSearchBtn.addEventListener('click', runStoreSearch)
+storeSearchInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    e.preventDefault()
+    runStoreSearch()
+  }
+})
+storeSearchClearBtn.addEventListener('click', () => {
+  storeSearchQuery = ''
+  storeSearchInput.value = ''
+  loadStores({ mode: 'reset' })
 })
 
 storeAddBtn.addEventListener('click', async () => {

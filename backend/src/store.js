@@ -274,8 +274,34 @@ function createStore({ merchantId, name, businessNumber, posToken }) {
   })
 }
 
-function listStores() {
-  return prisma.store.findMany()
+// 매장 검색(관리자 웹) OR절. buildSearchOr(예약/결제 검색용, 전화번호/차량번호 대상)와는
+// 대상 필드가 완전히 다르고 검색 사유(가맹점을 찾는 것 vs 손님을 찾는 것)도 달라 별도로 뺐다.
+function buildStoreSearchOr(q) {
+  const qRaw = String(q ?? '').trim()
+  if (!qRaw) return null
+  return {
+    OR: [
+      { name: { contains: qRaw } },
+      { merchantId: { contains: qRaw } },
+    ],
+  }
+}
+
+// 매장 목록(관리자 화면) 페이지네이션 + 검색. listReservationsPage/listPaymentsPage와 같은
+// { total, items } 모양을 쓴다 -- 예전 listStores()는 findMany()만 호출해 400개 매장이면 400개를
+// 통째로 내려보냈고, 그 응답에 POS 토큰(posToken)까지 평문으로 실려 있었다. 토큰을 빼는 건
+// 여기가 아니라 호출부(server.js)의 책임이다 -- listErpCarts가 전체 로우를 돌려주고 server.js가
+// 응답 모양을 만드는 것과 같은 층 분리를 따른다.
+// name 오름차순으로 정렬한다 -- 예약/결제처럼 "방금 들어온 게 위로" 와야 하는 실시간 피드가
+// 아니라, 매장을 찾아 설정(토큰/전산코드)을 고치는 정적 참조 목록이라 가나다순으로 훑는 편이
+// 사람이 원하는 매장을 찾기 쉽다.
+async function listStoresPage({ q, limit, offset }) {
+  const where = { ...(buildStoreSearchOr(q) || {}) }
+  const [total, items] = await Promise.all([
+    prisma.store.count({ where }),
+    prisma.store.findMany({ where, orderBy: { name: 'asc' }, take: limit, skip: offset }),
+  ])
+  return { total, items }
 }
 
 // Design Ref: Phase 4 대량 온보딩. 각 항목을 개별 트랜잭션으로 처리해서 하나가 실패(중복 merchantId 등)해도
@@ -1213,16 +1239,28 @@ async function findRepairHistoryByCarNumber(storeId, carNumber, limit = 10) {
 // 관리자 웹에서 전산 주문 이력을 보는 용도. 매장이 "전산에서 보냈는데 POS에 안 떴어요" 할 때
 // 본사가 확인할 방법이 지금까지 없었다 — 접수는 됐는지, POS가 가져갔는지, 실패했는지.
 // storeId가 없으면 전체(본사 관리자), 있으면 그 매장만 본다.
-async function listErpCarts({ storeId, status, limit = 50 }) {
-  return prisma.erpCart.findMany({
-    where: {
-      ...(storeId ? { storeId } : {}),
-      ...(status ? { status } : {}),
-    },
-    orderBy: { createdAt: 'desc' },
-    take: Math.min(Math.max(Number(limit) || 50, 1), 200),
-    include: { store: { select: { name: true, erpStoreCode: true } } },
-  })
+// limit/offset + total을 돌려준다(listReservationsPage/listPaymentsPage와 같은 { total, items }
+// 모양). 예전엔 최대 200건만 보여주고 그 이상은 화면에서 확인할 방법이 없었다 -- pending/failed
+// 건이 200건을 넘으면 오래된 문제 건이 조용히 화면에서 사라져 "이 매장엔 문제가 없다"고
+// 오판하게 되는데, total이 없으면 화면이 "더 있는지"조차 알 수 없어 더보기 버튼을 만들 수 없었다.
+async function listErpCarts({ storeId, status, limit = 50, offset = 0 }) {
+  const where = {
+    ...(storeId ? { storeId } : {}),
+    ...(status ? { status } : {}),
+  }
+  const take = Math.min(Math.max(Number(limit) || 50, 1), 200)
+  const skip = Math.max(Number(offset) || 0, 0)
+  const [total, items] = await Promise.all([
+    prisma.erpCart.count({ where }),
+    prisma.erpCart.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      take,
+      skip,
+      include: { store: { select: { name: true, erpStoreCode: true } } },
+    }),
+  ])
+  return { total, items }
 }
 
 // 매장 직원이 POS 화면에서 이 주문을 치웠을 때. 잘못 온 주문(다른 손님 것, 전산 오조작)을
@@ -1541,7 +1579,7 @@ module.exports = {
   recordFailedLogin,
   changeAdminPassword,
   createStore,
-  listStores,
+  listStoresPage,
   getStore,
   findStoreByMerchantId,
   findStoreByPosToken,

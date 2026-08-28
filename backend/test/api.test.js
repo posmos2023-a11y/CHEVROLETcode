@@ -897,6 +897,148 @@ testSerial('limit은 최대 500으로 클램프된다', async () => {
   assert.equal(response.body.hasMore, true)
 })
 
+// --- 매장 목록 페이지네이션/검색 + POS 토큰 노출 방지 ---
+// 400개 매장이면 listStores()가 전체를 한 번에 내려주면서 posToken까지 평문으로 실어보냈다.
+// 여기서는 (1) 페이지네이션이 예약/결제 목록과 같은 규칙으로 동작하는지, (2) 그 응답 어디에도
+// posToken 값이 없는지를 확인한다. (2)가 이번 작업의 보안 핵심이다.
+
+testSerial('매장 목록은 limit/offset/total/hasMore로 페이지네이션되고, 응답에는 POS 토큰 값이 실려 나오지 않는다', async () => {
+  const admin = await createHqAdmin()
+  const authorization = authHeader(admin)
+
+  const label = unique('storelist')
+  const created = []
+  for (let i = 0; i < 3; i += 1) {
+    created.push(await createStore(`${label}-${i}`))
+  }
+
+  const page1 = await request(app)
+    .get(`/api/admin/stores?limit=2&offset=0&q=${label}`)
+    .set('Authorization', authorization)
+  assert.equal(page1.status, 200, JSON.stringify(page1.body))
+  assert.equal(page1.body.total, 3)
+  assert.equal(page1.body.count, 2)
+  assert.equal(page1.body.hasMore, true)
+
+  const page2 = await request(app)
+    .get(`/api/admin/stores?limit=2&offset=2&q=${label}`)
+    .set('Authorization', authorization)
+  assert.equal(page2.body.count, 1)
+  assert.equal(page2.body.hasMore, false)
+
+  // 보안 핵심: 응답 JSON 문자열 어디에도 실제 posToken 값이 없어야 한다.
+  const rawBody = JSON.stringify(page1.body) + JSON.stringify(page2.body)
+  for (const store of created) {
+    assert.equal(rawBody.includes(store.posToken), false, `응답에 posToken이 노출되었습니다: ${store.posToken}`)
+  }
+  // 값은 안 주더라도 "토큰이 있기는 한지"는 알려줘야 화면의 보기/복사 버튼이 동작한다.
+  assert.ok(page1.body.stores.every((s) => s.hasPosToken === true))
+  assert.ok(page1.body.stores.every((s) => s.posToken === undefined))
+})
+
+testSerial('매장 검색은 매장명/merchantId 부분일치로 동작한다', async () => {
+  const admin = await createHqAdmin()
+  const authorization = authHeader(admin)
+
+  const target = await createStore(unique('findme'))
+  await createStore(unique('other'))
+
+  const byName = await request(app)
+    .get(`/api/admin/stores?q=${encodeURIComponent(target.name)}`)
+    .set('Authorization', authorization)
+  assert.equal(byName.status, 200)
+  assert.ok(byName.body.stores.some((s) => s.id === target.id))
+
+  const byMerchantId = await request(app)
+    .get(`/api/admin/stores?q=${encodeURIComponent(target.merchantId)}`)
+    .set('Authorization', authorization)
+  assert.ok(byMerchantId.body.stores.some((s) => s.id === target.id))
+
+  const noMatch = await request(app)
+    .get(`/api/admin/stores?q=${unique('no-match')}`)
+    .set('Authorization', authorization)
+  assert.equal(noMatch.body.total, 0)
+  assert.equal(noMatch.body.stores.length, 0)
+})
+
+testSerial('POS 토큰 단건 조회는 hq_admin만 가능하고, store_admin은 자기 매장이든 남의 매장이든 볼 수 없다', async () => {
+  const storeA = await createStore('token-a')
+  const storeB = await createStore('token-b')
+  const hqAdmin = await createHqAdmin()
+  const storeAAdmin = await createStoreAdmin(storeA)
+
+  const noAuth = await request(app).get(`/api/admin/stores/${storeA.id}/pos-token`)
+  assert.equal(noAuth.status, 401)
+
+  const hqRes = await request(app)
+    .get(`/api/admin/stores/${storeA.id}/pos-token`)
+    .set('Authorization', authHeader(hqAdmin))
+  assert.equal(hqRes.status, 200)
+  assert.equal(hqRes.body.posToken, storeA.posToken)
+
+  // 이 라우트는 requireRole('hq_admin')이라 store_admin은 role 자체 때문에 막힌다 --
+  // 자기 매장(storeA)이든 남의 매장(storeB)이든 결과는 같은 403이다.
+  const ownStore = await request(app)
+    .get(`/api/admin/stores/${storeA.id}/pos-token`)
+    .set('Authorization', authHeader(storeAAdmin))
+  assert.equal(ownStore.status, 403)
+
+  const otherStore = await request(app)
+    .get(`/api/admin/stores/${storeB.id}/pos-token`)
+    .set('Authorization', authHeader(storeAAdmin))
+  assert.equal(otherStore.status, 403)
+})
+
+testSerial('존재하지 않는 매장의 POS 토큰을 조회하면 404를 반환한다', async () => {
+  const hqAdmin = await createHqAdmin()
+  const res = await request(app)
+    .get('/api/admin/stores/00000000-0000-0000-0000-000000000000/pos-token')
+    .set('Authorization', authHeader(hqAdmin))
+  assert.equal(res.status, 404)
+})
+
+// --- 전산 주문 이력 페이지네이션 ---
+// pending/failed 건이 기존 최대치(200건)를 넘으면 오래된 문제 건이 화면에서 조용히 사라져
+// "이 매장엔 문제가 없다"고 오판하게 됐다. total/hasMore가 있어야 화면이 "더 있는지"를 알 수 있다.
+
+testSerial('전산 주문 이력은 limit/offset/total/hasMore로 페이지네이션된다', async () => {
+  const store = await createStore('erp-cart-pagination')
+  const admin = await createHqAdmin()
+  const authorization = authHeader(admin)
+
+  const base = Date.now() - 10_000
+  const created = []
+  for (let i = 0; i < 3; i += 1) {
+    created.push(
+      await prisma.erpCart.create({
+        data: {
+          storeId: store.id,
+          referenceId: unique(`erp-ref-${i}`),
+          itemsJson: JSON.stringify([{ name: '부품', price: 1000, qty: 1 }]),
+          totalAmount: 1000,
+          createdAt: new Date(base + i * 1000),
+        },
+      })
+    )
+  }
+
+  const page1 = await request(app)
+    .get(`/api/admin/erp-carts?storeId=${store.id}&limit=2&offset=0`)
+    .set('Authorization', authorization)
+  assert.equal(page1.status, 200, JSON.stringify(page1.body))
+  assert.equal(page1.body.total, 3)
+  assert.equal(page1.body.carts.length, 2)
+  assert.equal(page1.body.hasMore, true)
+  assert.deepEqual(page1.body.carts.map((c) => c.id), [created[2].id, created[1].id])
+
+  const page2 = await request(app)
+    .get(`/api/admin/erp-carts?storeId=${store.id}&limit=2&offset=2`)
+    .set('Authorization', authorization)
+  assert.equal(page2.body.carts.length, 1)
+  assert.equal(page2.body.hasMore, false)
+  assert.deepEqual(page2.body.carts.map((c) => c.id), [created[0].id])
+})
+
 // --- 동시성(레이스 컨디션) ---
 
 // --- 접수 알림 실패 추적 + 재발송 (API 계약 v3 §2) ---

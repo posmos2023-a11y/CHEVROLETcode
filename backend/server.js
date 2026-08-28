@@ -20,7 +20,7 @@ const {
   changeAdminPassword,
   getAdminUser,
   createStore,
-  listStores,
+  listStoresPage,
   getStore,
   findStoreByMerchantId,
   findStoreByPosToken,
@@ -1319,8 +1319,20 @@ app.post('/api/payments/:id/retry-receipt', requireAuth, asyncHandler(async (req
 // --- 가맹점(매장) 관리 (본사 관리자 전용) ---
 // 토스플레이스 개발자센터에서 발급된 merchant.id를 우리 store 레코드와 매핑해 등록한다.
 // 등록해야만 그 매장의 플러그인에서 온 예약/결제 요청이 통과된다 (requireStore 참고).
+// 페이지네이션 + 검색(계약 §3.3과 동일 패턴). 400개 매장이면 이전처럼 한 번에 다 내려받고
+// 매장마다 입력창 3개(사업자번호/전산코드/POS토큰)짜리 표를 한 번에 그리는 게 감당이 안 됐다.
+// ⚠️ POS 토큰은 이 목록 응답에 절대 싣지 않는다 -- listStoresPage가 돌려주는 로우에는 posToken이
+// 그대로 있지만(store.js가 어떤 필드를 뺄지는 책임지지 않는다, listErpCarts와 동일한 층 분리),
+// 여기서 posToken을 꺼내 hasPosToken(boolean)으로만 바꿔 내보낸다. 관리자는 인증된 사용자지만
+// 화면에 필요하지도 않은 400개 매장의 비밀값을 매번 평문으로 전부 내려줄 이유가 없다 -- 실제
+// 값은 아래 GET .../pos-token(단건)에서 관리자가 "보기"를 누른 매장 하나만 받는다.
 app.get('/api/admin/stores', requireAuth, requireRole('hq_admin'), asyncHandler(async (req, res) => {
-  return res.json({ ok: true, stores: await listStores() })
+  const q = req.query.q
+  const limit = parseLimit(req.query.limit)
+  const offset = parseOffset(req.query.offset)
+  const { total, items } = await listStoresPage({ q, limit, offset })
+  const stores = items.map(({ posToken, ...rest }) => ({ ...rest, hasPosToken: Boolean(posToken) }))
+  return res.json({ ok: true, count: stores.length, total, hasMore: offset + stores.length < total, stores })
 }))
 
 app.post('/api/admin/stores', requireAuth, requireRole('hq_admin'), asyncHandler(async (req, res) => {
@@ -1433,6 +1445,19 @@ app.post('/api/admin/stores/:id/pos-token', requireAuth, requireRole('hq_admin')
   return res.json({ ok: true, storeId: store.id, posToken: store.posToken })
 }))
 
+// POS 토큰 단건 조회 (본사 전용). GET /api/admin/stores 목록에는 이제 posToken이 실려 오지
+// 않으므로, 관리자 화면에서 "보기"/"복사"를 눌렀을 때만 이 라우트로 그 매장 하나의 실제 값을
+// 받아온다. requireRole('hq_admin')이라 store_admin은 애초에 이 라우트를 호출할 수 없다 --
+// 자기 매장 토큰은 기존처럼 GET /api/admin/me의 store 안에 포함된 값으로 본다(그 라우트는
+// role 제한이 없지만 "자기 매장"만 돌려주므로 안전하다).
+app.get('/api/admin/stores/:id/pos-token', requireAuth, requireRole('hq_admin'), asyncHandler(async (req, res) => {
+  const store = await getStore(req.params.id)
+  if (!store) {
+    return res.status(404).json({ ok: false, error: '매장을 찾을 수 없습니다.' })
+  }
+  return res.json({ ok: true, storeId: store.id, posToken: store.posToken })
+}))
+
 // 쉐보레 전산(ERP) 측 매장 코드 등록/해제 (본사 전용, ERP_CONTRACT_V1 §4.4). 전산이
 // POST /api/erp/draft-orders를 보낼 때 storeCode로 이 값을 지정해 매장을 특정한다.
 // posToken과 달리 이 코드는 "비밀"이 아니라 전산 쪽 식별자를 그대로 반영한 값이라(예:
@@ -1446,15 +1471,21 @@ const ERP_STORE_CODE_RE = /^[A-Za-z0-9_-]+$/
 // 전산 주문 이력 조회. 매장이 "보냈는데 POS에 안 떴어요" 할 때 본사가 어디서 끊겼는지
 // 확인하는 통로다(접수는 됐는지, POS가 가져갔는지, 실패했는지).
 // store_admin은 자기 매장만 본다 — 다른 매장의 차량번호·품목이 보이면 안 된다.
+// limit/offset + total(hasMore 계산용)을 추가했다. 화면이 offset을 안 보내던 시절엔 최대 200건
+// 까지만 보이고 그 이상은 확인할 방법이 없었다 -- pending/failed 건이 200건을 넘으면 오래된
+// 문제 건이 조용히 화면에서 사라져 "이 매장엔 문제가 없다"고 오판하게 된다.
 app.get('/api/admin/erp-carts', requireAuth, asyncHandler(async (req, res) => {
   const storeId = req.admin.role === 'hq_admin'
     ? (req.query.storeId ? String(req.query.storeId) : null)
     : req.admin.storeId
   const status = req.query.status ? String(req.query.status) : null
+  const offset = parseOffset(req.query.offset)
 
-  const rows = await listErpCarts({ storeId, status, limit: req.query.limit })
+  const { total, items: rows } = await listErpCarts({ storeId, status, limit: req.query.limit, offset })
   return res.json({
     ok: true,
+    total,
+    hasMore: offset + rows.length < total,
     carts: rows.map((r) => {
       let items = []
       try { items = JSON.parse(r.itemsJson) } catch { /* 손상된 건은 품목만 빈 배열로 */ }
