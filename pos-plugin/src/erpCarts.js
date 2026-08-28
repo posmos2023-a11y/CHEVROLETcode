@@ -453,6 +453,9 @@ async function runLoadCartToPos(cart) {
   // 지금은 buildLineItem이 key를 직접 발급하므로 그 값을 그대로 들고 있으면 된다 — 담기 전
   // 장바구니를 조회할 이유도 없어졌다.
   const addedKeys = []
+  // alreadyProcessed/dismissed 분기에서 되돌리기 실패를 안내에 특정하기 위한 key→품목명 매핑.
+  // addedKeys는 handleLoadFailure와도 공유하는 배열이라 구조를 바꾸지 않고 별도로 들고 있는다.
+  const addedTitleByKey = new Map()
   try {
     const base = await getBaseCatalogItem()
     if (!base) throw new Error('POS 카탈로그에 등록된 상품이 없습니다. POS에서 상품을 하나 이상 등록해주세요.')
@@ -475,6 +478,7 @@ async function runLoadCartToPos(cart) {
       // addLineItem이 던지면 이 항목은 안 담긴 것이므로, 성공한 뒤에 되돌리기 목록에 넣는다.
       await draftOrder.addLineItem(lineItem)
       addedKeys.push(lineItem.key)
+      addedTitleByKey.set(lineItem.key, item.name)
       done += 1
     }
     if (button) button.textContent = '서버에 알리는 중...'
@@ -512,13 +516,24 @@ async function runLoadCartToPos(cart) {
     // 몫이 아니게 됐으니 결제를 시작하면 안 되고, 방금 담아버린 것만 되돌린다
     // (handleLoadFailure와 같은 방식 — addedKeys만 지운다, 원래 있던 항목은 그대로 둔다).
     if (reported.body && reported.body.alreadyProcessed) {
+      const failedTitles = []
       for (const key of addedKeys) {
         try {
           await draftOrder.deleteLineItem(key)
         } catch {
+          // 콘솔은 매장에서 아무도 안 본다 — 로그는 남기되, 실제 안내는 아래 revertNote로
+          // deps.notify에 실어서 직원 눈에 보이게 한다.
           console.error('[erp-cart] 되돌리기 실패 — POS 장바구니를 직접 확인해주세요.', key)
+          failedTitles.push(addedTitleByKey.get(key) || key)
         }
       }
+      // 되돌리기가 하나라도 실패했는데 "되돌렸습니다"라고 단정하면, 그 말을 믿은 직원이 다음
+      // 결제를 그대로 진행해서 이미 다른 단말기가 처리한 품목이 함께 결제되는 사고로 이어진다
+      // (돈이 잘못되는 경로). 전부 성공했을 때만 단정하고, 하나라도 남으면 무엇이 남았을 수
+      // 있는지와 할 일을 알려준다.
+      const revertNote = failedTitles.length === 0
+        ? '방금 담은 품목은 되돌렸습니다.'
+        : `방금 담은 품목 중 되돌리기에 실패한 것이 있습니다(${failedTitles.join(', ')}). POS 장바구니에 남아 있을 수 있으니 [주문] 탭에서 직접 확인 후 지워주세요.`
       // 이 단말기에서는 결제를 시작하지 않으므로 결제 대기 기록도 지운다 — 남겨두면 나중에
       // 이 단말기에서 벌어지는 다른 결제에 이 주문이 딸려가 "결제완료"로 잘못 보고된다.
       forgetPendingPaid(cart.id)
@@ -529,13 +544,13 @@ async function runLoadCartToPos(cart) {
         deps.notify(
           'error',
           `다른 단말기에서 이미 거부한 주문입니다 (${cart.referenceId || cart.id}). ` +
-          '방금 담은 품목은 되돌렸습니다. 이 주문은 결제하지 말고 전산에서 다시 확인해주세요.'
+          `${revertNote} 이 주문은 결제하지 말고 전산에서 다시 확인해주세요.`
         )
       } else {
         deps.notify(
           'error',
           `다른 단말기에서 이미 처리한 주문입니다 (${cart.referenceId || cart.id}). ` +
-          '방금 담은 품목은 되돌렸습니다. 이 주문은 결제하지 마세요 — 이미 다른 단말기에서 처리됐습니다.'
+          `${revertNote} 이 주문은 결제하지 마세요 — 이미 다른 단말기에서 처리됐습니다.`
         )
       }
       return
