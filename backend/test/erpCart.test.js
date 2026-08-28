@@ -667,6 +667,124 @@ testSerial('자동연결: 형식에 맞지 않는 storeCode는 저장하지 않�
   assert.equal(after.erpStoreCode, null) // 아무것도 붙지 않아야 한다
 })
 
+// --- 매장 등록: 사업자번호 정규화 (단건/일괄) --------------------------------
+// 수정 라우트(.../business-number)는 원래도 자릿수를 확인하고 하이픈 형식으로 정규화해서
+// 저장했는데, 등록 경로 두 곳(단건 POST /api/admin/stores, 400개를 한 번에 넣는
+// POST /api/admin/stores/bulk)은 .trim()만 하고 그대로 저장했다. 그 결과 "123 45 67890"처럼
+// 공백이 섞인 값이 에러 없이 등록됐다가, businessNumberCandidates가 만드는 두 형식(숫자만/
+// 하이픈) 중 어느 쪽과도 안 맞아 전산 자동 연결이 조용히 404 났다 -- 등록 시점엔 아무 신호가
+// 없어서 실제 주문이 들어와야 발견됐다.
+
+function createAdminStore(token, body) {
+  return request(app)
+    .post('/api/admin/stores')
+    .set('authorization', `Bearer ${token}`)
+    .send(body)
+}
+
+function bulkCreateAdminStores(token, stores) {
+  return request(app)
+    .post('/api/admin/stores/bulk')
+    .set('authorization', `Bearer ${token}`)
+    .send({ stores })
+}
+
+testSerial('매장 등록(단건): 공백 섞인 사업자번호는 하이픈 형식으로 정규화해 저장한다', async () => {
+  const merchantId = unique('reg-single-normalize')
+  const res = await createAdminStore(await hqToken(), {
+    merchantId,
+    name: '단건 등록 매장',
+    businessNumber: '123 45 67890',
+  })
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal(res.body.store.businessNumber, '123-45-67890')
+})
+
+testSerial('매장 등록(단건): 자릿수가 틀리면 400으로 거부하고 저장하지 않는다', async () => {
+  // 수정 라우트(.../business-number)와 동작을 맞춘다 -- 단건은 사람이 직접 입력하는 경로라
+  // 여기서 막아도 다른 매장 등록에 영향이 없다.
+  const merchantId = unique('reg-single-bad')
+  const res = await createAdminStore(await hqToken(), {
+    merchantId,
+    name: '단건 등록 매장(불량)',
+    businessNumber: '123 45',
+  })
+  assert.equal(res.status, 400)
+  assert.equal(await prisma.store.findUnique({ where: { merchantId } }), null)
+})
+
+testSerial('매장 등록(단건): 사업자번호를 안 보내도 등록된다(빈 값은 허용)', async () => {
+  // 사업자번호 없이 등록한 뒤 나중에 수정 라우트로 채우는 흐름이 실제로 있다.
+  const merchantId = unique('reg-single-empty')
+  const res = await createAdminStore(await hqToken(), { merchantId, name: '단건 등록 매장(빈 사업자번호)' })
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal(res.body.store.businessNumber, null)
+})
+
+testSerial('매장 등록(일괄): 사업자번호가 틀린 한 건만 실패하고 나머지는 등록된다', async () => {
+  // bulkCreateStores는 400개를 한 번에 올리는 함수다. 한 건이 틀렸다고 전체를 막으면 온보딩
+  // 자체가 멈추므로, merchantId/name 누락과 같은 방식으로 그 항목만 실패 처리하고 나머지는
+  // 계속 등록되게 했다.
+  const goodId1 = unique('bulk-good-1')
+  const badId = unique('bulk-bad')
+  const goodId2 = unique('bulk-good-2')
+  const res = await bulkCreateAdminStores(await hqToken(), [
+    { merchantId: goodId1, name: '일괄 매장 1', businessNumber: '111-11-11111' },
+    { merchantId: badId, name: '일괄 매장 불량', businessNumber: '123 45' },
+    { merchantId: goodId2, name: '일괄 매장 2', businessNumber: '' }, // 빈 값은 허용
+  ])
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal(res.body.successCount, 2, JSON.stringify(res.body))
+  assert.equal(res.body.failCount, 1, JSON.stringify(res.body))
+
+  const badResult = res.body.results.find((r) => r.merchantId === badId)
+  assert.equal(badResult.ok, false)
+
+  assert.ok(await prisma.store.findUnique({ where: { merchantId: goodId1 } }))
+  assert.ok(await prisma.store.findUnique({ where: { merchantId: goodId2 } }))
+  assert.equal(await prisma.store.findUnique({ where: { merchantId: badId } }), null)
+})
+
+testSerial('매장 등록(단건) -> 전산 자동연결: 공백 섞여 등록해도 실제 주문에서 매칭된다', async () => {
+  // 이 작업의 핵심 -- 등록 시점의 정규화가 전산 자동 연결(resolveErpStore)과 실제로 맞물리는지
+  // 확인한다. 등록만 성공하고 매칭이 안 되면(예전 버그) 오픈 후 실제 주문이 들어와야 발견된다.
+  const merchantId = unique('reg-match-single')
+  const created = await createAdminStore(await hqToken(), {
+    merchantId,
+    name: '자동연결 확인 매장(단건)',
+    businessNumber: '123 45 67890',
+  })
+  assert.equal(created.status, 200, JSON.stringify(created.body))
+  assert.equal(created.body.store.businessNumber, '123-45-67890')
+
+  const res = await postCart({
+    storeCode: unique('AUTO-MATCH-SINGLE').toUpperCase().replace(/[^A-Z0-9-]/g, '-'),
+    referenceId: unique('ERP-MATCH-SINGLE'),
+    items: [{ productId: 'P-1', name: '엔진오일', category: '부품', unitPrice: 45000, quantity: 1 }],
+    totalAmount: 45000,
+    businessNumber: '1234567890',
+  })
+  assert.equal(res.status, 201, JSON.stringify(res.body))
+})
+
+testSerial('매장 등록(일괄) -> 전산 자동연결: 정규화해서 등록한 매장이 실제 주문에서 매칭된다', async () => {
+  const merchantId = unique('reg-match-bulk')
+  const bulkRes = await bulkCreateAdminStores(await hqToken(), [
+    { merchantId, name: '자동연결 확인 매장(일괄)', businessNumber: '987 65 43210' },
+  ])
+  assert.equal(bulkRes.status, 200, JSON.stringify(bulkRes.body))
+  assert.equal(bulkRes.body.successCount, 1, JSON.stringify(bulkRes.body))
+
+  const res = await postCart({
+    storeCode: unique('AUTO-MATCH-BULK').toUpperCase().replace(/[^A-Z0-9-]/g, '-'),
+    referenceId: unique('ERP-MATCH-BULK'),
+    items: [{ productId: 'P-1', name: '엔진오일', category: '부품', unitPrice: 45000, quantity: 1 }],
+    totalAmount: 45000,
+    businessNumber: '9876543210',
+  })
+  assert.equal(res.status, 201, JSON.stringify(res.body))
+})
+
 // --- POS 폴링 부하/한도 (400개 매장 규모 대비) ------------------------------
 // 실측으로 드러난 두 가지를 고친 뒤의 회귀 테스트다:
 //   1) 정상 폴링 1건마다 RateLimitHit에 2회 쓰던 문제(increment 후 decrement)

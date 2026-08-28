@@ -11,6 +11,7 @@ const {
   ensureDefaultStore,
   ensureDefaultHqAdmin,
   bulkCreateStores,
+  normalizeBusinessNumber,
   recordWebhookEventOnce,
   findAdminUserByEmail,
   createAdminUser,
@@ -1325,7 +1326,6 @@ app.get('/api/admin/stores', requireAuth, requireRole('hq_admin'), asyncHandler(
 app.post('/api/admin/stores', requireAuth, requireRole('hq_admin'), asyncHandler(async (req, res) => {
   const merchantId = String(req.body?.merchantId ?? '').trim()
   const name = String(req.body?.name ?? '').trim()
-  const businessNumber = String(req.body?.businessNumber ?? '').trim()
 
   if (!merchantId) {
     return res.status(400).json({ ok: false, error: 'merchantId가 필요합니다.' })
@@ -1337,8 +1337,15 @@ app.post('/api/admin/stores', requireAuth, requireRole('hq_admin'), asyncHandler
     return res.status(409).json({ ok: false, error: '이미 등록된 merchantId입니다.' })
   }
 
+  // 단건 등록은 사람이 직접 입력하는 경로라 수정 라우트(.../business-number)와 똑같이 즉시
+  // 거부한다 -- bulkCreateStores(400건 일괄)와 달리 여기서 막아도 다른 매장 등록을 막지 않는다.
+  const bnResult = normalizeBusinessNumber(req.body?.businessNumber)
+  if (!bnResult.ok) {
+    return res.status(400).json({ ok: false, error: bnResult.error })
+  }
+
   // posToken은 createStore 내부에서 crypto.randomBytes(32)로 자동 생성된다(계약 §3.18).
-  const store = await createStore({ merchantId, name, businessNumber })
+  const store = await createStore({ merchantId, name, businessNumber: bnResult.value })
   return res.json({ ok: true, store })
 }))
 
@@ -1431,9 +1438,8 @@ app.post('/api/admin/stores/:id/pos-token', requireAuth, requireRole('hq_admin')
 // posToken과 달리 이 코드는 "비밀"이 아니라 전산 쪽 식별자를 그대로 반영한 값이라(예:
 // CHEV-UJB-001) 별도 시도 횟수 제한 없이 형식만 검증한다.
 const ERP_STORE_CODE_RE = /^[A-Za-z0-9_-]+$/
-// 사업자등록번호 자릿수. 관리자 웹 저장(POST .../business-number)과 전산 자동 연결
-// (resolveErpStore)이 같은 기준을 써야 해서 상수로 뺐다.
-const BUSINESS_NUMBER_DIGITS = 10
+// 사업자등록번호 자릿수와 정규화 로직은 store.js에 있다(등록 경로인 createStore/bulkCreateStores와
+// 같은 기준을 써야 해서 -- 자세한 사연은 store.js의 normalizeBusinessNumber 주석 참고).
 // 이미 등록된 매장의 사업자번호를 채우거나 고친다. 매장 등록 화면에서만 받고 있어서 기존
 // 매장은 손댈 방법이 없었는데, 전산 자동 연결(resolveErpStore)이 이 값을 기준으로 동작하므로
 // 뒤늦게라도 채울 통로가 필요하다.
@@ -1473,21 +1479,14 @@ app.get('/api/admin/erp-carts', requireAuth, asyncHandler(async (req, res) => {
 }))
 
 app.post('/api/admin/stores/:id/business-number', requireAuth, requireRole('hq_admin'), asyncHandler(async (req, res) => {
-  const raw = req.body?.businessNumber
-  const wantsClear = raw === undefined || raw === null || String(raw).trim() === ''
-
-  let value = null
-  if (!wantsClear) {
-    // 표기(하이픈 유무)는 자유롭게 받되 숫자 10자리인지는 확인한다 -- 자릿수가 틀린 값이 들어가면
-    // 자동 연결이 조용히 실패하고, 왜 안 되는지 찾기가 어렵다.
-    const digits = String(raw).replace(/\D/g, '')
-    if (digits.length !== BUSINESS_NUMBER_DIGITS) {
-      return res.status(400).json({ ok: false, error: '사업자번호는 숫자 10자리여야 합니다.' })
-    }
-    value = `${digits.slice(0, 3)}-${digits.slice(3, 5)}-${digits.slice(5)}`
+  // 표기(하이픈 유무)는 자유롭게 받되 숫자 10자리인지는 확인한다 -- 자릿수가 틀린 값이 들어가면
+  // 자동 연결이 조용히 실패하고, 왜 안 되는지 찾기가 어렵다.
+  const result = normalizeBusinessNumber(req.body?.businessNumber)
+  if (!result.ok) {
+    return res.status(400).json({ ok: false, error: result.error })
   }
 
-  const store = await setStoreBusinessNumber(req.params.id, value)
+  const store = await setStoreBusinessNumber(req.params.id, result.value)
   if (!store) {
     return res.status(404).json({ ok: false, error: '매장을 찾을 수 없습니다.' })
   }
@@ -2185,10 +2184,11 @@ app.post('/api/pos/erp-carts/:id/paid', posIpFloodLimiter, posLimiter, requireSt
 // 사업자번호 표기는 "123-45-67890"과 "1234567890"이 섞여 들어온다. 우리 DB에 어느 표기로
 // 저장돼 있는지 통제할 수 없으므로 두 형태를 모두 만들어 조회한다.
 function businessNumberCandidates(raw) {
-  const digits = String(raw ?? '').replace(/\D/g, '')
-  if (digits.length !== BUSINESS_NUMBER_DIGITS) return null
-  const hyphenated = `${digits.slice(0, 3)}-${digits.slice(3, 5)}-${digits.slice(5)}`
-  return [digits, hyphenated]
+  // normalizeBusinessNumber는 등록/수정 경로가 저장 시 쓰는 바로 그 정규화다 -- 여기서 후보를
+  // 따로 계산하면 두 로직이 갈라져 다시 같은 버그(형식 불일치로 자동 연결 실패)가 날 수 있다.
+  const result = normalizeBusinessNumber(raw)
+  if (!result.ok || !result.value) return null
+  return [result.value.replace(/-/g, ''), result.value]
 }
 
 // 반환: { store } | { error: {status, body} }

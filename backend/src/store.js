@@ -236,6 +236,33 @@ function generatePosToken() {
   return crypto.randomBytes(32).toString('hex')
 }
 
+// 사업자등록번호 자릿수. 등록(POST /api/admin/stores, bulkCreateStores)과 수정(POST
+// .../business-number), 전산 자동 연결(server.js의 businessNumberCandidates)이 모두 같은
+// 기준을 써야 해서 상수로 뺐다.
+const BUSINESS_NUMBER_DIGITS = 10
+
+// 사업자번호 정규화 -- 숫자만 남겨 10자리인지 확인하고 하이픈 형식(123-45-67890)으로 통일한다.
+// 원래 이 로직은 수정 라우트(POST .../business-number)에만 있었고 등록 경로 두 곳(단건 POST
+// /api/admin/stores, 400개 매장을 한 번에 넣는 bulkCreateStores)은 .trim()만 해서 그대로
+// 저장했다. 그 결과 "123 45 67890"처럼 공백 섞인 값이 에러 없이 등록됐다가, 전산이 그 사업자
+// 번호로 주문을 보낼 때 businessNumberCandidates가 만드는 두 형식(숫자만/하이픈) 중 어느 쪽과도
+// 안 맞아 조용히 404가 났다 -- 등록 시점엔 아무 신호가 없어서 실제 주문이 들어와야 발견됐다.
+// 세 경로가 전부 이 함수 하나만 쓰게 해서 같은 값이 항상 같은 결과로 저장되게 한다.
+// 반환: { ok: true, value } -- value는 정규화된 문자열이거나(빈 값이면) null.
+//       { ok: false, error } -- 값은 있는데 자릿수가 안 맞는 경우.
+// 빈 값은 항상 허용한다(ok:true, value:null) -- 사업자번호 없이 등록한 뒤 나중에 수정 라우트로
+// 채우는 흐름이 실제로 있어서, "값이 없음"과 "값이 틀림"을 구분해야 한다.
+function normalizeBusinessNumber(raw) {
+  if (raw === undefined || raw === null || String(raw).trim() === '') {
+    return { ok: true, value: null }
+  }
+  const digits = String(raw).replace(/\D/g, '')
+  if (digits.length !== BUSINESS_NUMBER_DIGITS) {
+    return { ok: false, error: '사업자번호는 숫자 10자리여야 합니다.' }
+  }
+  return { ok: true, value: `${digits.slice(0, 3)}-${digits.slice(3, 5)}-${digits.slice(5)}` }
+}
+
 function createStore({ merchantId, name, businessNumber, posToken }) {
   return prisma.store.create({
     data: {
@@ -258,13 +285,21 @@ async function bulkCreateStores(items) {
   for (const item of items) {
     const merchantId = String(item.merchantId ?? '').trim()
     const name = String(item.name ?? '').trim()
-    const businessNumber = String(item.businessNumber ?? '').trim()
     if (!merchantId || !name) {
       results.push({ merchantId, ok: false, error: 'merchantId/name이 필요합니다.' })
       continue
     }
+    // 사업자번호가 틀렸다고 한 건이 전체 업로드를 막지는 않는다 -- 400개를 한 번에 올리는
+    // 함수라 여기서 막으면 온보딩 자체가 멈춘다. 대신 이 항목만 실패로 표시해서(merchantId/name
+    // 누락과 같은 처리) 엑셀 원본을 보고 고쳐 재업로드하면 되게 한다. 조용히 통과시키는 것도
+    // 고려했지만, 그럼 전산 자동 연결이 영원히 404 나는 지금 버그가 그대로 남는다.
+    const bnResult = normalizeBusinessNumber(item.businessNumber)
+    if (!bnResult.ok) {
+      results.push({ merchantId, ok: false, error: bnResult.error })
+      continue
+    }
     try {
-      const store = await createStore({ merchantId, name, businessNumber })
+      const store = await createStore({ merchantId, name, businessNumber: bnResult.value })
       results.push({ merchantId, ok: true, store })
     } catch (e) {
       results.push({ merchantId, ok: false, error: '이미 등록된 merchantId이거나 저장에 실패했습니다.' })
@@ -408,17 +443,6 @@ async function createReservation({ storeId, carNumber, phone, serviceType, idemp
     }
     throw error
   }
-}
-
-// storeId를 안 넘기면(관리자 "전체 매장 보기") 전체를 반환한다.
-// ⚠️ 관리자 목록 화면(GET /api/reservations 등)은 더 이상 이 함수를 쓰지 않는다 — 전체를 메모리로
-// 가져와 JS에서 필터링/역순 처리하면 매장·기간이 늘어날수록 응답이 느려지고 메모리를 낭비하기 때문에
-// listReservationsPage로 교체했다(§6 페이지네이션). 이 함수는 기존 export 시그니처 보존을 위해 남겨둔다.
-function listReservations(storeId) {
-  return prisma.reservation.findMany({
-    where: storeId ? { storeId } : undefined,
-    orderBy: { createdAt: 'asc' },
-  })
 }
 
 // 손님 검색(계약 v3 §3.1) OR절 공통 빌더. qRaw가 빈 문자열이면 필터를 아예 적용하지 않도록
@@ -726,16 +750,6 @@ function createPayment({ storeId, paymentKey, carNumber, serviceType, phone, amo
       privacyConsentAt: privacyConsentAt || null,
       marketingConsentAt: marketingConsentAt || null,
     },
-  })
-}
-
-// storeId를 안 넘기면(관리자 "전체 매장 보기") 전체를 반환한다.
-// ⚠️ listReservations와 같은 이유로 관리자 목록 화면은 더 이상 이 함수를 쓰지 않는다(listPaymentsPage
-// 사용). 기존 export 시그니처 보존을 위해 남겨둔다.
-function listPayments(storeId) {
-  return prisma.payment.findMany({
-    where: storeId ? { storeId } : undefined,
-    orderBy: { createdAt: 'asc' },
   })
 }
 
@@ -1237,18 +1251,6 @@ async function cancelErpCart(referenceId) {
   return result.count > 0
 }
 
-// 향후 결제 웹훅 연동용(계약 §5) -- 지금은 함수만 만들어 둔다. 아직 호출부가 없다.
-async function markErpOrderPaid(referenceId, paidAt) {
-  try {
-    return await prisma.erpOrder.update({
-      where: { referenceId },
-      data: { status: 'paid', paidAt: paidAt || new Date() },
-    })
-  } catch {
-    return null
-  }
-}
-
 // 웹훅 중복 수신 방지. 이미 처리한 x-toss-webhook-id면 false(스킵), 처음 보는 id면 기록하고 true.
 async function recordWebhookEventOnce(webhookId, eventType) {
   try {
@@ -1529,6 +1531,8 @@ module.exports = {
   ensureDefaultStore,
   ensureDefaultHqAdmin,
   bulkCreateStores,
+  BUSINESS_NUMBER_DIGITS,
+  normalizeBusinessNumber,
   recordWebhookEventOnce,
   findAdminUserByEmail,
   getAdminUser,
@@ -1544,7 +1548,6 @@ module.exports = {
   rotatePosToken,
   setPosToken,
   createReservation,
-  listReservations,
   listReservationsPage,
   listActiveQueueForStore,
   getNextWaitingReservation,
@@ -1565,7 +1568,6 @@ module.exports = {
   getPayment,
   markPaymentStatus,
   markPaymentReceiptRetrying,
-  listPayments,
   listPaymentsPage,
   claimDuePromotions,
   markPromoSent,
@@ -1579,7 +1581,6 @@ module.exports = {
   setStoreErpCode,
   findErpOrderByReference,
   upsertErpOrder,
-  markErpOrderPaid,
   createErpCart,
   findErpCartByReference,
   listPendingErpCarts,
