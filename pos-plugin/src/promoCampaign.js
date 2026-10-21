@@ -92,6 +92,91 @@ export function initPromoCampaign(injected) {
     e.preventDefault()
     handleOptOutSubmit().catch((err) => setOptOutMessage(err?.message || String(err), 'error'))
   })
+
+  el('promo-demo-toggle')?.addEventListener('click', () => {
+    handleDemoToggle().catch((err) => deps.notify('error', err?.message || String(err)))
+  })
+}
+
+// --- 시연 모드 ---------------------------------------------------------------------
+// 켜면 그날 자정까지 이 매장의 "같은 번호 30일 내 재발송 금지"가 꺼진다(서버가 자정에 저절로 끈다).
+// 수신 동의·수신거부·야간 금지는 그대로다. 켜는 건 안전장치를 끄는 일이라 두 번 눌러야 켜진다.
+let demoMode = false
+let demoConfirmTimer = null
+
+function formatTime(value) {
+  return new Intl.DateTimeFormat('ko-KR', { month: 'numeric', day: 'numeric', hour: 'numeric', minute: '2-digit' }).format(new Date(value))
+}
+
+function renderDemo(body) {
+  demoMode = Boolean(body.demoMode)
+  const card = el('promo-demo-card')
+  const status = el('promo-demo-status')
+  const btn = el('promo-demo-toggle')
+  if (!card || !status || !btn) return
+  card.classList.toggle('is-on', demoMode)
+  status.textContent = demoMode
+    ? `켜짐 — 같은 번호로 바로 다시 보낼 수 있습니다. ${formatTime(body.demoUntil)}에 저절로 꺼집니다.`
+    : '꺼짐 — 같은 번호에는 30일에 한 번만 보냅니다. 시연할 때만 켜세요(오늘 밤 12시에 저절로 꺼짐).'
+  btn.textContent = demoMode ? '끄기' : '켜기'
+  btn.classList.remove('confirming')
+  btn.disabled = false
+}
+
+// [홍보 문자] 화면을 열 때 부른다(nav.registerViewLoader).
+export async function loadPromoDemo() {
+  if (!deps) return
+  const { ok, status, body } = await deps.apiGet('/api/pos/promo/demo-mode')
+  if (!ok) {
+    if (status === 401) deps.onUnauthorized(body.error)
+    const s = el('promo-demo-status')
+    if (s) s.textContent = '시연 모드 상태를 확인하지 못했습니다.'
+    return
+  }
+  renderDemo(body)
+}
+
+async function handleDemoToggle() {
+  const btn = el('promo-demo-toggle')
+  if (!btn || btn.disabled) return
+  const enabling = !demoMode
+  if (enabling && !demoConfirmTimer) {
+    btn.classList.add('confirming')
+    btn.textContent = '한 번 더 누르면 켜짐'
+    demoConfirmTimer = setTimeout(() => {
+      demoConfirmTimer = null
+      btn.classList.remove('confirming')
+      btn.textContent = '켜기'
+    }, 3000)
+    return
+  }
+  if (demoConfirmTimer) clearTimeout(demoConfirmTimer)
+  demoConfirmTimer = null
+  btn.disabled = true
+  let res
+  try {
+    res = await deps.apiPost('/api/pos/promo/demo-mode', { enabled: enabling })
+  } catch {
+    res = { ok: false, status: 0, body: { error: '서버에 연결하지 못했습니다.' } }
+  }
+  if (!res.ok) {
+    if (res.status === 401) {
+      deps.onUnauthorized(res.body.error)
+      return
+    }
+    btn.disabled = false
+    btn.classList.remove('confirming')
+    btn.textContent = demoMode ? '끄기' : '켜기'
+    deps.notify('error', res.body.error || '시연 모드를 바꾸지 못했습니다.')
+    return
+  }
+  renderDemo(res.body)
+  deps.notify('success', res.body.demoMode ? '시연 모드를 켰습니다. 오늘 밤 12시에 저절로 꺼집니다.' : '시연 모드를 껐습니다.')
+  // 대상 수가 바뀌므로(30일 제외가 풀리거나 다시 걸림) 미리보기를 다시 하게 한다.
+  if (previewState && !sending) {
+    resetPreview()
+    setMessage('시연 모드가 바뀌어 대상이 달라졌습니다. [대상 확인]을 다시 눌러주세요.')
+  }
 }
 
 function excludedText(ex, days) {
@@ -99,8 +184,8 @@ function excludedText(ex, days) {
     ex.optedOut ? `수신거부 ${ex.optedOut}` : '',
     `광고 미동의 ${ex.noConsent}`,
     ex.consentExpired ? `동의 2년 경과 ${ex.consentExpired}` : '',
-    `최근 ${days}일 내 받은 번호 ${ex.recentlySent}`,
-  ].filter(Boolean).join(' · ') + ' 제외'
+    days > 0 ? `최근 ${days}일 내 받은 번호 ${ex.recentlySent}` : '',
+  ].filter(Boolean).join(' · ') + ' 제외' + (days > 0 ? '' : ' (시연 모드: 30일 제한 꺼짐)')
 }
 
 async function preview() {
@@ -120,6 +205,7 @@ async function preview() {
   }
   setMessage('')
   previewState = { from: body.from, to: body.to, eligible: body.eligible }
+  if (typeof body.demoMode === 'boolean') renderDemo(body)
   const rows = (body.sample || [])
     .map((r) => `
       <li>

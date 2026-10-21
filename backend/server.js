@@ -92,6 +92,9 @@ const {
   findLastPromoSend,
   PROMO_MIN_INTERVAL_DAYS,
   PROMO_CONSENT_MAX_AGE_DAYS,
+  getPromoIntervalDays,
+  isPromoDemoActive,
+  setPromoDemoUntil,
   assessPromoPhones,
   claimPromoSend,
   finishPromoSend,
@@ -2130,10 +2133,12 @@ async function evaluatePromoEligibility(storeId, carNumber) {
   }
 
   // 30일: 번호 기준(다른 경로 발송 포함)과 차량 기준(번호가 바뀐 같은 차) 중 더 최근 것.
-  const lastCar = await findLastPromoSend(storeId, carNumber)
+  // 시연 모드인 매장은 기간이 0이라 이 확인을 건너뛴다.
+  const intervalDays = await getPromoIntervalDays(storeId)
+  const lastCar = intervalDays > 0 ? await findLastPromoSend(storeId, carNumber) : null
   const candidates = [assessed.lastSentAt, lastCar?.sentAt].filter(Boolean).map((d) => new Date(d))
   const lastSentAt = candidates.length ? new Date(Math.max(...candidates)) : null
-  if (lastSentAt && Date.now() - lastSentAt.getTime() < PROMO_MIN_INTERVAL_DAYS * 24 * 60 * 60 * 1000) {
+  if (lastSentAt && Date.now() - lastSentAt.getTime() < intervalDays * 24 * 60 * 60 * 1000) {
     return { ok: false, reason: 'recently_sent', message: recentlySentMessage(lastSentAt), lastSentAt }
   }
   return { ok: true, phone: contact.phone, lastSentAt }
@@ -2237,6 +2242,43 @@ app.post('/api/admin/promo-opt-out', requireAuth, asyncHandler(async (req, res) 
   return res.json({ ok: true, storeName: store.name, phoneMasked: maskPhone(phone), optedOutAt: row.optedOutAt })
 }))
 
+// ── 홍보 문자 시연 모드 ─────────────────────────────────────────────────────────
+//
+// 시연할 때 같은 번호로 여러 번 보내 보려고 "30일 내 재발송 금지"만 잠깐 끈다. 켜면 그날 자정(KST)까지로
+// 잡혀 저절로 꺼진다 -- 탭앱은 매장 직원 누구나 만질 수 있어서, 켜 둔 채 잊으면 실제 손님에게 광고가 거듭
+// 나갈 수 있기 때문이다. 수신 동의·수신거부·야간 금지는 시연 모드에서도 그대로다.
+function promoDemoBody(store) {
+  return { ok: true, demoMode: isPromoDemoActive(store), demoUntil: isPromoDemoActive(store) ? store.promoDemoUntil : null }
+}
+
+async function togglePromoDemo(storeId, enabled, actor) {
+  const until = enabled ? kstDateRangeUtc(kstDateString()).end : null
+  const store = await setPromoDemoUntil(storeId, until)
+  logger.info('[promo] 시연 모드', { storeId, enabled: Boolean(enabled), until, ...actor })
+  return store
+}
+
+app.get('/api/pos/promo/demo-mode', posIpFloodLimiter, posQueueReadLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  const store = await prisma.store.findUnique({ where: { id: req.store.id }, select: { promoDemoUntil: true } })
+  return res.json(promoDemoBody(store))
+}))
+
+app.post('/api/pos/promo/demo-mode', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  if (typeof req.body?.enabled !== 'boolean') return res.status(400).json({ ok: false, error: 'enabled(true/false)가 필요합니다.' })
+  const store = await togglePromoDemo(req.store.id, req.body.enabled, { via: 'pos' })
+  return res.json(promoDemoBody(store))
+}))
+
+app.post('/api/admin/promo-demo-mode', requireAuth, asyncHandler(async (req, res) => {
+  const storeId = req.admin.role === 'store_admin' ? req.admin.storeId : String(req.body?.storeId || '').trim()
+  if (!storeId) return res.status(400).json({ ok: false, error: '매장을 선택해주세요.' })
+  if (typeof req.body?.enabled !== 'boolean') return res.status(400).json({ ok: false, error: 'enabled(true/false)가 필요합니다.' })
+  const exists = await prisma.store.findUnique({ where: { id: storeId }, select: { id: true } })
+  if (!exists) return res.status(404).json({ ok: false, error: '매장을 찾을 수 없습니다.' })
+  const store = await togglePromoDemo(storeId, req.body.enabled, { via: 'admin', adminId: req.admin.id })
+  return res.json(promoDemoBody(store))
+}))
+
 // ── 기간 지정 홍보 문자 (관리자 웹) ──────────────────────────────────────────────
 //
 // "○월 ○일 ~ ○월 ○일에 방문한 손님"에게 홍보 문자를 한 번에 보낸다. 광고라서 수동 발송(위)과
@@ -2307,8 +2349,14 @@ function isPromoNightNow() {
 // optOutConfigured: 수신거부 안내 문구(PROMO_OPT_OUT_TEXT)를 운영에서 정했는지. 기본 문구("매장으로 연락")는
 // 손님에게 비용이 드는 방법이라, 080 무료수신거부처럼 무료 수단으로 바꾸라고 화면에서 알린다.
 async function buildPromoCampaignPreview(target) {
-  const result = await listPromoCampaignCandidates(target.store.id, target.start, target.end)
+  const [result, demo] = await Promise.all([
+    listPromoCampaignCandidates(target.store.id, target.start, target.end),
+    prisma.store.findUnique({ where: { id: target.store.id }, select: { promoDemoUntil: true } }),
+  ])
+  const { demoMode, demoUntil } = promoDemoBody(demo)
   return {
+    demoMode,
+    demoUntil,
     ok: true,
     storeName: target.store.name,
     from: target.from,
@@ -2318,7 +2366,7 @@ async function buildPromoCampaignPreview(target) {
     excluded: result.excluded,
     truncated: result.truncated,
     night: isPromoNightNow(),
-    minIntervalDays: PROMO_MIN_INTERVAL_DAYS,
+    minIntervalDays: demoMode ? 0 : PROMO_MIN_INTERVAL_DAYS,
     message: solapi.buildPromoText(target.store.name),
     optOutConfigured: Boolean(process.env.PROMO_OPT_OUT_TEXT),
     sample: result.recipients.slice(0, 50).map((r) => ({

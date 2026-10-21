@@ -652,3 +652,85 @@ testSerial('발송: 야간에는 막힌다(야간에 실행될 때만 확인)', 
   assert.equal(res.body.reason, 'night')
   assert.equal(promoCalls.length, 0)
 })
+
+// --- 시연 모드 ---------------------------------------------------------------------
+
+function posDemo(store, enabled) {
+  return request(app).post('/api/pos/promo/demo-mode').set('X-Store-Token', store.posToken).send({ enabled })
+}
+
+testSerial('시연 모드: 탭앱에서 켜면 그날 자정까지 30일 제한이 꺼져 같은 번호로 다시 보낼 수 있다', async () => {
+  if (!isDaytimeKst()) return
+  const store = await createStore('demo')
+  await visit(store, { phone: '01022220009', daysAgo: 2 })
+  await prisma.promoSend.create({ data: { storeId: store.id, phone: '01022220009', sentAt: new Date(Date.now() - 60 * 1000) } })
+
+  const before = await posPreview(store, { from: kstDate(-7), to: kstDate(0) })
+  assert.equal(before.body.eligible, 0)
+  assert.equal(before.body.demoMode, false)
+
+  const on = await posDemo(store, true)
+  assert.equal(on.status, 200, JSON.stringify(on.body))
+  assert.equal(on.body.demoMode, true)
+  const until = new Date(on.body.demoUntil)
+  assert.equal(new Date(until.getTime() + 9 * 3600 * 1000).toISOString().slice(11, 19), '00:00:00') // KST 자정
+  assert.ok(until.getTime() > Date.now())
+
+  const after = await posPreview(store, { from: kstDate(-7), to: kstDate(0) })
+  assert.equal(after.body.eligible, 1)
+  assert.equal(after.body.minIntervalDays, 0)
+  assert.equal(after.body.demoMode, true)
+
+  // 연달아 두 번 보낼 수 있다
+  for (let i = 0; i < 2; i += 1) {
+    const res = await posSend(store, { from: kstDate(-7), to: kstDate(0), confirmCount: 1 })
+    assert.equal(res.body.sent, 1, JSON.stringify(res.body))
+  }
+  assert.equal(promoCalls.length, 2)
+
+  // 수동(차량별) 발송도 30일 제한 없이 나간다
+  const manual = await request(app).post('/api/pos/promo/send').set('X-Store-Token', store.posToken).send({ carNumber: '12가3456' })
+  assert.equal(manual.status, 200, JSON.stringify(manual.body))
+
+  const off = await posDemo(store, false)
+  assert.equal(off.body.demoMode, false)
+  const back = await posPreview(store, { from: kstDate(-7), to: kstDate(0) })
+  assert.equal(back.body.eligible, 0)
+})
+
+testSerial('시연 모드: 끝나는 시각이 지나면 저절로 꺼진다', async () => {
+  const store = await createStore('demo-expired')
+  await visit(store, { phone: '01022220010', daysAgo: 2 })
+  await prisma.promoSend.create({ data: { storeId: store.id, phone: '01022220010', sentAt: new Date(Date.now() - 60 * 1000) } })
+  await prisma.store.update({ where: { id: store.id }, data: { promoDemoUntil: new Date(Date.now() - 1000) } })
+  const res = await request(app).get('/api/pos/promo/demo-mode').set('X-Store-Token', store.posToken)
+  assert.equal(res.body.demoMode, false)
+  const preview = await posPreview(store, { from: kstDate(-7), to: kstDate(0) })
+  assert.equal(preview.body.eligible, 0)
+})
+
+testSerial('시연 모드: 수신거부·미동의는 시연 모드에서도 빠진다', async () => {
+  const store = await createStore('demo-guard')
+  await visit(store, { phone: '01022220011', daysAgo: 2 })
+  await visit(store, { phone: '01022220012', daysAgo: 2, marketing: false })
+  await posOptOut(store, '01022220011')
+  await posDemo(store, true)
+  const res = await posPreview(store, { from: kstDate(-7), to: kstDate(0) })
+  assert.equal(res.body.eligible, 0)
+  assert.equal(res.body.excluded.optedOut, 1)
+  assert.equal(res.body.excluded.noConsent, 1)
+})
+
+testSerial('시연 모드: 잘못된 값은 400, 토큰 없으면 401, 관리자 웹은 매장 관리자면 자기 매장만', async () => {
+  const store = await createStore('demo-auth')
+  const other = await createStore('demo-auth-other')
+  assert.equal((await request(app).post('/api/pos/promo/demo-mode').set('X-Store-Token', store.posToken).send({ enabled: 'yes' })).status, 400)
+  assert.equal((await request(app).post('/api/pos/promo/demo-mode').send({ enabled: true })).status, 401)
+
+  const { token } = await adminToken('store_admin', store)
+  const res = await request(app).post('/api/admin/promo-demo-mode').set('Authorization', `Bearer ${token}`).send({ storeId: other.id, enabled: true })
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.ok((await prisma.store.findUnique({ where: { id: store.id } })).promoDemoUntil)
+  assert.equal((await prisma.store.findUnique({ where: { id: other.id } })).promoDemoUntil, null)
+  assert.equal((await request(app).post('/api/admin/promo-demo-mode').send({ storeId: store.id, enabled: true })).status, 401)
+})

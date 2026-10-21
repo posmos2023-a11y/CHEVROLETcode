@@ -1443,6 +1443,22 @@ const PROMO_CONSENT_MAX_AGE_DAYS = 730
 // 않게). 이 시간이 지나면 다시 대상이 된다.
 const PROMO_FAILED_RETRY_COOLDOWN_MS = 30 * 60 * 1000
 
+// 이 매장의 재발송 금지 기간(일). 시연 모드(Store.promoDemoUntil이 지금보다 뒤)면 0 -- 같은 번호로 바로
+// 다시 보낼 수 있다.
+function isPromoDemoActive(store) {
+  return Boolean(store?.promoDemoUntil && new Date(store.promoDemoUntil).getTime() > Date.now())
+}
+
+async function getPromoIntervalDays(storeId, db = prisma) {
+  const store = await db.store.findUnique({ where: { id: storeId }, select: { promoDemoUntil: true } })
+  return isPromoDemoActive(store) ? 0 : PROMO_MIN_INTERVAL_DAYS
+}
+
+// 시연 모드를 켜고 끈다. until: 켤 때 끝나는 시각(호출부가 그날 자정 KST로 넘긴다), 끌 때 null.
+function setPromoDemoUntil(storeId, until) {
+  return prisma.store.update({ where: { id: storeId }, data: { promoDemoUntil: until }, select: { id: true, name: true, promoDemoUntil: true } })
+}
+
 // db: prisma 또는 트랜잭션 클라이언트. 트랜잭션 안에서는 쿼리를 하나씩 보낸다(한 연결을 쓴다).
 // 반환: Map(phone -> { status, carNumber, lastVisitAt, consentAt, lastSentAt, recentFailure })
 //   status: ok | opted_out | no_consent | consent_expired | recently_sent
@@ -1452,7 +1468,10 @@ async function assessPromoPhones(storeId, phones, db = prisma) {
   if (!list.length) return assessed
 
   const now = Date.now()
-  const sentCutoff = new Date(now - PROMO_MIN_INTERVAL_DAYS * 24 * 60 * 60 * 1000)
+  const intervalDays = await getPromoIntervalDays(storeId, db)
+  const sentCutoff = new Date(now - intervalDays * 24 * 60 * 60 * 1000)
+  // 실패 기록은 재발송 금지 기간과 따로 최근 30분을 본다(시연 모드에서 기간이 0이어도).
+  const sendsSince = new Date(Math.min(sentCutoff.getTime(), now - PROMO_FAILED_RETRY_COOLDOWN_MS))
   const consentCutoff = new Date(now - PROMO_CONSENT_MAX_AGE_DAYS * 24 * 60 * 60 * 1000)
   const latestSelect = { phone: true, carNumber: true, marketingConsentAt: true, createdAt: true }
   const queries = [
@@ -1473,7 +1492,7 @@ async function assessPromoPhones(storeId, phones, db = prisma) {
       select: { phone: true, optedOutAt: true },
     }),
     () => db.promoSend.findMany({
-      where: { storeId, phone: { in: list }, sentAt: { gte: sentCutoff } },
+      where: { storeId, phone: { in: list }, sentAt: { gte: sendsSince } },
       select: { phone: true, sentAt: true, status: true },
     }),
     () => db.payment.findMany({
@@ -1505,11 +1524,11 @@ async function assessPromoPhones(storeId, phones, db = prisma) {
   for (const s of sends) {
     if (s.status === 'failed') {
       if (now - new Date(s.sentAt).getTime() < PROMO_FAILED_RETRY_COOLDOWN_MS) recentFailure.add(s.phone)
-    } else {
+    } else if (intervalDays > 0 && new Date(s.sentAt) >= sentCutoff) {
       noteSent(s.phone, s.sentAt)
     }
   }
-  for (const p of autoSends) noteSent(p.phone, p.promoSentAt)
+  if (intervalDays > 0) for (const p of autoSends) noteSent(p.phone, p.promoSentAt)
 
   for (const phone of list) {
     const rec = latest.get(phone) || null
@@ -2146,6 +2165,9 @@ module.exports = {
   findLastPromoSend,
   PROMO_MIN_INTERVAL_DAYS,
   PROMO_CONSENT_MAX_AGE_DAYS,
+  getPromoIntervalDays,
+  isPromoDemoActive,
+  setPromoDemoUntil,
   assessPromoPhones,
   claimPromoSend,
   finishPromoSend,

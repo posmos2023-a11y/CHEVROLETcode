@@ -1060,6 +1060,24 @@
     white-space: pre-wrap;
   }
   .promo-optout-card { margin-top: 14px; }
+  .promo-demo-card { margin-bottom: 14px; }
+  .promo-demo-card.is-on { background: #fff6e5; }
+  .promo-demo-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .promo-demo-row .promo-campaign-note { margin-top: 2px; }
+  .promo-demo-button {
+    flex: 0 0 auto;
+    min-height: 44px;
+    padding: 0 16px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: #fff;
+    color: var(--ink, #191f28);
+    font-size: 14px;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  .promo-demo-button:disabled { opacity: 0.5; cursor: default; }
+  .promo-demo-button.confirming { background: var(--red); border-color: var(--red); color: #fff; }
   .promo-optout-title { margin: 0 0 4px; font-size: 15px; }
   .promo-optout-card .promo-campaign-form { margin-top: 10px; }
 
@@ -1400,6 +1418,16 @@
                 <p>기간을 정하면 그 기간에 방문한 손님 중 광고 수신에 동의한 분께 홍보 문자를 보냅니다</p>
               </div>
             </div>
+            <div class="settings-card promo-demo-card" id="promo-demo-card">
+              <div class="promo-demo-row">
+                <div>
+                  <h3 class="promo-optout-title">시연 모드</h3>
+                  <div class="promo-campaign-note" id="promo-demo-status">확인하는 중...</div>
+                </div>
+                <button type="button" class="promo-demo-button" id="promo-demo-toggle" disabled>켜기</button>
+              </div>
+            </div>
+
             <div class="settings-card">
               <form class="promo-campaign-form" id="promo-campaign-form">
                 <label>시작일 <input type="date" id="promo-campaign-from" required /></label>

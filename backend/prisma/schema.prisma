@@ -16,6 +16,10 @@ model Store {
   status         String   @default("active")
   posToken       String?  @unique // 매장별 POS 탭앱 인증 토큰(64자 hex, X-Store-Token 헤더로 검증)
   erpStoreCode   String?  @unique // 쉐보레 전산 측 매장 코드. 전산이 이 값으로 매장을 지정한다.
+  // 홍보 문자 시연 모드가 켜져 있는 마지막 시각. 이 시각 전까지 이 매장은 "같은 번호 30일 내 재발송
+  // 금지"를 적용하지 않는다(시연할 때 같은 번호로 여러 번 보내 보기 위해). 수신 동의·수신거부·야간 금지는
+  // 그대로다. 켜면 그날 자정(KST)까지로 잡혀 저절로 꺼진다 -- 켜 둔 채 잊어도 다음 날엔 원래대로 돌아온다.
+  promoDemoUntil DateTime?
   createdAt      DateTime @default(now())
 
   reservations  Reservation[]
