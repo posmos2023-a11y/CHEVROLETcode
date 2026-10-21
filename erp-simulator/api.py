@@ -154,7 +154,8 @@ class PollStatusWorker(QObject):
     (0.2초 단위) 취소 반응성을 확보한다.
     """
 
-    status_changed = pyqtSignal(dict)  # pending이 아닌 최종 상태
+    status_changed = pyqtSignal(dict)  # 기다리는 상태(wait_statuses)가 아닌 최종 상태
+    progressed = pyqtSignal(dict)  # 기다리는 상태 안에서 상태가 바뀌었을 때(예: pending -> paying)
     timed_out = pyqtSignal()
     poll_failed = pyqtSignal(str)  # 조회 자체가 계속 실패할 때(네트워크 등)
 
@@ -162,10 +163,21 @@ class PollStatusWorker(QObject):
     MAX_SECONDS = 60
     SLEEP_TICK_SECONDS = 0.2
 
-    def __init__(self, client, reference_id):
+    # 프론트 결제는 손님이 카드를 꽂고 끝낼 때까지 기다려야 해서 상한을 길게 준다.
+    FRONT_MAX_SECONDS = 300
+
+    def __init__(self, client, reference_id, wait_statuses=("pending", "paying"), max_seconds=None):
+        """wait_statuses: 이 상태인 동안은 계속 기다린다. POS가 담으면 loaded로, 프론트가 결제하면
+        paid로 끝난다. paying은 프론트에서 손님이 결제 중인 상태다.
+
+        POS로 보낸 건도 매장 탭앱에서 [프론트 결제]로 넘길 수 있다. 그때는 응답의 payTarget이
+        'front'로 바뀌는데, 이를 보면 대기 상한을 FRONT_MAX_SECONDS로 늘린다 — 60초 안에 POS가
+        안 가져갔다고 끝내버리면 프론트 결제 완료를 전산이 모른다."""
         super().__init__()
         self._client = client
         self._reference_id = reference_id
+        self._wait_statuses = tuple(wait_statuses)
+        self._max_seconds = max_seconds or self.MAX_SECONDS
         self._stopped = False
 
     def stop(self):
@@ -178,10 +190,12 @@ class PollStatusWorker(QObject):
             elapsed += self.SLEEP_TICK_SECONDS
 
     def run(self):
-        started_at = time.monotonic()
+        deadline = time.monotonic() + self._max_seconds
+        front_extended = False
         consecutive_errors = 0
+        last_state = None
         while not self._stopped:
-            if time.monotonic() - started_at >= self.MAX_SECONDS:
+            if time.monotonic() >= deadline:
                 self.timed_out.emit()
                 return
             try:
@@ -198,9 +212,18 @@ class PollStatusWorker(QObject):
                 continue
 
             status = result.get("status")
-            if status != "pending":
+            if status not in self._wait_statuses:
                 self.status_changed.emit(result)
                 return
+            if result.get("payTarget") == "front" and not front_extended:
+                deadline = max(deadline, time.monotonic() + self.FRONT_MAX_SECONDS)
+                front_extended = True
+            # 상태나 결제 위치(POS↔프론트)가 바뀌면 알린다. 첫 응답은 전송 직후 상태 그대로라 건너뛴다.
+            state = (status, result.get("payTarget"))
+            if state != last_state:
+                if last_state is not None:
+                    self.progressed.emit(result)
+                last_state = state
 
             self._sleep_interruptible(self.POLL_INTERVAL_SECONDS)
 

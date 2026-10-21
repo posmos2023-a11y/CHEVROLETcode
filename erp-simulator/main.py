@@ -177,6 +177,7 @@ class MainWindow(QMainWindow):
         self._search_text = ""
 
         self._current_reference_id = None
+        self._current_pay_target = "pos"  # 진행 중인 건이 POS 결제인지 프론트 결제인지
         self._threads = []  # (QThread, QObject) 진행 중인 워커들. 창 종료 시 정리한다.
         # 전송 직전의 장바구니 보관본. POS 담기 실패/응답없음일 때 [장바구니 복원]으로 되살린다.
         self._restorable = None
@@ -367,12 +368,20 @@ class MainWindow(QMainWindow):
         self.auto_pay_checkbox.setChecked(True)
         layout.addWidget(self.auto_pay_checkbox)
 
+        # 프론트에서 결제: POS를 거치지 않고 플러그인 모드 프론트가 이 주문을 바로 받아 결제한다.
+        # (토스는 프론트 플러그인과 토스 POS 동시 연결을 지원하지 않는다.) 이때는 POS가 담는 단계가
+        # 없으므로 "결제까지 자동 진행"은 의미가 없어 끈다.
+        self.front_pay_checkbox = QCheckBox("프론트에서 결제 (POS 거치지 않음)")
+        self.front_pay_checkbox.setChecked(False)
+        self.front_pay_checkbox.toggled.connect(self._on_front_pay_toggled)
+        layout.addWidget(self.front_pay_checkbox)
+
         btn_row = QHBoxLayout()
         btn_row.setSpacing(10)
         self.clear_button = QPushButton("비우기")
         self.clear_button.setObjectName("SecondaryButton")
         self.clear_button.clicked.connect(self._on_clear_cart_clicked)
-        self.send_button = QPushButton("POS로 전송")
+        self.send_button = QPushButton(self._send_button_label())
         self.send_button.setObjectName("PrimaryButton")
         self.send_button.clicked.connect(self._on_send_clicked)
         btn_row.addWidget(self.clear_button, 1)
@@ -380,6 +389,18 @@ class MainWindow(QMainWindow):
         layout.addLayout(btn_row)
 
         return panel
+
+    def _is_front_pay(self):
+        checkbox = getattr(self, "front_pay_checkbox", None)
+        return bool(checkbox and checkbox.isChecked())
+
+    def _send_button_label(self):
+        return "프론트로 전송" if self._is_front_pay() else "POS로 전송"
+
+    def _on_front_pay_toggled(self, checked):
+        self.auto_pay_checkbox.setEnabled(not checked)
+        if not getattr(self, "_is_sending", False):
+            self.send_button.setText(self._send_button_label())
 
     def _totals_row(self, label_text, value_label, big=False):
         row = QHBoxLayout()
@@ -569,7 +590,11 @@ class MainWindow(QMainWindow):
             # 기계적으로 쓰려면 별도 필드여야 한다(연동 요청서 §4.3).
             business_number=self.cfg.business_number,
             car_number=self.plate_edit.text().strip(),
+            pay_target="front" if self._is_front_pay() else "pos",
         )
+        # 폴링이 끝날 때까지 이 건이 어디서 결제되는지 기억해둔다 — 전송 뒤에 체크박스를 바꿔도
+        # 진행 중인 건의 상태 문구가 바뀌면 안 된다.
+        self._current_pay_target = "front" if self._is_front_pay() else "pos"
 
         # 새로 보내는 순간 직전 건의 복원 제안은 의미가 없다(보관본은 아래에서 새로 덮인다).
         self.status_restore_button.setVisible(False)
@@ -593,7 +618,7 @@ class MainWindow(QMainWindow):
 
     def _on_send_succeeded(self, reference_id, result):
         self._is_sending = False
-        self.send_button.setText("POS로 전송")
+        self.send_button.setText(self._send_button_label())
 
         if not result.get("ok", True):
             self._on_send_failed(result.get("error") or "알 수 없는 오류가 발생했습니다.")
@@ -643,14 +668,15 @@ class MainWindow(QMainWindow):
             link_note = " · 연결된 예약 없음"
         else:
             link_note = ""
+        waiting_for = "프론트 결제 대기 중" if self._current_pay_target == "front" else "POS 대기 중"
         self._set_status(
-            f"전송됨 · POS 대기 중...{link_note} ({reference_id})", STATUS_COLOR_PENDING
+            f"전송됨 · {waiting_for}...{link_note} ({reference_id})", STATUS_COLOR_PENDING
         )
         self._start_poll(reference_id)
 
     def _on_send_failed(self, message):
         self._is_sending = False
-        self.send_button.setText("POS로 전송")
+        self.send_button.setText(self._send_button_label())
         self._update_send_button_enabled()
         self._set_status(f"❌ 전송 실패: {message}", STATUS_COLOR_ERROR)
 
@@ -659,9 +685,15 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     def _start_poll(self, reference_id):
         client = api.ApiClient(self.cfg.base_url, self.cfg.erp_token)
-        worker = api.PollStatusWorker(client, reference_id)
+        if self._current_pay_target == "front":
+            # 프론트 결제는 손님이 카드를 꽂고 결제를 마칠 때까지 기다려야 한다(pending -> paying -> paid).
+            worker = api.PollStatusWorker(client, reference_id, max_seconds=api.PollStatusWorker.FRONT_MAX_SECONDS)
+        else:
+            # POS로 보낸 건도 매장이 탭앱에서 프론트로 넘기면 워커가 알아서 더 오래 기다린다.
+            worker = api.PollStatusWorker(client, reference_id)
         thread = api.run_in_thread(worker)
 
+        worker.progressed.connect(lambda result: self._on_poll_progressed(reference_id, result))
         worker.status_changed.connect(lambda result: self._on_poll_status_changed(reference_id, result))
         worker.timed_out.connect(lambda: self._on_poll_timed_out(reference_id))
         worker.poll_failed.connect(lambda msg: self._on_poll_failed(reference_id, msg))
@@ -686,7 +718,11 @@ class MainWindow(QMainWindow):
             return  # 이미 취소되었거나 새 전송으로 대체된 낡은 결과는 무시한다.
 
         status = result.get("status")
-        if status == "loaded":
+        if status == "paid":
+            amount = result.get("totalAmount") or 0
+            self._set_status(f"✅ 프론트에서 결제가 끝났습니다 · {format_won(amount)}", STATUS_COLOR_SUCCESS)
+            self._restorable = None
+        elif status == "loaded":
             amount = result.get("totalAmount") or 0
             self._set_status(f"✅ POS 장바구니에 담겼습니다 · {format_won(amount)}", STATUS_COLOR_SUCCESS)
             # 정상적으로 담겼으면 되살릴 이유가 없다 — 복원 버튼을 눌러 같은 주문을 두 번
@@ -706,12 +742,43 @@ class MainWindow(QMainWindow):
         self._poll_thread = None
         self._poll_worker = None
 
+    def _on_poll_progressed(self, reference_id, result):
+        """프론트 결제 중간 상태. 최종 상태가 아니므로 폴링은 계속된다."""
+        if not self._is_current_reference(reference_id):
+            return
+        status = result.get("status")
+        pay_target = result.get("payTarget") or self._current_pay_target
+        moved = pay_target != self._current_pay_target
+        # 매장 탭앱에서 [프론트 결제]/[POS로 되돌리기]를 누르면 결제 위치가 바뀐다. 시간 초과 문구도
+        # 이 값을 보므로 따라 바꿔둔다.
+        self._current_pay_target = pay_target
+
+        if status == "paying":
+            self._set_status(f"💳 손님이 프론트에서 결제 중입니다... ({reference_id})", STATUS_COLOR_PENDING)
+        elif status == "pending" and moved and pay_target == "front":
+            self._set_status(
+                f"매장에서 프론트로 결제를 넘겼습니다 · 프론트 결제 대기 중... ({reference_id})", STATUS_COLOR_PENDING
+            )
+        elif status == "pending" and moved and pay_target == "pos":
+            self._set_status(
+                f"매장에서 POS로 되돌렸습니다 · POS 대기 중... ({reference_id})", STATUS_COLOR_PENDING
+            )
+        elif status == "pending":
+            # 손님이 결제창을 닫았거나 승인이 실패했다. 주문은 그대로 남아 다시 결제할 수 있다.
+            reason = result.get("errorMessage")
+            note = f" · {reason}" if reason else ""
+            self._set_status(
+                f"프론트 결제가 완료되지 않아 다시 기다리는 중...{note} ({reference_id})", STATUS_COLOR_PENDING
+            )
+
     def _on_poll_timed_out(self, reference_id):
         if not self._is_current_reference(reference_id):
             return
-        self._set_status(
-            f"⏱ 응답 없음 · 60초 동안 POS가 가져가지 않았습니다 ({reference_id})", STATUS_COLOR_PENDING
-        )
+        if self._current_pay_target == "front":
+            message = f"⏱ 5분 동안 프론트에서 결제가 끝나지 않았습니다 ({reference_id})"
+        else:
+            message = f"⏱ 응답 없음 · 60초 동안 POS가 가져가지 않았습니다 ({reference_id})"
+        self._set_status(message, STATUS_COLOR_PENDING)
         # 타임아웃은 "아직 pending"일 뿐 실패가 아니다 — POS가 나중에 담아갈 수도 있다.
         # 그래서 복원은 제공하되, 되살려 다시 보내면 중복이 될 수 있다는 걸 버튼을 눌렀을 때
         # 확인받는다(_on_restore_clicked).

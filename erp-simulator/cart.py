@@ -125,7 +125,7 @@ class Cart:
         return " ".join(parts)
 
     def to_api_payload(self, store_code, reference_id, memo, auto_pay,
-                       business_number=None, car_number=None):
+                       business_number=None, car_number=None, pay_target="pos"):
         """연동 요청서 §4.2의 바디를 만든다.
 
         carNumber와 businessNumber는 memo와 **따로** 보낸다. memo에도 같은 값이 들어가지만
@@ -146,4 +146,9 @@ class Cart:
             payload["businessNumber"] = business_number
         if car_number:
             payload["carNumber"] = car_number
+        # 프론트에서 결제할 때만 보낸다. 안 보내면 서버는 기존처럼 POS 결제 건(pos)으로 받는다.
+        # 토스는 프론트 플러그인과 토스 POS 동시 연결을 지원하지 않아서, 프론트 결제 건은 POS를
+        # 거치지 않고 프론트 플러그인이 서버에서 바로 가져가 결제한다.
+        if pay_target == "front":
+            payload["payTarget"] = "front"
         return payload

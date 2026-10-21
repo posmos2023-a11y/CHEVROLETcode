@@ -172,7 +172,7 @@ model ErpCart {
   totalAmount  Int
   memo         String?
   autoPay      Boolean   @default(true)
-  status       String    @default("pending") // pending | loaded | failed | dismissed | expired | cancelled | paid
+  status       String    @default("pending") // pending | loaded | failed | dismissed | expired | cancelled | paid | paying(프론트 결제 진행 중)
   errorMessage String?
   createdAt    DateTime  @default(now())
   loadedAt     DateTime?
@@ -192,7 +192,19 @@ model ErpCart {
   tossPaymentId  String?
   tossOrderId    String?
 
+  // 어디서 결제하는지. 'pos'(기존: POS 탭앱이 담아서 POS 결제) | 'front'(플러그인 모드 프론트가
+  // 직접 결제). 토스는 프론트 플러그인과 토스 POS 동시 연결을 지원하지 않아서, 프론트 결제 건은
+  // POS를 거치지 않고 프론트가 서버에서 바로 가져가 결제한다. POS 탭앱에는 'pos' 건만 내려간다.
+  payTarget        String    @default("pos")
+  // 프론트가 결제를 시작할 때 붙이는 paymentKey(sdk.payment.requestPayment에 넘긴 값). 결제 결과
+  // 보고는 이 값이 맞을 때만 받는다 -- 다른 시도의 늦은 보고가 현재 시도를 덮어쓰지 못하게 한다.
+  frontPaymentKey  String?   @unique
+  frontPayingAt    DateTime?
+  // 승인 결과 중 나중에 취소·대사에 필요한 값만 추려 JSON으로 남긴다(승인번호, 승인시각, 결제수단 등).
+  frontPaymentJson String?
+
   @@index([storeId, status, createdAt])
+  @@index([storeId, payTarget, status, createdAt])
   @@index([storeId, carNumber])
 }
 

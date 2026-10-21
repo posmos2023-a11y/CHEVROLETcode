@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" href="https://static.toss.im/tds/43.9.4/css/tds.min.css" />
+    <link rel="stylesheet" type="text/css" href="https://static.toss.im/tps/main.css" />
+    <link rel="stylesheet" type="text/css" href="https://static.toss.im/tps/others.css" />
+    <script src="https://cdn.tossplace.com/toss-front-sdk/v0/index.js"></script>
+    <script src="./sdk.js"></script>
+    <script src="./api-config.js"></script>
+    <script src="./erp-front-pay.js"></script>
+    <title>정비 결제 - Toss Front Plugin</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script>
+      // 전산이 이 프론트로 보낸 정비 주문을 보여주고 결제한다(erp-front-pay.js 상단 주석 참고).
+      // 대기화면(index.html)이 결제할 주문이 생긴 걸 보고 이 화면으로 넘어온다.
+      const pay = window.ErpFrontPay
+
+      function goHome() {
+        location.href = './index.html'
+      }
+
+      function showMessage(status, title, description, timerMs) {
+        sdk.template.renderResultPage({
+          type: 'image',
+          status,
+          title,
+          description,
+          timerMs: timerMs || 4000,
+          onTimeout: goHome,
+          localeCode: 'ko',
+        })
+      }
+
+      function cartTitle(cart) {
+        return cart.carNumber || cart.memo || cart.referenceId
+      }
+
+      // 주문 품목을 주문내역 템플릿 형식으로 바꾼다. value는 그 줄의 금액(단가 × 수량)이다.
+      function toOrderItems(cart) {
+        return (cart.items || []).map((item) => ({
+          label: String(item.name || item.productId || '품목'),
+          quantity: Number(item.quantity) || 1,
+          value: (Number(item.unitPrice) || 0) * (Number(item.quantity) || 1),
+        }))
+      }
+
+      async function init() {
+        const token = await pay.getToken()
+        if (!token) {
+          showMessage('error', '매장 토큰이 없습니다', '프론트 설정 > 플러그인 설정에서 매장 토큰을 넣어주세요.', 6000)
+          return
+        }
+        const { ok, status, body } = await pay.listCarts(token)
+        if (!ok) {
+          showMessage('error', status === 401 ? '매장 토큰이 올바르지 않습니다' : '주문을 불러오지 못했습니다', body.error)
+          return
+        }
+        const carts = (body.carts || []).filter((c) => !pay.isSnoozed(c.id))
+        if (!carts.length) {
+          goHome()
+          return
+        }
+        if (carts.length === 1) {
+          showOrder(token, carts[0])
+          return
+        }
+        // 여러 건이면 손님이 자기 차를 고르게 한다. 대기 중인 손님 것을 남이 결제하지 않도록
+        // 차량번호를 크게 보여준다.
+        sdk.template.renderSelectPage({
+          title: '결제할 차량을 선택해주세요',
+          subtitle: '차량번호를 확인해주세요',
+          options: carts.map((cart) => ({
+            title: `${cartTitle(cart)} · ${pay.formatWon(cart.totalAmount)}`,
+            onClick: () => showOrder(token, cart),
+          })),
+          onBack: () => {
+            carts.forEach((c) => pay.snooze(c.id))
+            goHome()
+          },
+        })
+      }
+
+      function showOrder(token, cart) {
+        sdk.template.renderOrderPage({
+          localeCode: 'ko',
+          order: {
+            items: toOrderItems(cart),
+            discounts: [],
+            summary: { totalAmount: cart.totalAmount },
+          },
+          onClick: () => startPayment(token, cart),
+        })
+      }
+
+      async function startPayment(token, cart) {
+        const paymentKey = crypto.randomUUID()
+        const started = await pay.startCart(token, cart.id, paymentKey)
+        if (!started.ok) {
+          if (started.status === 409) {
+            showMessage('error', '이미 처리 중인 주문입니다', '다른 기기에서 결제 중이거나 이미 끝난 주문입니다.')
+          } else {
+            showMessage('error', '결제를 시작하지 못했습니다', started.body.error || '잠시 후 다시 시도해주세요.')
+          }
+          return
+        }
+
+        // 결제창을 띄우기 **전에** 기록한다. 결제 도중 플러그인이 다시 로드돼도 다음에 켜질 때
+        // 승인 여부를 확인해 보고할 수 있다(erp-front-pay.js recoverInflight).
+        await pay.saveInflight({ cartId: cart.id, paymentKey })
+
+        let result
+        try {
+          // 금액은 서버가 내려준 값을 쓴다 -- 화면에 들고 있던 값이 그 사이 바뀌었을 수 있다.
+          result = await sdk.payment.requestPayment({
+            paymentKey,
+            tax: started.body.tax,
+            supplyValue: started.body.supplyValue,
+            tip: 0,
+            timeoutMs: 60000,
+            localeCode: 'ko',
+          })
+        } catch (err) {
+          // 예외만으로는 승인 여부를 알 수 없다. 단말기 캐시를 확인해 승인이면 paid로, 아니면 되돌린다.
+          console.error('[erp-pay] requestPayment 예외', err)
+          const recovered = await pay.recoverInflight(token)
+          if (recovered === 'paid') {
+            showPaid(cart, null)
+          } else if (recovered === 'released') {
+            showRetryChoice(token, cart, '결제가 완료되지 않았습니다')
+          } else {
+            showMessage('error', '결제 상태를 확인하지 못했습니다', '직원에게 알려주세요. 결제가 됐는지 확인이 필요합니다.', 8000)
+          }
+          return
+        }
+
+        if (result.type === 'SUCCESS') {
+          const res = await pay.reportResult(token, cart.id, {
+            result: 'paid',
+            paymentKey,
+            payment: pay.extractPayment(result.response),
+          })
+          if (res.ok || (res.status >= 400 && res.status < 500)) {
+            // 4xx는 서버가 대사 필요 오류로 남겼다. 손님 입장에서는 결제가 끝난 것이므로 완료로 안내한다.
+            await pay.clearInflight()
+          }
+          // 보고가 끝내 실패하면(네트워크) 기록을 남겨두고, 다음에 대기화면이 켜질 때 다시 보고한다.
+          showPaid(cart, res.ok ? res.body : null)
+          return
+        }
+
+        // CANCELED / TIMEOUT / 그 외 실패 -- 돈이 나가지 않았다. 다시 결제할 수 있게 되돌린다.
+        const failed = result.type !== 'CANCELED' && result.type !== 'TIMEOUT'
+        const released = await pay.reportResult(token, cart.id, {
+          result: failed ? 'failed' : 'cancelled',
+          paymentKey,
+          errorMessage: failed ? `프론트 결제 실패(${result.type})` : undefined,
+        })
+        if (released.ok || (released.status >= 400 && released.status < 500)) {
+          await pay.clearInflight()
+        }
+        showRetryChoice(token, cart, failed ? '결제에 실패했습니다' : '결제가 취소되었습니다')
+      }
+
+      function showPaid(cart) {
+        sdk.template.renderResultPage({
+          type: 'text',
+          text: pay.formatWon(cart.totalAmount),
+          title: '결제가 완료되었습니다',
+          description: `${cartTitle(cart)} 정비 결제가 끝났습니다. 감사합니다.`,
+          timerMs: 5000,
+          onTimeout: goHome,
+          localeCode: 'ko',
+        })
+      }
+
+      function showRetryChoice(token, cart, title) {
+        sdk.template.renderSelectPage({
+          title,
+          subtitle: `${cartTitle(cart)} · ${pay.formatWon(cart.totalAmount)}`,
+          options: [
+            { title: '다시 결제하기', onClick: () => showOrder(token, cart) },
+            {
+              title: '처음 화면으로',
+              onClick: () => {
+                pay.snooze(cart.id)
+                goHome()
+              },
+            },
+          ],
+          onBack: () => {
+            pay.snooze(cart.id)
+            goHome()
+          },
+        })
+      }
+
+      init()
+    </script>
+  </body>
+</html>

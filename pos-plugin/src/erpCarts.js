@@ -34,6 +34,7 @@ export function initErpCarts(injected) {
     })
   }
 
+  if (frontListEl) frontListEl.addEventListener('click', handleFrontListClick)
   if (!listEl) return
   listEl.addEventListener('click', handleListClick)
 }
@@ -74,6 +75,11 @@ let lastCarts = []
 const inFlight = new Set()
 const consumed = new Set()
 
+// sentToFront: 방금 [프론트 결제]로 넘긴 cart → 넘긴 시각. 넘기기 직전에 출발한 폴링 응답이 그 카드를
+//   POS 목록에 되살리면 직원이 [담기]를 눌러 프론트와 양쪽에서 결제될 수 있다(서버도 막지만 화면에서
+//   먼저 막는다). consumed와 달리 영구가 아니다 -- [POS로 되돌리기]를 하면 다시 POS 목록에 나와야 한다.
+const sentToFront = new Map()
+
 function formatWon(value) {
   return `${Number(value || 0).toLocaleString('ko-KR')}원`
 }
@@ -88,7 +94,7 @@ function summarizeItems(items) {
 
 function renderErpCarts(incoming) {
   // 이미 처리한 건은 폴링 응답에 남아 있더라도 화면에 다시 세우지 않는다(consumed 주석 참고).
-  const carts = incoming.filter((c) => !consumed.has(c.id))
+  const carts = incoming.filter((c) => !consumed.has(c.id) && !sentToFront.has(c.id))
   lastCarts = carts
   if (!listEl) return
   // 담는 중에는 DOM을 건드리지 않는다(inFlight 주석 참고). lastCarts는 위에서 갱신해뒀으므로
@@ -112,6 +118,7 @@ function renderErpCarts(incoming) {
     .map((cart) => {
       const buttonLabel = cart.autoPay ? '담고 결제 시작' : 'POS에 담기'
       const dismissing = dismissConfirm.has(cart.id)
+      const sendingToFront = frontConfirm.has(cart.id)
       return `
         <article class="erp-cart-item" data-cart-id="${deps.escapeHtml(cart.id)}">
           <div class="erp-cart-ref">${deps.escapeHtml(cart.referenceId || '')}</div>
@@ -124,6 +131,8 @@ function renderErpCarts(incoming) {
           <div class="erp-cart-total">${formatWon(cart.totalAmount)}</div>
           <div class="erp-cart-actions">
             <button class="erp-cart-button" type="button" data-cart-id="${deps.escapeHtml(cart.id)}">${buttonLabel}</button>
+            <button class="erp-cart-front${sendingToFront ? ' confirming' : ''}" type="button"
+                    data-cart-id="${deps.escapeHtml(cart.id)}">${sendingToFront ? '프론트로 넘길까요?' : '프론트 결제'}</button>
             <button class="erp-cart-dismiss${dismissing ? ' confirming' : ''}" type="button"
                     data-cart-id="${deps.escapeHtml(cart.id)}">${dismissing ? '정말 지울까요?' : '지우기'}</button>
           </div>
@@ -215,7 +224,166 @@ async function dismissCart(cartId) {
   }
 }
 
+// ── 프론트로 결제 넘기기 ──────────────────────────────────────────────────────
+// 토스는 프론트 플러그인과 토스 POS 동시 연결을 지원하지 않는다. 플러그인 모드 프론트는 POS와
+// 페어링되지 않으므로, 넘기기는 서버의 주문 상태(payTarget)를 바꾸는 것으로 한다 -- 프론트 플러그인이
+// 서버를 폴링하다가 그 주문을 가져가 결제한다(front-plugin/erp-pay.html).
+// [지우기]와 같은 2단계 확인(3초 안에 한 번 더)을 쓴다. 잘못 넘겨도 [POS로 되돌리기]로 돌릴 수 있지만,
+// 손님이 그 사이 프론트에서 결제를 시작하면 되돌릴 수 없다.
+const frontConfirm = new Map()
+
+function clearFrontConfirm(cartId) {
+  const timeoutId = frontConfirm.get(cartId)
+  if (timeoutId) clearTimeout(timeoutId)
+  frontConfirm.delete(cartId)
+}
+
+function handleFrontClick(cartId) {
+  if (frontConfirm.has(cartId)) {
+    clearFrontConfirm(cartId)
+    sendCartToFront(cartId)
+    return
+  }
+  Array.from(frontConfirm.keys()).forEach(clearFrontConfirm)
+  Array.from(dismissConfirm.keys()).forEach(clearDismissConfirm)
+  frontConfirm.set(cartId, setTimeout(() => {
+    frontConfirm.delete(cartId)
+    renderErpCarts(lastCarts)
+  }, 3000))
+  renderErpCarts(lastCarts)
+}
+
+async function sendCartToFront(cartId) {
+  const cart = lastCarts.find((c) => c.id === cartId)
+  inFlight.add(cartId)
+  try {
+    let ok, status, body
+    try {
+      ;({ ok, status, body } = await deps.apiPost(`/api/pos/erp-carts/${cartId}/send-to-front`))
+    } catch {
+      deps.notify('error', '서버에 연결하지 못해 프론트로 넘기지 못했습니다. 잠시 후 다시 시도해주세요.')
+      return
+    }
+    if (!ok) {
+      if (status === 401) {
+        deps.onUnauthorized(body.error)
+        return
+      }
+      deps.notify('error', body.error || '프론트로 넘기지 못했습니다.')
+      return
+    }
+    sentToFront.set(cartId, Date.now())
+    lastCarts = lastCarts.filter((c) => c.id !== cartId)
+    deps.notify('success', `프론트로 넘겼습니다${cart?.carNumber ? ` (${cart.carNumber})` : ''}. 손님이 프론트에서 결제하면 됩니다.`)
+  } finally {
+    inFlight.delete(cartId)
+    renderErpCarts(lastCarts)
+  }
+}
+
+// ── 프론트 결제 대기 목록 ─────────────────────────────────────────────────────
+// 넘긴 주문이 화면에서 그냥 사라지면 직원은 그 주문이 어디 있는지 모르고 되돌릴 수도 없다.
+// 프론트에서 결제 대기(pending)·진행(paying) 중인 주문을 따로 보여주고, 대기 중이면 되돌릴 수 있게 한다.
+const frontListEl = document.getElementById('front-cart-list')
+const frontSectionEl = document.getElementById('front-cart-section')
+const returnConfirm = new Map()
+let lastFrontCarts = []
+
+// 넘긴 직후에는 서버의 frontCarts에 아직 안 실린 응답이 올 수 있어 잠깐은 기억해 둔다.
+const SENT_TO_FRONT_GRACE_MS = 15 * 1000
+
+function renderFrontCarts() {
+  if (!frontListEl) return
+  if (frontSectionEl) frontSectionEl.hidden = lastFrontCarts.length === 0
+  frontListEl.innerHTML = lastFrontCarts
+    .map((cart) => {
+      const paying = cart.status === 'paying'
+      const confirming = returnConfirm.has(cart.id)
+      return `
+        <article class="erp-cart-item front-cart-item" data-cart-id="${deps.escapeHtml(cart.id)}">
+          <div class="erp-cart-ref">${deps.escapeHtml(cart.referenceId || '')}</div>
+          <div class="erp-cart-head">
+            <strong class="erp-cart-car">${deps.escapeHtml(cart.carNumber || cart.memo || '-')}</strong>
+            <span class="front-cart-status${paying ? ' paying' : ''}">${paying ? '손님 결제 중' : '프론트 결제 대기'}</span>
+          </div>
+          <div class="erp-cart-total">${formatWon(cart.totalAmount)}</div>
+          ${paying ? '' : `
+          <div class="erp-cart-actions">
+            <button class="erp-cart-return${confirming ? ' confirming' : ''}" type="button"
+                    data-cart-id="${deps.escapeHtml(cart.id)}">${confirming ? '정말 되돌릴까요?' : 'POS로 되돌리기'}</button>
+          </div>`}
+        </article>
+      `
+    })
+    .join('')
+}
+
+export function applyFrontCarts(carts) {
+  if (!deps) return
+  lastFrontCarts = Array.isArray(carts) ? carts : []
+  // 서버 목록에서 사라진 건(결제 끝남/되돌려짐/취소)은 잠깐의 유예 뒤 잊는다.
+  const ids = new Set(lastFrontCarts.map((c) => c.id))
+  const now = Date.now()
+  for (const [id, at] of sentToFront) {
+    if (!ids.has(id) && now - at > SENT_TO_FRONT_GRACE_MS) sentToFront.delete(id)
+  }
+  renderFrontCarts()
+}
+
+function handleReturnClick(cartId) {
+  if (returnConfirm.has(cartId)) {
+    clearTimeout(returnConfirm.get(cartId))
+    returnConfirm.delete(cartId)
+    returnCartToPos(cartId)
+    return
+  }
+  Array.from(returnConfirm.values()).forEach(clearTimeout)
+  returnConfirm.clear()
+  returnConfirm.set(cartId, setTimeout(() => {
+    returnConfirm.delete(cartId)
+    renderFrontCarts()
+  }, 3000))
+  renderFrontCarts()
+}
+
+async function returnCartToPos(cartId) {
+  let ok, status, body
+  try {
+    ;({ ok, status, body } = await deps.apiPost(`/api/pos/erp-carts/${cartId}/return-to-pos`))
+  } catch {
+    deps.notify('error', '서버에 연결하지 못해 되돌리지 못했습니다. 잠시 후 다시 시도해주세요.')
+    return
+  }
+  if (!ok) {
+    if (status === 401) {
+      deps.onUnauthorized(body.error)
+      return
+    }
+    deps.notify('error', body.error || '되돌리지 못했습니다.')
+    return
+  }
+  sentToFront.delete(cartId)
+  lastFrontCarts = lastFrontCarts.filter((c) => c.id !== cartId)
+  renderFrontCarts()
+  deps.notify('success', 'POS로 되돌렸습니다. 전산 주문 목록에서 담을 수 있습니다.')
+  // 다음 폴링을 기다리지 않고 바로 POS 목록에 다시 보이게 한다.
+  refreshErpCarts()
+}
+
+function handleFrontListClick(e) {
+  const btn = e.target.closest('button.erp-cart-return')
+  if (!btn || btn.disabled) return
+  handleReturnClick(btn.dataset.cartId)
+}
+
 function handleListClick(e) {
+  const frontBtn = e.target.closest('button.erp-cart-front')
+  if (frontBtn && !frontBtn.disabled) {
+    const id = frontBtn.dataset.cartId
+    if (!inFlight.has(id) && !consumed.has(id)) handleFrontClick(id)
+    return
+  }
+
   const dismissBtn = e.target.closest('button.erp-cart-dismiss')
   if (dismissBtn && !dismissBtn.disabled) {
     const id = dismissBtn.dataset.cartId
@@ -496,6 +664,29 @@ async function runLoadCartToPos(cart) {
     // 화면이 죽든 말든 상태는 남는다.
     rememberLoadedCart(cart.id)
     const reported = await reportConsume(cart.id, { result: 'loaded' })
+
+    // 이 주문은 그 사이 프론트로 넘어갔다(다른 단말기가 넘겼거나, 넘기기 직전 화면이 남아 있었다).
+    // 아래 일반 실패 안내("[주문] 탭에서 결제해주세요")를 타면 POS와 프론트 양쪽에서 결제된다 --
+    // 방금 담은 품목을 되돌리고 결제하지 말라고 분명히 알린다.
+    if (!reported.ok && reported.status === 409 && reported.body?.payTarget === 'front') {
+      const failedTitles = []
+      for (const key of addedKeys) {
+        try {
+          await draftOrder.deleteLineItem(key)
+        } catch {
+          console.error('[erp-cart] 되돌리기 실패 — POS 장바구니를 직접 확인해주세요.', key)
+          failedTitles.push(addedTitleByKey.get(key) || key)
+        }
+      }
+      forgetPendingPaid(cart.id)
+      sentToFront.set(cart.id, Date.now())
+      lastCarts = lastCarts.filter((c) => c.id !== cart.id)
+      const revertNote = failedTitles.length === 0
+        ? '방금 담은 품목은 되돌렸습니다.'
+        : `방금 담은 품목 중 되돌리기에 실패한 것이 있습니다(${failedTitles.join(', ')}). [주문] 탭에서 직접 지워주세요.`
+      deps.notify('error', `프론트에서 결제하도록 넘긴 주문입니다. ${revertNote} POS에서는 결제하지 마세요.`)
+      return
+    }
 
     if (!reported.ok) {
       // 아직 결제는 시작하지 않았다. 서버가 어떤 상태인지 모르는 채로 결제까지 자동으로

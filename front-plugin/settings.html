@@ -8,31 +8,107 @@
     <link rel="stylesheet" type="text/css" href="https://static.toss.im/tps/others.css" />
     <script src="https://cdn.tossplace.com/toss-front-sdk/v0/index.js"></script>
     <script src="./sdk.js"></script>
+    <script src="./api-config.js"></script>
+    <script src="./erp-front-pay.js"></script>
     <title>설정 - Toss Front Plugin</title>
   </head>
   <body>
     <!--
-      플러그인 설정 화면. 지금은 매장/알림톡 관련 값이 전부 서버 .env로
-      관리되고 있어(README "알림톡 템플릿 변수" 참고) 단말기에서 바꿀 값이 없다.
-      renderResultPage(type:text)로 안내 문구를 보여준다. timerMs가 지나면
-      자동으로 대기화면으로 돌아간다 (값을 명시하지 않으면 SDK 기본 카운트다운이
-      적용되는데 몇 초인지 문서에 명시가 없어서 명시적으로 지정해둔다).
-      나중에 결제금액 자동입력 등 단말기별 설정이 필요해지면
-      sdk.template.renderInputPage + sdk.storage로 값을 저장하도록 확장하면 된다.
+      플러그인 설정 화면(프론트 설정 > 플러그인 선택 > 플러그인 설정).
+      전산 주문을 이 프론트에서 결제하려면 매장 토큰(X-Store-Token)이 필요하다. POS 탭앱과 같은
+      값이며, 관리자 웹 [매장 개통 설정] > 해당 매장 > POS 토큰 [보기]에서 확인한다.
+      매장 토큰을 넣지 않은 프론트는 기존 기능(예약/결제)만 쓴다.
     -->
     <div id="app"></div>
     <script>
-      sdk.template.renderResultPage({
-        type: 'text',
-        text: '설정 없음',
-        title: '플러그인 설정',
-        description: '현재 단말기에서 바꿀 수 있는 설정이 없습니다.',
-        timerMs: 10000,
-        onTimeout: () => {
-          location.href = './index.html'
-        },
-        localeCode: 'ko',
-      })
+      const pay = window.ErpFrontPay
+
+      function goHome() {
+        location.href = './index.html'
+      }
+
+      async function showMenu(notice) {
+        const token = await pay.getToken()
+        let subtitle = '전산 주문 결제를 쓰려면 매장 토큰을 넣어주세요.'
+        if (token) {
+          const { ok, status, body } = await pay.listCarts(token)
+          subtitle = ok
+            ? `연결됨: ${body.storeName || '매장'}`
+            : status === 401
+              ? '저장된 매장 토큰이 올바르지 않습니다. 다시 넣어주세요.'
+              : '서버에 연결하지 못했습니다. 인터넷 연결을 확인해주세요.'
+        }
+        const options = [
+          { title: '매장 토큰 직접 입력', onClick: () => showTokenInput() },
+          { title: 'QR로 매장 토큰 입력', onClick: () => showTokenScan() },
+        ]
+        if (token) {
+          options.push({
+            title: '매장 토큰 지우기',
+            onClick: async () => {
+              await pay.clearToken()
+              showMenu('매장 토큰을 지웠습니다. 전산 주문 결제가 꺼졌습니다.')
+            },
+          })
+        }
+        options.push({ title: '나가기', onClick: goHome })
+
+        sdk.template.renderSelectPage({
+          title: '전산 주문 결제 설정',
+          subtitle: notice ? `${notice}\n${subtitle}` : subtitle,
+          options,
+          onBack: goHome,
+        })
+      }
+
+      function showTokenInput(errorText) {
+        sdk.template.renderInputPage({
+          type: 'text',
+          top: {
+            title: '매장 토큰을 입력해주세요',
+            subtitle: errorText || '관리자 웹 [매장 개통 설정]의 POS 토큰과 같은 값입니다.',
+          },
+          input: { placeholder: '매장 토큰', type: 'password' },
+          button: { label: '저장' },
+          onSubmit: (value) => saveToken(value, showTokenInput),
+          onBack: () => showMenu(),
+        })
+      }
+
+      function showTokenScan() {
+        sdk.template.renderQRScanPage({
+          title: '매장 토큰 QR을 화면에 비춰주세요',
+          onSuccess: (data) => saveToken(data?.value, () => showMenu('QR에서 올바른 매장 토큰을 읽지 못했습니다.')),
+          onBack: () => showMenu(),
+        })
+      }
+
+      // 저장하기 전에 서버에 실제로 물어본다. 틀린 값을 저장하면 대기화면이 조용히 아무것도
+      // 안 가져와서, 직원은 설정을 마쳤다고 믿는데 전산 주문이 안 뜬다.
+      async function saveToken(raw, onInvalid) {
+        const token = String(raw || '').trim()
+        if (!token) {
+          onInvalid('매장 토큰을 입력해주세요.')
+          return
+        }
+        const { ok, status, body } = await pay.listCarts(token)
+        if (!ok) {
+          onInvalid(status === 401 ? '매장 토큰이 올바르지 않습니다.' : (body.error || '서버에 연결하지 못했습니다.'))
+          return
+        }
+        await pay.setToken(token)
+        sdk.template.renderResultPage({
+          type: 'image',
+          status: 'success',
+          title: '매장 토큰을 저장했습니다',
+          description: `${body.storeName || '매장'}의 전산 주문을 이 프론트에서 결제합니다.`,
+          timerMs: 4000,
+          onTimeout: goHome,
+          localeCode: 'ko',
+        })
+      }
+
+      showMenu()
     </script>
   </body>
 </html>

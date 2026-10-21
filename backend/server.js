@@ -67,6 +67,12 @@ const {
   markErpCartFailed,
   markErpCartDismissed,
   markErpCartPaid,
+  markErpCartFrontPaying,
+  releaseErpCartFrontPaying,
+  markErpCartFrontPaid,
+  sendErpCartToFront,
+  returnErpCartToPos,
+  listFrontErpCartsForPos,
   listErpCarts,
   getPosDailySummary,
   findRepairHistoryByCarNumber,
@@ -191,6 +197,8 @@ app.options('/api/payments', methodAwarePreflight({ GET: adminCors }, publicCors
 
 // POS 탭앱/웹훅은 항상 전체 허용(§8).
 app.use('/api/pos', publicCors)
+// 프론트 플러그인은 단말기 로컬 서버(예: 172.30.1.54:9900) 오리진에서 부르므로 POS와 같이 전체 허용한다.
+app.use('/api/front', publicCors)
 app.use('/api/webhooks', publicCors)
 
 // 웹훅 서명 검증(HMAC)은 재직렬화한 JSON이 아니라 원본 바이트가 필요해서, verify 훅으로
@@ -983,9 +991,10 @@ app.get('/api/pos/queue', posIpFloodLimiter, posQueueReadLimiter, requireStoreTo
   // 대기열과 전산 장바구니를 한 응답에 함께 담는다. 예전에는 탭앱이 두 경로를 각각 폴링해서
   // 매장당 요청이 두 배였다 -- 400개 매장 기준 초당 160건 중 절반이 이 때문이었다.
   // 두 조회는 서로 무관하므로 병렬로 던진다.
-  const [reservations, erpCarts] = await Promise.all([
+  const [reservations, erpCarts, frontCartRows] = await Promise.all([
     listActiveQueueForStore(req.store.id, serviceDate),
     loadPendingErpCartsForResponse(req.store.id),
+    listFrontErpCartsForPos(req.store.id, 20),
   ])
   return res.json({
     ok: true,
@@ -993,6 +1002,17 @@ app.get('/api/pos/queue', posIpFloodLimiter, posQueueReadLimiter, requireStoreTo
     storeName: req.store.name,
     // 구버전 탭앱은 이 필드를 무시하고 /api/pos/erp-carts를 계속 부른다(그 경로도 살아 있다).
     erpCarts,
+    // 프론트에서 결제 대기/진행 중인 전산 주문. 담기 버튼이 없는 "보기 전용" 목록이다 --
+    // POS가 이 건을 담으면 프론트와 양쪽에서 결제될 수 있다. 구버전 탭앱은 이 필드를 무시한다.
+    frontCarts: frontCartRows.map((row) => ({
+      id: row.id,
+      referenceId: row.referenceId,
+      carNumber: row.carNumber,
+      memo: row.memo,
+      totalAmount: row.totalAmount,
+      status: row.status,
+      createdAt: row.createdAt,
+    })),
     reservations: reservations.map((r) => ({
       id: r.id,
       queueNumber: r.queueNumber,
@@ -1013,8 +1033,8 @@ app.get('/api/pos/queue', posIpFloodLimiter, posQueueReadLimiter, requireStoreTo
 // 늘릴 이유가 없다.
 // 대기 중인 전산 장바구니를 응답 형태로 만든다. /api/pos/queue와 /api/pos/erp-carts가
 // 같은 값을 내려주도록 한 곳에 모았다.
-async function loadPendingErpCartsForResponse(storeId) {
-  const rows = await listPendingErpCarts(storeId, 20)
+async function loadPendingErpCartsForResponse(storeId, payTarget = 'pos') {
+  const rows = await listPendingErpCarts(storeId, 20, payTarget)
   const carts = []
   for (const row of rows) {
     let items
@@ -1068,6 +1088,12 @@ app.post('/api/pos/erp-carts/:id/consume', posIpFloodLimiter, posLimiter, requir
   const cart = await prisma.erpCart.findUnique({ where: { id: req.params.id } })
   if (!cart || cart.storeId !== req.store.id) {
     return res.status(404).json({ ok: false, error: '장바구니를 찾을 수 없습니다.' })
+  }
+
+  if (cart.payTarget === 'front') {
+    // 프론트로 넘긴 건이다. POS가 담으면 프론트와 양쪽에서 결제될 수 있으므로 막는다
+    // (넘기기 직전에 출발한 폴링 응답 때문에 탭앱에 카드가 잠깐 남아 있을 수 있다).
+    return res.status(409).json({ ok: false, error: '프론트에서 결제하도록 넘긴 주문입니다.', status: cart.status, payTarget: 'front' })
   }
 
   if (cart.status !== 'pending') {
@@ -1495,6 +1521,7 @@ app.get('/api/admin/erp-carts', requireAuth, asyncHandler(async (req, res) => {
         storeName: r.store?.name || null,
         erpStoreCode: r.store?.erpStoreCode || null,
         status: r.status,
+        payTarget: r.payTarget,
         totalAmount: r.totalAmount,
         memo: r.memo,
         carNumber: r.carNumber,
@@ -2192,6 +2219,207 @@ app.post('/api/pos/erp-carts/:id/paid', posIpFloodLimiter, posLimiter, requireSt
   return res.json({ ok: true, alreadyProcessed: false, status: 'paid', reservationCompleted })
 }))
 
+// --- 전산 주문을 프론트 플러그인에서 직접 결제 (payTarget: 'front') ---
+//
+// 토스는 프론트 플러그인과 토스 POS 동시 연결을 지원하지 않는다(연동 가이드 FAQ). 플러그인 모드
+// 프론트는 POS와 페어링되지 않으므로, POS 플러그인이 프론트에 결제를 보낼 방법이 없다. 그래서
+// 전산이 payTarget:'front'로 보낸 주문은 POS를 거치지 않고 프론트 플러그인이 여기서 바로 가져가
+// 자기 SDK(sdk.payment.requestPayment)로 결제한다. 서버는 결제를 일으키지 않는다 -- 주문을
+// 전달하고, 결과를 받아 전산에 알려줄 뿐이다.
+//
+// 인증은 POS 탭앱과 같은 매장 토큰(X-Store-Token)이다. 프론트의 다른 API(예약·결제 영수증)는
+// merchantId로 매장을 찾지만, 이 경로는 차량번호·고객명이 담긴 주문을 내려주고 "결제됐다"는
+// 보고로 전산 주문을 끝내버릴 수 있어서 merchantId만으로는 부족하다(merchantId는 위조가 쉽다).
+// 직원이 프론트 [플러그인 설정]에서 매장 토큰을 한 번 넣어두면 된다.
+//
+// 상태 흐름: pending --(start)--> paying --(result: paid)--> paid
+//                                       \--(result: cancelled/failed)--> pending (다시 결제 가능)
+// paying에서 결과 보고가 끊기면(프론트 재시작 등) 서버는 자동으로 되돌리지 않는다. 실제로는
+// 승인됐을 수 있어서 되돌리면 이중결제가 된다. 프론트가 다시 켜질 때 sdk.payment.getPayment로
+// 승인 여부를 확인해 보고를 마저 보낸다(front-plugin/index.html 참고).
+
+const FRONT_PAYMENT_KEY_RE = /^[A-Za-z0-9_-]{8,64}$/
+
+// 부가세는 전산(erp-simulator/cart.py)과 같은 기준(합계 / 11 반올림)으로 나눈다. 금액을 서버가
+// 정해 내려주는 이유: 프론트가 자기가 가진 값으로 결제하면 그 사이 바뀐 주문과 금액이 어긋날 수 있다.
+function splitVat(totalAmount) {
+  const tax = Math.round(totalAmount / 11)
+  return { tax, supplyValue: totalAmount - tax }
+}
+
+function trimmedString(value, maxLength) {
+  if (value === undefined || value === null) return null
+  const s = String(value).trim()
+  return s ? s.slice(0, maxLength) : null
+}
+
+// 승인 응답에서 나중에 취소·대사에 쓸 값만 추린다. 카드번호(마스킹본 포함)처럼 필요 없는 값은
+// 아예 저장하지 않는다.
+function sanitizeFrontPayment(raw) {
+  const p = raw && typeof raw === 'object' ? raw : {}
+  const method = ['CARD', 'CASH', 'BARCODE'].includes(p.paymentMethod) ? p.paymentMethod : null
+  const timestamp = Number(p.timestamp)
+  const installment = Number(p.installment)
+  return {
+    paymentMethod: method,
+    approvalNumber: trimmedString(p.approvalNumber, 64),
+    timestamp: Number.isSafeInteger(timestamp) && timestamp > 0 ? timestamp : null,
+    installment: Number.isSafeInteger(installment) && installment >= 0 && installment <= 99 ? installment : null,
+    vanTransactionKey: trimmedString(p.vanTransactionKey, 64),
+    tid: trimmedString(p.tid, 64),
+    isCashReceipt: typeof p.isCashReceipt === 'boolean' ? p.isCashReceipt : null,
+    easyPayProvider: trimmedString(p.easyPayProvider, 40),
+  }
+}
+
+// POS 탭앱 [프론트로 결제 요청]. 전산이 POS로 보낸 주문을, 담기 전에 프론트 결제로 돌린다.
+// 손님이 프론트 앞에 왔을 때 직원이 넘기는 흐름이다(전산이 처음부터 payTarget:'front'로 보내는
+// 경로와 결과는 같다).
+app.post('/api/pos/erp-carts/:id/send-to-front', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  const cart = await prisma.erpCart.findUnique({ where: { id: req.params.id } })
+  if (!cart || cart.storeId !== req.store.id) {
+    return res.status(404).json({ ok: false, error: '주문을 찾을 수 없습니다.' })
+  }
+  if (cart.payTarget === 'front' && (cart.status === 'pending' || cart.status === 'paying')) {
+    return res.json({ ok: true, alreadyProcessed: true, status: cart.status, payTarget: 'front' })
+  }
+  const changed = await sendErpCartToFront(cart.id, req.store.id)
+  if (!changed) {
+    const latest = await prisma.erpCart.findUnique({ where: { id: cart.id } })
+    return res.status(409).json({
+      ok: false, error: '아직 담기 전인 주문만 프론트로 넘길 수 있습니다.', status: latest?.status, payTarget: latest?.payTarget,
+    })
+  }
+  return res.json({ ok: true, alreadyProcessed: false, status: 'pending', payTarget: 'front' })
+}))
+
+// POS 탭앱 [POS로 되돌리기]. 프론트가 아직 결제를 시작하지 않은 건만 되돌린다.
+app.post('/api/pos/erp-carts/:id/return-to-pos', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  const cart = await prisma.erpCart.findUnique({ where: { id: req.params.id } })
+  if (!cart || cart.storeId !== req.store.id) {
+    return res.status(404).json({ ok: false, error: '주문을 찾을 수 없습니다.' })
+  }
+  if (cart.payTarget === 'pos' && cart.status === 'pending') {
+    return res.json({ ok: true, alreadyProcessed: true, status: 'pending', payTarget: 'pos' })
+  }
+  const changed = await returnErpCartToPos(cart.id, req.store.id)
+  if (!changed) {
+    const latest = await prisma.erpCart.findUnique({ where: { id: cart.id } })
+    const error = latest?.status === 'paying'
+      ? '손님이 프론트에서 결제 중입니다. 끝나거나 취소된 뒤에 다시 시도해주세요.'
+      : '되돌릴 수 없는 주문입니다.'
+    return res.status(409).json({ ok: false, error, status: latest?.status, payTarget: latest?.payTarget })
+  }
+  return res.json({ ok: true, alreadyProcessed: false, status: 'pending', payTarget: 'pos' })
+}))
+
+// 프론트 대기화면이 몇 초마다 부른다. POS 폴링과 같은 한도(매장 토큰 기준)를 쓴다.
+app.get('/api/front/erp-carts', posIpFloodLimiter, posQueueReadLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  const carts = await loadPendingErpCartsForResponse(req.store.id, 'front')
+  return res.json({ ok: true, storeName: req.store.name, carts })
+}))
+
+// 결제창을 띄우기 직전에 부른다. 이 주문을 이 프론트가 잡았다는 표시(paying)와 paymentKey를 남기고,
+// 결제할 금액을 서버 기준으로 돌려준다.
+app.post('/api/front/erp-carts/:id/start', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  const paymentKey = String(req.body?.paymentKey ?? '').trim()
+  if (!FRONT_PAYMENT_KEY_RE.test(paymentKey)) {
+    return res.status(400).json({ ok: false, error: 'paymentKey는 8~64자의 영문/숫자/하이픈/밑줄이어야 합니다.' })
+  }
+
+  const cart = await prisma.erpCart.findUnique({ where: { id: req.params.id } })
+  if (!cart || cart.storeId !== req.store.id || cart.payTarget !== 'front') {
+    return res.status(404).json({ ok: false, error: '주문을 찾을 수 없습니다.' })
+  }
+  if (cart.status !== 'pending') {
+    return res.status(409).json({ ok: false, error: '결제할 수 없는 주문입니다(이미 결제 중이거나 끝났습니다).', status: cart.status })
+  }
+
+  let claimed
+  try {
+    claimed = await markErpCartFrontPaying(cart.id, req.store.id, paymentKey)
+  } catch (e) {
+    // paymentKey unique 충돌 -- 프론트가 같은 키를 다른 주문에 재사용했다.
+    if (e?.code === 'P2002') {
+      return res.status(409).json({ ok: false, error: '이미 사용한 paymentKey입니다. 새 값으로 다시 시도해주세요.' })
+    }
+    throw e
+  }
+  if (!claimed) {
+    // 조회와 전이 사이에 다른 프론트가 먼저 잡았거나 전산이 취소했다.
+    const latest = await prisma.erpCart.findUnique({ where: { id: cart.id } })
+    return res.status(409).json({ ok: false, error: '결제할 수 없는 주문입니다(이미 결제 중이거나 끝났습니다).', status: latest?.status })
+  }
+
+  return res.json({
+    ok: true,
+    id: cart.id,
+    referenceId: cart.referenceId,
+    paymentKey,
+    totalAmount: cart.totalAmount,
+    ...splitVat(cart.totalAmount),
+  })
+}))
+
+// 결제 결과 보고. result: 'paid' | 'cancelled' | 'failed'.
+app.post('/api/front/erp-carts/:id/result', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  const result = req.body?.result
+  if (result !== 'paid' && result !== 'cancelled' && result !== 'failed') {
+    return res.status(400).json({ ok: false, error: "result는 'paid', 'cancelled', 'failed' 중 하나여야 합니다." })
+  }
+  const paymentKey = String(req.body?.paymentKey ?? '').trim()
+  if (!FRONT_PAYMENT_KEY_RE.test(paymentKey)) {
+    return res.status(400).json({ ok: false, error: 'paymentKey가 올바르지 않습니다.' })
+  }
+
+  const cart = await prisma.erpCart.findUnique({ where: { id: req.params.id } })
+  if (!cart || cart.storeId !== req.store.id || cart.payTarget !== 'front') {
+    return res.status(404).json({ ok: false, error: '주문을 찾을 수 없습니다.' })
+  }
+
+  if (result === 'paid') {
+    // 프론트가 재시도했다(응답을 못 받았거나 재시작 후 복구). 같은 키로 이미 끝난 건이면 성공으로 돌려준다.
+    if (cart.status === 'paid' && cart.frontPaymentKey === paymentKey) {
+      return res.json({ ok: true, alreadyProcessed: true, status: 'paid' })
+    }
+    const payment = sanitizeFrontPayment(req.body?.payment)
+    const changed = await markErpCartFrontPaid(cart.id, paymentKey, JSON.stringify(payment))
+    if (!changed) {
+      // 돈은 나갔는데 주문 상태가 맞지 않는다(다른 키로 잡혀 있거나 이미 다른 상태). 조용히 넘기면
+      // 아무도 모르는 결제가 생기므로 오류로 크게 남긴다 -- 관리자가 승인번호로 대사해야 한다.
+      logger.error('[front] 결제 완료 보고를 반영하지 못했습니다. 승인 내역과 대사가 필요합니다.', {
+        cartId: cart.id, status: cart.status, approvalNumber: payment.approvalNumber,
+      })
+      return res.status(409).json({ ok: false, error: '주문 상태가 맞지 않아 결제 완료를 기록하지 못했습니다.', status: cart.status })
+    }
+
+    // POS 결제 경로와 같이, 예약이 이어져 있으면 정비완료까지 자동으로 처리한다.
+    let reservationCompleted = false
+    if (cart.reservationId) {
+      try {
+        reservationCompleted = await completeReservationAfterPayment(cart.reservationId)
+      } catch (e) {
+        logger.error('[front] 결제 후 예약 자동완료 실패', { cartId: cart.id, error: e.message })
+      }
+    }
+    return res.json({ ok: true, alreadyProcessed: false, status: 'paid', reservationCompleted })
+  }
+
+  // cancelled/failed: 돈이 나가지 않았으므로 다시 결제할 수 있게 되돌린다.
+  const note = result === 'failed'
+    ? (trimmedString(req.body?.errorMessage, 500) || '프론트 결제 실패')
+    : null
+  const released = await releaseErpCartFrontPaying(cart.id, paymentKey, note)
+  if (!released) {
+    if (cart.status === 'pending' && !cart.frontPaymentKey) {
+      // 이미 되돌려졌다(같은 보고의 재시도).
+      return res.json({ ok: true, alreadyProcessed: true, status: 'pending' })
+    }
+    return res.status(409).json({ ok: false, error: '주문 상태가 맞지 않습니다.', status: cart.status })
+  }
+  return res.json({ ok: true, alreadyProcessed: false, status: 'pending' })
+}))
+
 // --- 쉐보레 전산(ERP) "물건 담기" -> POS 플러그인 장바구니 중계 (POS-CART-BRIDGE §1) ---
 // 위 /api/erp/draft-orders(토스 Open API로 주문 자체를 생성)와는 완전히 별개의 새 경로다 -- 그
 // 경로로 만든 주문은 POS에서 결제할 수 없다는 게 실증됐다(docs/ERP연동-결제경로-조사결과.md).
@@ -2293,6 +2521,14 @@ app.post('/api/erp/carts', erpIpFloodLimiter, erpLimiter, requireErpToken, async
     ? true
     : !(autoPayRaw === false || autoPayRaw === 'false' || autoPayRaw === 0 || autoPayRaw === '0')
 
+  // 어디서 결제할지. 안 보내면 기존과 같이 'pos'다 -- 이 필드를 모르는 전산은 동작이 바뀌지 않는다.
+  // 오타를 'pos'로 조용히 바꾸면 전산은 프론트로 보냈다고 믿는데 POS에 뜨므로 400으로 막는다.
+  const payTargetRaw = req.body?.payTarget
+  const payTarget = payTargetRaw === undefined || payTargetRaw === null || payTargetRaw === '' ? 'pos' : payTargetRaw
+  if (payTarget !== 'pos' && payTarget !== 'front') {
+    return res.status(400).json({ ok: false, error: "payTarget은 'pos' 또는 'front'여야 합니다." })
+  }
+
   // 코드로 못 찾으면 사업자번호로 자동 연결을 시도한다(resolveErpStore 주석 참고).
   const resolved = await resolveErpStore(storeCode, req.body?.businessNumber)
   if (resolved.error) {
@@ -2318,7 +2554,7 @@ app.post('/api/erp/carts', erpIpFloodLimiter, erpLimiter, requireErpToken, async
   // cancelled였다면 전산이 다시 담는 것이므로 새로 생성한다(취소된 건 재사용하지 않는다).
   const existing = await findErpCartByReference(referenceId)
   if (existing && existing.status !== 'cancelled') {
-    return res.json({ ok: true, cartId: existing.id, referenceId, status: existing.status, duplicate: true })
+    return res.json({ ok: true, cartId: existing.id, referenceId, status: existing.status, payTarget: existing.payTarget, duplicate: true })
   }
 
   // 차량번호가 오면 그날 대기 중인 손님과 잇는다. 이어지면 결제가 끝났을 때 정비완료까지
@@ -2348,8 +2584,11 @@ app.post('/api/erp/carts', erpIpFloodLimiter, erpLimiter, requireErpToken, async
     autoPay,
     carNumber,
     reservationId,
+    payTarget,
   })
-  return res.status(201).json({ ok: true, cartId: cart.id, referenceId, status: cart.status, linkedReservation: Boolean(reservationId) })
+  return res.status(201).json({
+    ok: true, cartId: cart.id, referenceId, status: cart.status, payTarget: cart.payTarget, linkedReservation: Boolean(reservationId),
+  })
 }))
 
 // 전산이 담아둔 장바구니의 처리 상태(pending/loaded/failed/cancelled)를 재조회할 수 있게 한다.
@@ -2364,8 +2603,10 @@ app.get('/api/erp/carts/:referenceId', erpIpFloodLimiter, erpLimiter, requireErp
     status: cart.status,
     totalAmount: cart.totalAmount,
     autoPay: cart.autoPay,
+    payTarget: cart.payTarget,
     createdAt: cart.createdAt,
     loadedAt: cart.loadedAt,
+    paidAt: cart.paidAt,
     errorMessage: cart.errorMessage,
   })
 }))

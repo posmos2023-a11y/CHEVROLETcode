@@ -954,7 +954,7 @@ function upsertErpOrder({ referenceId, storeId, tossOrderKey, tossOrderId, total
 // 초기화). 멱등 판단(cancelled가 아닌 기존 건은 손대지 않고 duplicate로 응답) 자체는
 // server.js가 findErpCartByReference로 먼저 조회해서 처리하고, 이 함수는 "없거나 cancelled일
 // 때만" 호출된다.
-function createErpCart({ storeId, referenceId, itemsJson, totalAmount, memo, autoPay, carNumber, reservationId }) {
+function createErpCart({ storeId, referenceId, itemsJson, totalAmount, memo, autoPay, carNumber, reservationId, payTarget }) {
   const data = {
     storeId,
     itemsJson,
@@ -966,10 +966,14 @@ function createErpCart({ storeId, referenceId, itemsJson, totalAmount, memo, aut
     loadedAt: null,
     carNumber: carNumber ?? null,
     reservationId: reservationId ?? null,
+    payTarget: payTarget === 'front' ? 'front' : 'pos',
     // 재전송(cancelled 뒤 같은 referenceId)일 때 이전 결제 흔적이 남지 않게 초기화한다.
     paidAt: null,
     tossPaymentId: null,
     tossOrderId: null,
+    frontPaymentKey: null,
+    frontPayingAt: null,
+    frontPaymentJson: null,
   }
   return prisma.erpCart.upsert({
     where: { referenceId },
@@ -983,16 +987,80 @@ function findErpCartByReference(referenceId) {
   return prisma.erpCart.findUnique({ where: { referenceId } })
 }
 
-// POS 플러그인 폴링(GET /api/pos/erp-carts) 전용. 오래 기다린 것부터 순서대로 최대 limit건.
-function listPendingErpCarts(storeId, limit) {
+// POS 플러그인 폴링(GET /api/pos/erp-carts)과 프론트 플러그인 폴링(GET /api/front/erp-carts) 전용.
+// 오래 기다린 것부터 순서대로 최대 limit건. payTarget으로 나눠서 POS 건은 POS에만, 프론트 건은
+// 프론트에만 내려간다 -- 섞이면 같은 주문을 두 기기에서 각각 결제할 수 있다.
+function listPendingErpCarts(storeId, limit, payTarget = 'pos') {
   // 만료 잡은 하루 한 번 돌므로, 그 사이에 하루가 지난 건이 화면에 남을 수 있다. 조회에서도
   // 같은 기준으로 걸러서 "어제 주문이 오늘 아침 POS에 떠 있는" 상황 자체를 막는다.
   const staleBefore = new Date(Date.now() - ERP_CART_STALE_HOURS * 60 * 60 * 1000)
   return prisma.erpCart.findMany({
-    where: { storeId, status: 'pending', createdAt: { gte: staleBefore } },
+    where: { storeId, payTarget, status: 'pending', createdAt: { gte: staleBefore } },
     orderBy: { createdAt: 'asc' },
     take: limit,
   })
+}
+
+// POS 탭앱에서 직원이 [프론트로 결제 요청]을 눌렀다. 아직 POS에 담기 전(pending)인 POS 건만
+// 넘길 수 있다 -- 이미 담긴 건을 넘기면 POS 장바구니와 프론트 양쪽에서 결제될 수 있다.
+async function sendErpCartToFront(id, storeId) {
+  const result = await prisma.erpCart.updateMany({
+    where: { id, storeId, payTarget: 'pos', status: 'pending' },
+    data: { payTarget: 'front', errorMessage: null },
+  })
+  return result.count > 0
+}
+
+// 프론트로 넘긴 건을 다시 POS로 가져온다(손님이 프론트 앞을 떠났거나 잘못 넘겼을 때).
+// 프론트가 결제를 시작한 뒤(paying)에는 가져올 수 없다.
+async function returnErpCartToPos(id, storeId) {
+  const result = await prisma.erpCart.updateMany({
+    where: { id, storeId, payTarget: 'front', status: 'pending' },
+    data: { payTarget: 'pos' },
+  })
+  return result.count > 0
+}
+
+// POS 탭앱이 "프론트에서 결제 대기 중인 주문"을 보여주는 용도. 넘긴 뒤 화면에서 사라져버리면
+// 직원이 그 주문이 어디 있는지 모르고, 되돌릴 수도 없다.
+function listFrontErpCartsForPos(storeId, limit) {
+  const staleBefore = new Date(Date.now() - ERP_CART_STALE_HOURS * 60 * 60 * 1000)
+  return prisma.erpCart.findMany({
+    where: { storeId, payTarget: 'front', status: { in: ['pending', 'paying'] }, createdAt: { gte: staleBefore } },
+    orderBy: { createdAt: 'asc' },
+    take: limit,
+  })
+}
+
+// 프론트가 결제창을 띄우기 직전에 이 주문을 "결제 중"으로 잡는다. pending -> paying 전이가
+// 원자적이라 프론트가 두 대여도 한 대만 잡는다(나머지는 count 0을 받는다).
+// paymentKey를 함께 박아두고, 이후 결과 보고는 이 값이 맞을 때만 받는다.
+async function markErpCartFrontPaying(id, storeId, paymentKey) {
+  const result = await prisma.erpCart.updateMany({
+    where: { id, storeId, payTarget: 'front', status: 'pending' },
+    data: { status: 'paying', frontPaymentKey: paymentKey, frontPayingAt: new Date(), errorMessage: null },
+  })
+  return result.count > 0
+}
+
+// 손님이 결제창을 닫았거나 승인이 실패했다 -- 돈이 나가지 않았으므로 다시 결제할 수 있게
+// pending으로 되돌린다. paymentKey가 맞을 때만 되돌린다. 서버가 시간 기준으로 알아서 되돌리지는
+// 않는다: 프론트가 보고를 못 했을 뿐 실제로는 승인됐을 수 있어서, 되돌리면 이중결제가 된다.
+async function releaseErpCartFrontPaying(id, paymentKey, errorMessage) {
+  const result = await prisma.erpCart.updateMany({
+    where: { id, status: 'paying', frontPaymentKey: paymentKey },
+    data: { status: 'pending', frontPaymentKey: null, frontPayingAt: null, errorMessage: errorMessage ?? null },
+  })
+  return result.count > 0
+}
+
+// 프론트에서 승인이 끝났다는 보고. paying + 같은 paymentKey일 때만 paid로 넘긴다.
+async function markErpCartFrontPaid(id, paymentKey, paymentJson) {
+  const result = await prisma.erpCart.updateMany({
+    where: { id, status: 'paying', frontPaymentKey: paymentKey },
+    data: { status: 'paid', paidAt: new Date(), frontPaymentJson: paymentJson ?? null },
+  })
+  return result.count > 0
 }
 
 // POS가 addLineItem()까지 성공적으로 마쳤다는 통보(consume). updateMany + count로 pending ->
@@ -1626,6 +1694,12 @@ module.exports = {
   markErpCartFailed,
   markErpCartDismissed,
   markErpCartPaid,
+  markErpCartFrontPaying,
+  releaseErpCartFrontPaying,
+  markErpCartFrontPaid,
+  sendErpCartToFront,
+  returnErpCartToPos,
+  listFrontErpCartsForPos,
   listErpCarts,
   getPosDailySummary,
   findRepairHistoryByCarNumber,

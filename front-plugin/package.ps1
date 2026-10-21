@@ -14,7 +14,9 @@ $runtimeFiles = @(
   'reservation.html',
   'sdk.js',
   'settings.html',
-  'api-config.js'
+  'api-config.js',
+  'erp-pay.html',
+  'erp-front-pay.js'
 )
 
 if (Test-Path -LiteralPath $stageDir) {
@@ -42,7 +44,7 @@ try {
   }
   Compress-Archive -Path (Join-Path $stageDir '*') -DestinationPath $zipPath -CompressionLevel Optimal
   Write-Output "생성 완료: $zipPath"
-  Write-Output 'ZIP 내용: index.html, onboarding.html, payment.html, reservation.html, sdk.js, settings.html, api-config.js'
+  Write-Output 'ZIP 내용: index.html, onboarding.html, payment.html, reservation.html, sdk.js, settings.html, api-config.js, erp-pay.html, erp-front-pay.js'
 }
 finally {
   if (Test-Path -LiteralPath $stageDir) {

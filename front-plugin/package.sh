@@ -26,6 +26,8 @@ runtime_files=(
   "sdk.js"
   "settings.html"
   "api-config.js"
+  "erp-pay.html"
+  "erp-front-pay.js"
 )
 
 rm -rf "$stage_dir"
@@ -67,4 +69,4 @@ else
 fi
 
 echo "생성 완료: $zip_path"
-echo 'ZIP 내용: index.html, onboarding.html, payment.html, reservation.html, sdk.js, settings.html, api-config.js'
+echo 'ZIP 내용: index.html, onboarding.html, payment.html, reservation.html, sdk.js, settings.html, api-config.js, erp-pay.html, erp-front-pay.js'

@@ -349,6 +349,57 @@
     color: var(--red);
   }
 
+  /* [프론트 결제] / [POS로 되돌리기]. 지우기와 같은 보조 버튼 모양에 파랑 글자로 구분한다.
+     확인 대기 상태는 되돌릴 수 있는 동작이라 빨강이 아닌 파랑 배경을 쓴다. */
+  .erp-cart-front,
+  .erp-cart-return {
+    flex: 0 0 auto;
+    min-height: 48px;
+    margin-top: 8px;
+    padding: 0 14px;
+    border: 1px solid var(--line);
+    border-radius: 13px;
+    background: var(--surface);
+    color: var(--blue);
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: -0.03em;
+    cursor: pointer;
+  }
+
+  .erp-cart-return { flex: 1 1 auto; }
+
+  .erp-cart-front:active,
+  .erp-cart-return:active { transform: scale(0.98); }
+
+  .erp-cart-front.confirming,
+  .erp-cart-return.confirming {
+    border-color: var(--blue);
+    background: var(--blue);
+    color: #fff;
+  }
+
+  .front-cart-status {
+    display: inline-flex;
+    align-items: center;
+    min-height: 21px;
+    padding: 0 7px;
+    border-radius: 7px;
+    background: #fff5dc;
+    color: #8a6100;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: -0.03em;
+  }
+
+  .front-cart-status.paying {
+    background: #f3ecff;
+    color: #6b3fd4;
+  }
+
+  .front-cart-section { margin-top: 20px; }
+  .front-cart-section[hidden] { display: none; }
+
   .queue-item {
     display: grid;
     grid-template-columns: 58px minmax(0, 1fr) auto;
@@ -1149,6 +1200,17 @@
               <div class="empty-copy">전산에서 물건을 담으면 이곳에 표시됩니다.</div>
             </div>
           </div>
+        </section>
+
+        <!-- 프론트에서 결제하도록 넘긴 주문. 비어 있으면 숨긴다(erpCarts.js renderFrontCarts). -->
+        <section class="erp-cart-section front-cart-section" id="front-cart-section" aria-labelledby="front-cart-heading" hidden>
+          <div class="section-heading">
+            <div>
+              <h2 id="front-cart-heading">프론트 결제 대기</h2>
+              <p>손님이 프론트에서 결제하면 사라집니다. 결제 전이면 POS로 되돌릴 수 있습니다.</p>
+            </div>
+          </div>
+          <div class="list" id="front-cart-list"></div>
         </section>
 
           </section>
