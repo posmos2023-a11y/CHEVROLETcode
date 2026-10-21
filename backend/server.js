@@ -293,6 +293,14 @@ function parseKstDate(raw) {
 // POS 화면은 순번 호출용이라 손님 전화번호 원본이 필요 없다 — 대기실 화면을 스치듯 보는 다른
 // 손님에게 노출될 수 있으므로 마스킹해서 내려준다(계약 §3.13). 표준(010 + 7~8자리)과 자리수가
 // 안 맞는 값은 부분적으로 어설프게 노출하느니 전부 가린다.
+// 정비 이력처럼 직원만 보는 화면에 전체 번호를 읽기 쉽게 보여줄 때 쓴다(01012345678 -> 010-1234-5678).
+function formatPhone(phone) {
+  const d = String(phone || '').replace(/D/g, '')
+  if (d.length === 11) return `${d.slice(0, 3)}-${d.slice(3, 7)}-${d.slice(7)}`
+  if (d.length === 10) return `${d.slice(0, 3)}-${d.slice(3, 6)}-${d.slice(6)}`
+  return d || null
+}
+
 function maskPhone(phone) {
   const digits = String(phone || '').replace(/\D/g, '')
   if (digits.length < 9 || digits.length > 11) return '010-****-****'
@@ -2495,12 +2503,13 @@ app.post('/api/pos/promo-campaign/send', posIpFloodLimiter, posLimiter, requireS
 
 // 매장의 최근 정비 이력. 이력 화면을 열자마자 보여줄 목록이다.
 //
-// 직원이 "이 차가 누구 차인지" 알아볼 수 있게 차의 지금 연락처를 가운데를 가린 번호(010-****-1234)로,
-// 전산 주문에는 전산이 보낸 고객명을 함께 준다. 전화번호 원문은 내려주지 않는다.
+// 직원이 "이 차가 누구 차인지" 알아보고 바로 연락할 수 있게 차의 지금 연락처(010-1234-5678)와, 전산
+// 주문에는 전산이 보낸 고객명을 함께 준다. 이 화면은 직원용이다 -- 대기실 손님에게 보일 수 있는 정비 대기
+// 화면(/api/pos/queue)은 지금처럼 가린 번호만 준다.
 app.get('/api/pos/history/recent', posIpFloodLimiter, posQueueReadLimiter, requireStoreToken, asyncHandler(async (req, res) => {
   const { carts, reservations } = await listRecentRepairHistory(req.store.id, 20)
   const phones = await latestPhonesByCarNumbers(req.store.id, [...carts, ...reservations].map((v) => v.carNumber))
-  const contactOf = (car) => (phones.get(car) ? maskPhone(phones.get(car)) : null)
+  const contactOf = (car) => (phones.get(car) ? formatPhone(phones.get(car)) : null)
 
   const visits = []
   for (const c of carts) {
@@ -2509,7 +2518,7 @@ app.get('/api/pos/history/recent', posIpFloodLimiter, posQueueReadLimiter, requi
     visits.push({
       kind: 'order',
       carNumber: c.carNumber,
-      contactMasked: contactOf(c.carNumber),
+      contact: contactOf(c.carNumber),
       customerName: customerNameFromMemo(c.memo, c.carNumber),
       at: c.paidAt || c.createdAt,
       paid: c.status === 'paid',
@@ -2522,7 +2531,7 @@ app.get('/api/pos/history/recent', posIpFloodLimiter, posQueueReadLimiter, requi
     visits.push({
       kind: 'reservation',
       carNumber: r.carNumber,
-      contactMasked: contactOf(r.carNumber),
+      contact: contactOf(r.carNumber),
       customerName: null,
       at: r.completedAt,
       paid: false,
@@ -2554,7 +2563,7 @@ function customerNameFromMemo(memo, carNumber) {
 // 차량번호 또는 전화번호로 정비 이력을 조회한다. 직원이 "이 차 지난번에 뭐 갈았지?"를 POS에서 바로 본다.
 //
 // 전화번호로 찾으면 그 번호로 방문한 차가 여러 대일 수 있다. 한 대면 바로 그 차의 이력을, 여러 대면
-// 차량 목록(cars)만 주고 화면이 고르게 한다. 연락처는 가운데를 가린 번호만 내려준다(원문 없음).
+// 차량 목록(cars)만 주고 화면이 고르게 한다. 연락처는 전체 번호(010-1234-5678)로 준다(직원용 화면).
 app.get('/api/pos/history', posIpFloodLimiter, posQueueReadLimiter, requireStoreToken, asyncHandler(async (req, res) => {
   let carNumber = String(req.query.carNumber || '').trim()
   const rawPhone = String(req.query.phone || '').replace(/\D/g, '')
@@ -2566,7 +2575,7 @@ app.get('/api/pos/history', posIpFloodLimiter, posQueueReadLimiter, requireStore
     searchedPhone = rawPhone
     const cars = await findCarNumbersByPhone(req.store.id, rawPhone)
     if (cars.length !== 1) {
-      return res.json({ ok: true, carNumber: null, phoneSearch: maskPhone(rawPhone), cars, visits: [] })
+      return res.json({ ok: true, carNumber: null, phoneSearch: formatPhone(rawPhone), cars, visits: [] })
     }
     carNumber = cars[0]
   }
@@ -2613,11 +2622,11 @@ app.get('/api/pos/history', posIpFloodLimiter, posQueueReadLimiter, requireStore
     serviceType: r.serviceType,
     status: r.status,
     at: r.completedAt || r.createdAt,
-    contactMasked: r.phone ? maskPhone(r.phone) : null,
+    contact: r.phone ? formatPhone(r.phone) : null,
     orders: cartsByReservation.get(r.id) || [],
   }))
   for (const c of standalone) {
-    visits.push({ kind: 'order', date: null, serviceType: null, status: null, at: c.at, contactMasked: null, orders: [c] })
+    visits.push({ kind: 'order', date: null, serviceType: null, status: null, at: c.at, contact: null, orders: [c] })
   }
   // 최근 방문이 위로.
   visits.sort((a, b) => new Date(b.at) - new Date(a.at))
@@ -2625,8 +2634,8 @@ app.get('/api/pos/history', posIpFloodLimiter, posQueueReadLimiter, requireStore
   return res.json({
     ok: true,
     carNumber,
-    phoneSearch: searchedPhone ? maskPhone(searchedPhone) : null,
-    contactMasked: currentPhone ? maskPhone(currentPhone) : null,
+    phoneSearch: searchedPhone ? formatPhone(searchedPhone) : null,
+    contact: currentPhone ? formatPhone(currentPhone) : null,
     customerName,
     visits: visits.slice(0, 10),
   })

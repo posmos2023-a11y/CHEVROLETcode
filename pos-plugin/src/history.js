@@ -5,8 +5,8 @@
 //
 // 개인정보 관점에서 좁혀둔 것:
 //   - 조회는 서버가 매장 토큰으로 자기 매장 것만 돌려준다.
-//   - 전화번호는 가운데를 가린 번호(010-****-1234)만 온다. "이 차가 누구 차인지" 알아보는 데는
-//     끝 네 자리면 충분하다. 원문은 서버가 내려주지 않는다.
+//   - 연락처는 전체 번호(010-1234-5678)로 온다. 직원이 이 화면에서 손님에게 바로 연락할 수 있게 하려는
+//     것이다(사장님 결정). 대기실 손님에게 보일 수 있는 정비 대기 화면은 여전히 가린 번호만 쓴다.
 //   - 전산 주문에는 전산이 보낸 고객명(예: 김민준님)이 함께 온다.
 //   - 보관기간이 지나 파기(익명화)된 건은 차량번호가 덮여 있어 검색되지 않는다.
 //     "지운다고 해놓고 조회에는 남아 있는" 상황이 구조적으로 생기지 않는다.
@@ -92,7 +92,7 @@ function claimRender() {
 }
 
 function ownerLine(info) {
-  const parts = [info.contactMasked, info.customerName].filter(Boolean)
+  const parts = [info.contact, info.customerName].filter(Boolean)
   return parts.length ? parts.map((p) => deps.escapeHtml(p)).join(' · ') : ''
 }
 
@@ -126,7 +126,7 @@ function renderVisits(carNumber, visits, info = {}) {
     const itemLines = orders.flatMap((o) => o.items || [])
     const paid = orders.some((o) => o.paid)
     // 지금 연락처·고객명과 다를 때만 그 방문의 값을 따로 보여준다(번호를 바꾼 손님 등).
-    const visitContact = v.contactMasked && v.contactMasked !== info.contactMasked ? v.contactMasked : ''
+    const visitContact = v.contact && v.contact !== info.contact ? v.contact : ''
     const visitName = orders.map((o) => o.customerName).find((n) => n && n !== info.customerName) || ''
     const visitOwner = [visitContact, visitName].filter(Boolean).map((p) => deps.escapeHtml(p)).join(' · ')
 

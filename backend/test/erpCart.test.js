@@ -1657,16 +1657,14 @@ testSerial('이력: 차량번호로 지난 방문과 품목이 나온다', async
   assert.equal(visit.orders[0].paid, true)
 })
 
-testSerial('이력: 연락처는 가운데를 가린 번호로만 주고, 전산 고객명을 함께 준다', async () => {
-  // 직원이 "이 차가 누구 차인지" 알아볼 수 있게 가린 번호(010-****-5678)와 고객명만 준다. 원문은 없다.
+testSerial('이력: 연락처를 전체 번호로 주고, 전산 고객명을 함께 준다', async () => {
+  // 직원용 화면이라 바로 연락할 수 있게 전체 번호(010-1234-5678)를 준다.
   const store = await createStore('hist-nophone')
   await visitWithOrder(store, '22나2222', '타이어 교체')
 
   const res = await getHistory(store, '22나2222')
-  const raw = JSON.stringify(res.body)
-  assert.equal(raw.includes('01012345678'), false, '전화번호 원문이 응답에 들어 있습니다')
-  assert.equal(res.body.contactMasked, '010-****-5678')
-  assert.equal(res.body.visits[0].contactMasked, '010-****-5678')
+  assert.equal(res.body.contact, '010-1234-5678')
+  assert.equal(res.body.visits[0].contact, '010-1234-5678')
   assert.equal(res.body.customerName, '김민준님')
   assert.equal(res.body.visits[0].orders[0].customerName, '김민준님')
 })
@@ -1679,9 +1677,9 @@ testSerial('이력: 전화번호로 찾으면 그 번호의 차 이력이 나오
   const one = await byPhone('010-1234-5678')
   assert.equal(one.status, 200, JSON.stringify(one.body))
   assert.equal(one.body.carNumber, '23다2323')
-  assert.equal(one.body.phoneSearch, '010-****-5678')
+  assert.equal(one.body.phoneSearch, '010-1234-5678')
+  assert.equal(one.body.contact, '010-1234-5678')
   assert.equal(one.body.visits.length, 1)
-  assert.equal(JSON.stringify(one.body).includes('01012345678'), false)
 
   // 같은 번호로 다른 차도 방문했다
   const today = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10)
@@ -2139,7 +2137,7 @@ testSerial('최근 이력: 다른 매장 건이 섞이지 않는다', async () =
   assert.equal(res.body.visits.length, 0)
 })
 
-testSerial('최근 이력: 전화번호 원문은 나가지 않고, 가린 번호와 전산 고객명이 나온다', async () => {
+testSerial('최근 이력: 연락처(전체 번호)와 전산 고객명이 나온다', async () => {
   const store = await createStore('recent-privacy')
   const today = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10)
   await prisma.reservation.create({
@@ -2153,9 +2151,8 @@ testSerial('최근 이력: 전화번호 원문은 나가지 않고, 가린 번�
   await consumeCart(store, cartId, { result: 'loaded' })
 
   const res = await getRecent(store)
-  assert.equal(JSON.stringify(res.body).includes('01012345678'), false)
   const order = res.body.visits.find((v) => v.kind === 'order')
-  assert.equal(order.contactMasked, '010-****-5678')
+  assert.equal(order.contact, '010-1234-5678')
   assert.equal(order.customerName, '김민준님')
 })
 
