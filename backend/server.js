@@ -122,7 +122,7 @@ if (!process.env.JWT_SECRET) {
 // "결제 승인" 이벤트를 보내 가짜 결제 기록을 만들 수 있는 심각한 문제라, 아예 부팅을 막는다
 // (계약 §3.23-1, §10). 로컬 개발(NODE_ENV != production)에서는 비워둬도 되며, 그 경우
 // 웹훅 핸들러가 서명 검증을 건너뛰고 경고 로그만 남긴다.
-if (process.env.NODE_ENV === 'production' && !process.env.TOSS_WEBHOOK_SECRET) {
+if (process.env.NODE_ENV === 'production' && !(process.env.TOSS_WEBHOOK_SECRET || '').trim()) {
   throw new Error('운영 환경에서는 TOSS_WEBHOOK_SECRET을 반드시 설정해야 합니다.')
 }
 
@@ -1735,7 +1735,10 @@ app.post('/api/webhooks/toss/payment', asyncHandler(async (req, res) => {
     return res.status(400).json({ ok: false, error: 'x-toss-webhook-id 헤더가 없습니다.' })
   }
 
-  const secret = process.env.TOSS_WEBHOOK_SECRET
+  // 앞뒤 공백·줄바꿈을 지운다. Secret Manager에 값을 넣을 때 끝에 줄바꿈이 붙는 일이 흔한데
+  // (echo로 만들면 붙는다), 그러면 개발자센터에 같은 값을 넣어도 서명이 절대 맞지 않는다 --
+  // 실제로 운영에서 모든 웹훅이 "서명 검증 실패"(401)로 거절됐다. 비밀키 자체에 공백이 있을 일은 없다.
+  const secret = (process.env.TOSS_WEBHOOK_SECRET || '').trim()
   if (secret) {
     if (!timestamp || !signature) {
       return res.status(400).json({ ok: false, error: 'x-toss-timestamp/x-toss-signature 헤더가 없습니다.' })

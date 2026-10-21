@@ -241,6 +241,32 @@ testSerial('매핑: 취소 웹훅이 프론트 보고보다 먼저 왔으면 보
   assert.equal((await row(cartId)).status, 'refunded')
 })
 
+testSerial('웹훅 서명: 서버 비밀키 끝에 줄바꿈이 붙어 있어도 토스가 보낸 서명을 통과시킨다', async () => {
+  const store = await createStore('sig-newline')
+  const secret = 'GA1k8THAGeGihd_Z0rW0MqpRTDQGYIktHBfmCWbsZn0'
+  const original = process.env.TOSS_WEBHOOK_SECRET
+  process.env.TOSS_WEBHOOK_SECRET = `${secret}\n` // Secret Manager에 echo로 넣으면 이렇게 된다
+  try {
+    const raw = JSON.stringify({ type: 'payment.payment.approved.v1', merchantId: Number(store.merchantId), data: { payment: tossPayment(store) } })
+    const ts = String(Date.now())
+    const sign = (key) => 'v1=' + crypto.createHmac('sha256', key).update(`${ts}.${raw}`).digest('hex')
+
+    const ok = await request(app).post('/api/webhooks/toss/payment')
+      .set('Content-Type', 'application/json')
+      .set('x-toss-webhook-id', unique('wh')).set('x-toss-timestamp', ts).set('x-toss-signature', sign(secret))
+      .send(raw)
+    assert.equal(ok.status, 200, JSON.stringify(ok.body))
+
+    const forged = await request(app).post('/api/webhooks/toss/payment')
+      .set('Content-Type', 'application/json')
+      .set('x-toss-webhook-id', unique('wh')).set('x-toss-timestamp', ts).set('x-toss-signature', sign('wrong-secret'))
+      .send(raw)
+    assert.equal(forged.status, 401)
+  } finally {
+    process.env.TOSS_WEBHOOK_SECRET = original
+  }
+})
+
 // --- 프론트 결제 취소 --------------------------------------------------------------
 
 testSerial('프론트 취소: 요청 → 프론트가 취소 정보를 받아 시작 → 완료되면 refunded', async () => {
