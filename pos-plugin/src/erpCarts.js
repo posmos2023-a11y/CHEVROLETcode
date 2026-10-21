@@ -84,12 +84,33 @@ function formatWon(value) {
   return `${Number(value || 0).toLocaleString('ko-KR')}원`
 }
 
-function summarizeItems(items) {
-  if (!items || items.length === 0) return '품목 없음'
-  const first = items[0]
-  const rest = items.length - 1
-  const base = `${deps.escapeHtml(first.name)} ×${first.quantity}`
-  return rest > 0 ? `${base} 외 ${rest}건` : base
+// 품목을 한 줄씩(이름 ×수량 ……… 금액) 보여준다. 직원이 담거나 프론트로 넘기기 전에 무엇을
+// 얼마에 결제하는지 확인할 수 있어야 한다 -- 예전에는 "엔진오일 ×1 외 3건"으로만 보여서 무엇이
+// 들어 있는지 [주문] 탭에 담아보기 전에는 알 수 없었다. 품목이 아주 많으면 카드가 화면을
+// 다 차지하므로 앞의 몇 줄만 보이고 나머지는 건수로 줄인다.
+const MAX_ITEM_LINES = 8
+
+function renderItemList(items) {
+  if (!items || items.length === 0) return '<div class="erp-cart-summary">품목 없음</div>'
+  const shown = items.slice(0, MAX_ITEM_LINES)
+  const hidden = items.slice(MAX_ITEM_LINES)
+  const hiddenAmount = hidden.reduce((sum, i) => sum + (Number(i.unitPrice) || 0) * (Number(i.quantity) || 0), 0)
+  return `
+    <ul class="erp-cart-items">
+      ${shown.map((i) => `
+        <li>
+          <span class="erp-item-name">${deps.escapeHtml(i.name)}</span>
+          <span class="erp-item-qty">×${Number(i.quantity) || 0}</span>
+          <span class="erp-item-amount">${formatWon((Number(i.unitPrice) || 0) * (Number(i.quantity) || 0))}</span>
+        </li>`).join('')}
+      ${hidden.length ? `
+        <li class="erp-item-more">
+          <span class="erp-item-name">외 ${hidden.length}건</span>
+          <span class="erp-item-qty"></span>
+          <span class="erp-item-amount">${formatWon(hiddenAmount)}</span>
+        </li>` : ''}
+    </ul>
+  `
 }
 
 function renderErpCarts(incoming) {
@@ -127,7 +148,7 @@ function renderErpCarts(incoming) {
             ${cart.linkedReservation ? '<span class="erp-cart-linked">예약 연결됨</span>' : ''}
           </div>
           ${cart.carNumber && cart.memo ? `<div class="erp-cart-memo">${deps.escapeHtml(cart.memo)}</div>` : ''}
-          <div class="erp-cart-summary">${summarizeItems(cart.items)}</div>
+          ${renderItemList(cart.items)}
           <div class="erp-cart-total">${formatWon(cart.totalAmount)}</div>
           <div class="erp-cart-actions">
             <button class="erp-cart-button" type="button" data-cart-id="${deps.escapeHtml(cart.id)}">${buttonLabel}</button>
@@ -306,6 +327,7 @@ function renderFrontCarts() {
             <strong class="erp-cart-car">${deps.escapeHtml(cart.carNumber || cart.memo || '-')}</strong>
             <span class="front-cart-status${paying ? ' paying' : ''}">${paying ? '손님 결제 중' : '프론트 결제 대기'}</span>
           </div>
+          ${renderItemList(cart.items)}
           <div class="erp-cart-total">${formatWon(cart.totalAmount)}</div>
           ${paying ? '' : `
           <div class="erp-cart-actions">

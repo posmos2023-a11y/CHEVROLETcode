@@ -289,6 +289,47 @@
     letter-spacing: -0.03em;
   }
 
+  /* 품목 목록. 이름은 남는 폭을 쓰고 수량·금액은 오른쪽에 붙여 영수증처럼 읽히게 한다. */
+  .erp-cart-items {
+    list-style: none;
+    margin: 6px 0 0;
+    padding: 8px 0 0;
+    border-top: 1px solid var(--line);
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .erp-cart-items li {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    font-size: 13px;
+    letter-spacing: -0.03em;
+  }
+
+  .erp-item-name {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .erp-item-qty {
+    flex: 0 0 auto;
+    color: var(--sub);
+  }
+
+  .erp-item-amount {
+    flex: 0 0 auto;
+    min-width: 72px;
+    text-align: right;
+    font-weight: 700;
+  }
+
+  .erp-item-more { color: var(--sub); }
+
   .erp-cart-total {
     margin-top: 4px;
     font-size: 20px;

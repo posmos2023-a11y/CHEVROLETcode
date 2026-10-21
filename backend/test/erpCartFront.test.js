@@ -444,6 +444,11 @@ testSerial('넘기기: POS 건을 프론트로 넘기면 POS 목록에서 빠지
   assert.equal(queue.body.frontCarts.length, 1)
   assert.equal(queue.body.frontCarts[0].id, cartId)
   assert.equal(queue.body.frontCarts[0].status, 'pending')
+  // 직원이 넘긴 주문의 품목을 대기열에서 그대로 확인할 수 있어야 한다.
+  assert.deepEqual(
+    queue.body.frontCarts[0].items.map((i) => [i.name, i.quantity, i.unitPrice]),
+    [['엔진오일 5W30 (4L)', 1, 45000], ['엔진오일 교환 공임', 1, 20000]]
+  )
   assert.deepEqual((await getFrontCarts(store)).body.carts.map((c) => c.id), [cartId])
 
   // 전산은 상태 조회로 프론트로 넘어간 걸 안다.

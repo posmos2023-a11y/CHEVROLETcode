@@ -15,8 +15,9 @@
   <body>
     <div id="app"></div>
     <script>
-      // 전산이 이 프론트로 보낸 정비 주문을 보여주고 결제한다(erp-front-pay.js 상단 주석 참고).
-      // 대기화면(index.html)이 결제할 주문이 생긴 걸 보고 이 화면으로 넘어온다.
+      // 전산이 이 프론트로 보낸 정비 주문을 결제한다(erp-front-pay.js 상단 주석 참고).
+      // 대기화면(index.html)이 결제할 주문이 생긴 걸 보고 이 화면으로 넘어오며, 주문이 한 건이면
+      // 곧바로 통합결제창(결제수단 선택)을 띄운다. 여러 건일 때만 차량을 고르는 화면을 먼저 보여준다.
       const pay = window.ErpFrontPay
 
       function goHome() {
@@ -39,15 +40,6 @@
         return cart.carNumber || cart.memo || cart.referenceId
       }
 
-      // 주문 품목을 주문내역 템플릿 형식으로 바꾼다. value는 그 줄의 금액(단가 × 수량)이다.
-      function toOrderItems(cart) {
-        return (cart.items || []).map((item) => ({
-          label: String(item.name || item.productId || '품목'),
-          quantity: Number(item.quantity) || 1,
-          value: (Number(item.unitPrice) || 0) * (Number(item.quantity) || 1),
-        }))
-      }
-
       async function init() {
         const token = await pay.getToken()
         if (!token) {
@@ -65,7 +57,9 @@
           return
         }
         if (carts.length === 1) {
-          showOrder(token, carts[0])
+          // 주문내역 화면과 [결제하기] 버튼 없이 바로 통합결제창(결제수단 선택)을 띄운다.
+          // 금액은 결제창에 표시되고, 품목은 직원이 정비 대기열에서 확인한다.
+          startPayment(token, carts[0])
           return
         }
         // 여러 건이면 손님이 자기 차를 고르게 한다. 대기 중인 손님 것을 남이 결제하지 않도록
@@ -75,24 +69,12 @@
           subtitle: '차량번호를 확인해주세요',
           options: carts.map((cart) => ({
             title: `${cartTitle(cart)} · ${pay.formatWon(cart.totalAmount)}`,
-            onClick: () => showOrder(token, cart),
+            onClick: () => startPayment(token, cart),
           })),
           onBack: () => {
             carts.forEach((c) => pay.snooze(c.id))
             goHome()
           },
-        })
-      }
-
-      function showOrder(token, cart) {
-        sdk.template.renderOrderPage({
-          localeCode: 'ko',
-          order: {
-            items: toOrderItems(cart),
-            discounts: [],
-            summary: { totalAmount: cart.totalAmount },
-          },
-          onClick: () => startPayment(token, cart),
         })
       }
 
@@ -182,7 +164,7 @@
           title,
           subtitle: `${cartTitle(cart)} · ${pay.formatWon(cart.totalAmount)}`,
           options: [
-            { title: '다시 결제하기', onClick: () => showOrder(token, cart) },
+            { title: '다시 결제하기', onClick: () => startPayment(token, cart) },
             {
               title: '처음 화면으로',
               onClick: () => {

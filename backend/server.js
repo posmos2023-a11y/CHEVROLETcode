@@ -1004,15 +1004,20 @@ app.get('/api/pos/queue', posIpFloodLimiter, posQueueReadLimiter, requireStoreTo
     erpCarts,
     // 프론트에서 결제 대기/진행 중인 전산 주문. 담기 버튼이 없는 "보기 전용" 목록이다 --
     // POS가 이 건을 담으면 프론트와 양쪽에서 결제될 수 있다. 구버전 탭앱은 이 필드를 무시한다.
-    frontCarts: frontCartRows.map((row) => ({
-      id: row.id,
-      referenceId: row.referenceId,
-      carNumber: row.carNumber,
-      memo: row.memo,
-      totalAmount: row.totalAmount,
-      status: row.status,
-      createdAt: row.createdAt,
-    })),
+    frontCarts: frontCartRows.map((row) => {
+      let items = []
+      try { items = JSON.parse(row.itemsJson) } catch { /* 손상된 건은 품목만 빈 배열로 -- 목록 전체를 죽이지 않는다 */ }
+      return {
+        id: row.id,
+        referenceId: row.referenceId,
+        carNumber: row.carNumber,
+        memo: row.memo,
+        items,
+        totalAmount: row.totalAmount,
+        status: row.status,
+        createdAt: row.createdAt,
+      }
+    }),
     reservations: reservations.map((r) => ({
       id: r.id,
       queueNumber: r.queueNumber,
