@@ -25,6 +25,7 @@ model Store {
   erpOrders     ErpOrder[]
   erpCarts      ErpCart[]
   promoSends    PromoSend[]
+  marketingOptOuts MarketingOptOut[]
 }
 
 // Design Ref: docs/02-design/features/multi-store-support.design.md Phase 3
@@ -95,6 +96,7 @@ model Payment {
 
   @@index([storeId])
   @@index([storeId, createdAt])
+  @@index([storeId, phone])
   @@index([promoAt, promoSent, promoClaimedAt])
 }
 
@@ -265,9 +267,34 @@ model PromoSend {
   phone     String?
   sentBy    String? // 보낸 사람(관리자 계정 id). POS 탭앱에서 보낸 건 매장 단위라 null이다.
   sentAt    DateTime @default(now())
+  // 기록을 먼저 남기고(sending) 발송 결과로 바꾼다. sent(나감) | failed(확실히 안 나감 -- 30일 제한에서
+  // 빠진다) | unknown(시간 초과 등 결과를 모름 -- 나갔을 수 있어 30일 제한에 넣는다). 결과를 쓰기 전에
+  // 프로세스가 죽어 sending으로 남은 건도 나갔을 수 있으므로 30일 제한에 넣는다.
+  status    String   @default("sent")
+  via       String? // auto(결제 3개월 뒤) | manual(POS 차량별) | campaign-admin | campaign-pos
+  consentAt DateTime? // 이 발송의 근거가 된 광고 수신 동의 시각(가장 최근 기록의 marketingConsentAt)
 
   anonymizedAt DateTime? // 보관기간 경과 후 phone/carNumber를 지운 시각
 
   @@index([storeId, carNumber, sentAt])
+  @@index([storeId, phone, sentAt])
   @@index([storeId, sentAt])
+}
+
+// 광고 수신거부(동의 철회). 손님이 매장에 거부를 알려오면 직원이 POS 탭앱이나 관리자 웹에서 등록한다.
+// 등록된 번호에는 자동·수동·기간 지정 어떤 광고도 보내지 않는다. 등록한 뒤에 다시 방문해 광고 수신에
+// 새로 동의했다면(동의 시각 > optedOutAt) 그 동의를 따른다.
+//
+// 예약·결제 기록과 달리 보관기간이 지나도 지우지 않는다 -- 지우면 옛 동의 기록이 다시 살아나 거부한
+// 손님에게 광고가 나갈 수 있다. 거부 의사를 지키는 데 필요한 최소 정보(번호, 시각)만 둔다.
+model MarketingOptOut {
+  id         String   @id @default(uuid())
+  storeId    String
+  store      Store    @relation(fields: [storeId], references: [id])
+  phone      String
+  optedOutAt DateTime @default(now())
+  recordedBy String? // 등록한 관리자 id. POS 탭앱에서 등록한 건 매장 단위라 null이다.
+  via        String? // pos | admin
+
+  @@unique([storeId, phone])
 }

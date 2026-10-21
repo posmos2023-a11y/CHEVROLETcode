@@ -846,6 +846,31 @@ async function releasePromoClaim(id) {
   }
 }
 
+// 자동 홍보를 보내지 않고 끝낸다(수신거부·최근 방문에서 미동의·동의 2년 경과). promoSent는 true로
+// 두되 promoSentAt은 비워 "처리했지만 보내지 않음"을 남긴다 -- 다시 claim되지 않게 하려는 것이다.
+async function skipDuePromotion(id) {
+  try {
+    await prisma.payment.updateMany({
+      where: { id, promoSent: false },
+      data: { promoSent: true, promoClaimedAt: null },
+    })
+  } catch {
+    // 실패하면 claim이 10분 뒤 풀려 다음 실행에서 같은 판단을 다시 한다.
+  }
+}
+
+// 30일 안에 다른 경로로 광고를 받은 번호면 자동 홍보를 그 30일이 끝날 때까지 미룬다.
+async function postponeDuePromotion(id, until) {
+  try {
+    await prisma.payment.updateMany({
+      where: { id, promoSent: false },
+      data: { promoAt: until, promoClaimedAt: null },
+    })
+  } catch {
+    // releasePromoClaim과 같은 이유로 삼킨다.
+  }
+}
+
 // --- 쉐보레 전산(ERP) 연동 (ERP_CONTRACT_V1 §5) ---
 
 // 전산이 보낸 storeCode로 매장을 찾는다. 등록되지 않은 코드(빈 값 포함)는 null-safe하게 null을
@@ -1385,26 +1410,216 @@ async function findMarketingContactByCarNumber(storeId, carNumber) {
   }
 }
 
-// 이 차에 마지막으로 홍보를 보낸 시각. 반복 발송을 막는 데 쓴다.
+// 이 차에 마지막으로 홍보를 보낸 시각. 반복 발송을 막는 데 쓴다. 확실히 안 나간(failed) 기록은 뺀다.
 async function findLastPromoSend(storeId, carNumber) {
   const value = String(carNumber || '').replace(/[\s-]/g, '').trim()
   if (!value) return null
   return prisma.promoSend.findFirst({
-    where: { storeId, carNumber: value },
+    where: { storeId, carNumber: value, status: { not: 'failed' } },
     orderBy: { sentAt: 'desc' },
     select: { sentAt: true },
   })
 }
 
-function recordPromoSend({ storeId, carNumber, phone, sentBy }) {
-  return prisma.promoSend.create({
-    data: {
-      storeId,
-      carNumber: carNumber ? String(carNumber).replace(/[\s-]/g, '').trim() : null,
-      phone: phone || null,
-      sentBy: sentBy || null,
-    },
+// --- 광고 발송 공통 판단 ------------------------------------------------------------
+//
+// 광고(홍보 문자)는 세 경로로 나간다: 결제 3개월 뒤 자동 발송, POS 이력 화면의 차량별 수동 발송,
+// 기간 지정 발송. 경로마다 기준이 다르면(자동은 결제 건의 동의만, 수동은 차량번호 기준 30일 등) 같은
+// 번호에 30일 안에 광고가 거듭 나간다. 그래서 세 경로 모두 assessPromoPhones로 "이 번호에 지금 보내도
+// 되는가"를 같은 기준으로 판단하고, 보내기 직전에는 claimPromoSend로 다시 확인하며 기록을 잡는다.
+//
+//   1) 수신거부: MarketingOptOut에 등록된 번호는 보내지 않는다. 등록 뒤에 새로 동의했다면 그 동의를 따른다.
+//   2) 동의: 그 번호의 가장 최근 기록(예약·결제, 기간과 무관)에 광고 수신 동의가 있어야 한다. 옛 방문에서
+//      동의했더라도 마지막 방문에서 동의하지 않았다면 지금의 의사는 "거부"다.
+//   3) 동의 유효기간: 그 동의가 2년을 넘었으면 보내지 않는다. 법은 2년마다 수신동의 여부를 확인해
+//      알리라고 하는데(정보통신망법 시행령 제62조의3) 우리는 그 통지를 하지 않으므로, 다시 방문해 새로
+//      동의할 때까지 보내지 않는다.
+//   4) 30일: 이 매장에서 30일 안에 광고를 보낸 번호는 뺀다. PromoSend(수동·기간 지정·자동)와 이 기능 전에
+//      자동 발송만 남긴 Payment.promoSentAt을 함께 본다.
+// 보관기간이 지나 익명화된 기록은 보지 않는다.
+const PROMO_MIN_INTERVAL_DAYS = 30
+const PROMO_CONSENT_MAX_AGE_DAYS = 730
+// 확실히 실패한 번호는 같은 발송 작업 안에서 다시 시도하지 않는다(이어 보내기마다 같은 실패가 반복되지
+// 않게). 이 시간이 지나면 다시 대상이 된다.
+const PROMO_FAILED_RETRY_COOLDOWN_MS = 30 * 60 * 1000
+
+// db: prisma 또는 트랜잭션 클라이언트. 트랜잭션 안에서는 쿼리를 하나씩 보낸다(한 연결을 쓴다).
+// 반환: Map(phone -> { status, carNumber, lastVisitAt, consentAt, lastSentAt, recentFailure })
+//   status: ok | opted_out | no_consent | consent_expired | recently_sent
+async function assessPromoPhones(storeId, phones, db = prisma) {
+  const list = [...new Set((phones || []).filter(Boolean))]
+  const assessed = new Map()
+  if (!list.length) return assessed
+
+  const now = Date.now()
+  const sentCutoff = new Date(now - PROMO_MIN_INTERVAL_DAYS * 24 * 60 * 60 * 1000)
+  const consentCutoff = new Date(now - PROMO_CONSENT_MAX_AGE_DAYS * 24 * 60 * 60 * 1000)
+  const latestSelect = { phone: true, carNumber: true, marketingConsentAt: true, createdAt: true }
+  const queries = [
+    () => db.reservation.findMany({
+      where: { storeId, anonymizedAt: null, phone: { in: list } },
+      orderBy: { createdAt: 'desc' },
+      distinct: ['phone'],
+      select: latestSelect,
+    }),
+    () => db.payment.findMany({
+      where: { storeId, anonymizedAt: null, phone: { in: list } },
+      orderBy: { createdAt: 'desc' },
+      distinct: ['phone'],
+      select: latestSelect,
+    }),
+    () => db.marketingOptOut.findMany({
+      where: { storeId, phone: { in: list } },
+      select: { phone: true, optedOutAt: true },
+    }),
+    () => db.promoSend.findMany({
+      where: { storeId, phone: { in: list }, sentAt: { gte: sentCutoff } },
+      select: { phone: true, sentAt: true, status: true },
+    }),
+    () => db.payment.findMany({
+      where: { storeId, phone: { in: list }, promoSentAt: { gte: sentCutoff } },
+      select: { phone: true, promoSentAt: true },
+    }),
+  ]
+  let results
+  if (db === prisma) {
+    results = await Promise.all(queries.map((q) => q()))
+  } else {
+    results = []
+    for (const q of queries) results.push(await q())
+  }
+  const [latestRes, latestPay, optOuts, sends, autoSends] = results
+
+  const latest = new Map()
+  for (const r of [...latestRes, ...latestPay]) {
+    const prev = latest.get(r.phone)
+    if (!prev || new Date(r.createdAt) > new Date(prev.createdAt)) latest.set(r.phone, r)
+  }
+  const optedOutAt = new Map(optOuts.map((o) => [o.phone, o.optedOutAt]))
+  const lastSent = new Map()
+  const recentFailure = new Set()
+  const noteSent = (phone, at) => {
+    const prev = lastSent.get(phone)
+    if (!prev || new Date(at) > new Date(prev)) lastSent.set(phone, at)
+  }
+  for (const s of sends) {
+    if (s.status === 'failed') {
+      if (now - new Date(s.sentAt).getTime() < PROMO_FAILED_RETRY_COOLDOWN_MS) recentFailure.add(s.phone)
+    } else {
+      noteSent(s.phone, s.sentAt)
+    }
+  }
+  for (const p of autoSends) noteSent(p.phone, p.promoSentAt)
+
+  for (const phone of list) {
+    const rec = latest.get(phone) || null
+    const consentAt = rec?.marketingConsentAt || null
+    const optOut = optedOutAt.get(phone)
+    let status = 'ok'
+    if (optOut && !(consentAt && new Date(consentAt) > new Date(optOut))) status = 'opted_out'
+    else if (!consentAt) status = 'no_consent'
+    else if (new Date(consentAt) < consentCutoff) status = 'consent_expired'
+    else if (lastSent.has(phone)) status = 'recently_sent'
+    assessed.set(phone, {
+      status,
+      carNumber: rec?.carNumber || null,
+      lastVisitAt: rec?.createdAt || null,
+      consentAt,
+      lastSentAt: lastSent.get(phone) || null,
+      recentFailure: recentFailure.has(phone),
+    })
+  }
+  return assessed
+}
+
+// 광고 한 건을 보내기 직전에 "이 번호에 지금 보내도 되는가"를 다시 확인하고 발송 기록(status 'sending')을
+// 남긴다. 확인과 기록 사이에 다른 요청(다른 Cloud Run 인스턴스의 기간 발송, 10시 자동 발송, 직원의 수동
+// 발송)이 끼어들면 같은 번호에 두 번 갈 수 있어서, 번호 단위 트랜잭션 잠금(pg_advisory_xact_lock) 안에서
+// 확인하고 기록한다. 같은 번호를 동시에 잡으려는 요청은 앞 요청이 끝날 때까지 기다렸다가 그 기록을 보고 빠진다.
+// 기록을 발송보다 **먼저** 남기는 이유: 발송이 성공했는데 기록이 실패하면 30일 제한이 풀린다.
+// 반환: { ok: true, record } | { ok: false, status, lastSentAt }
+async function claimPromoSend({ storeId, phone, carNumber, sentBy, via }) {
+  return prisma.$transaction(async (tx) => {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`promo:${storeId}:${phone}`}))`
+    const assessed = (await assessPromoPhones(storeId, [phone], tx)).get(phone)
+    if (assessed.status !== 'ok') {
+      return { ok: false, status: assessed.status, lastSentAt: assessed.lastSentAt }
+    }
+    const record = await tx.promoSend.create({
+      data: {
+        storeId,
+        carNumber: carNumber ? String(carNumber).replace(/[\s-]/g, '').trim() : null,
+        phone,
+        sentBy: sentBy || null,
+        status: 'sending',
+        via: via || null,
+        consentAt: assessed.consentAt,
+      },
+    })
+    return { ok: true, record }
   })
+}
+
+// 발송 결과를 기록한다. status: sent | failed(확실히 안 나감) | unknown(결과 모름 -- 나갔을 수 있음)
+async function finishPromoSend(id, status) {
+  try {
+    await prisma.promoSend.updateMany({ where: { id, status: 'sending' }, data: { status } })
+  } catch {
+    // 결과 기록에 실패하면 sending으로 남는다. sending은 30일 제한에 들어가므로 중복 발송 쪽으로는 안전하다.
+  }
+}
+
+// 수신거부 등록. 이미 있으면 거부 시각을 지금으로 갱신한다(그 사이 받은 동의보다 나중의 의사가 된다).
+function registerMarketingOptOut({ storeId, phone, recordedBy, via }) {
+  return prisma.marketingOptOut.upsert({
+    where: { storeId_phone: { storeId, phone } },
+    create: { storeId, phone, recordedBy: recordedBy || null, via: via || null },
+    update: { optedOutAt: new Date(), recordedBy: recordedBy || null, via: via || null },
+  })
+}
+
+// --- 기간 지정 홍보 문자(관리자 웹·POS 탭앱) -------------------------------------------
+//
+// "이 기간에 방문한 손님"에게 홍보 문자를 한 번에 보내기 위한 대상 계산. 받는 사람은 전화번호라
+// 차량번호가 아니라 **전화번호 단위**로 묶는다(한 사람이 차 두 대면 한 번만 보낸다).
+// 보낼 수 있는지는 assessPromoPhones(위)로 판단한다.
+// skipRecentFailures: 발송할 때만 켠다. 방금 확실히 실패한 번호를 이어 보내기에서 다시 시도하지 않는다.
+const PROMO_CAMPAIGN_MAX_VISITORS = 5000
+
+async function listPromoCampaignCandidates(storeId, start, end, { skipRecentFailures = false } = {}) {
+  const inRange = { storeId, anonymizedAt: null, createdAt: { gte: start, lt: end } }
+  const [resPhones, payPhones] = await Promise.all([
+    prisma.reservation.findMany({
+      where: { ...inRange, phone: { not: '' } },
+      select: { phone: true },
+      distinct: ['phone'],
+      take: PROMO_CAMPAIGN_MAX_VISITORS,
+    }),
+    prisma.payment.findMany({
+      where: { ...inRange, phone: { not: null } },
+      select: { phone: true },
+      distinct: ['phone'],
+      take: PROMO_CAMPAIGN_MAX_VISITORS,
+    }),
+  ])
+  const phones = [...new Set([...resPhones, ...payPhones].map((r) => r.phone).filter(Boolean))]
+  const truncated = phones.length >= PROMO_CAMPAIGN_MAX_VISITORS
+  const excluded = { optedOut: 0, noConsent: 0, consentExpired: 0, recentlySent: 0, recentlyFailed: 0 }
+  if (!phones.length) return { visitors: 0, recipients: [], excluded, truncated: false }
+
+  const assessed = await assessPromoPhones(storeId, phones)
+  const recipients = []
+  for (const phone of phones) {
+    const a = assessed.get(phone)
+    if (a.status === 'opted_out') excluded.optedOut += 1
+    else if (a.status === 'no_consent') excluded.noConsent += 1
+    else if (a.status === 'consent_expired') excluded.consentExpired += 1
+    else if (a.status === 'recently_sent') excluded.recentlySent += 1
+    else if (skipRecentFailures && a.recentFailure) excluded.recentlyFailed += 1
+    else recipients.push({ phone, carNumber: a.carNumber, lastVisitAt: a.lastVisitAt })
+  }
+  recipients.sort((x, y) => new Date(y.lastVisitAt) - new Date(x.lastVisitAt))
+  return { visitors: phones.length, recipients, excluded, truncated }
 }
 
 // 매장이 POS에서 보는 오늘 현황. 관리자 웹의 getDailySummary와 목적이 다르다 —
@@ -1929,7 +2144,15 @@ module.exports = {
   listRecentRepairHistory,
   findMarketingContactByCarNumber,
   findLastPromoSend,
-  recordPromoSend,
+  PROMO_MIN_INTERVAL_DAYS,
+  PROMO_CONSENT_MAX_AGE_DAYS,
+  assessPromoPhones,
+  claimPromoSend,
+  finishPromoSend,
+  registerMarketingOptOut,
+  skipDuePromotion,
+  postponeDuePromotion,
+  listPromoCampaignCandidates,
   completeReservationAfterPayment,
   findOpenReservationByCarNumber,
   expireStaleErpCarts,

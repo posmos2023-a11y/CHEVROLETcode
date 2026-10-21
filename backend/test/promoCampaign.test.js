@@ -1,0 +1,654 @@
+// 기간 지정 홍보 문자(관리자 웹) 테스트.
+// 다른 테스트 파일과 같은 로컬 devdb를 TRUNCATE로 비우므로 package.json의 `--test-concurrency=1`이 필요하다.
+// 야간(21~08시 KST)에는 발송이 막히므로, 실제 발송을 확인하는 테스트는 낮에만 돈다(erpCart.test.js와 같은 방식).
+
+const assert = require('node:assert/strict')
+const crypto = require('node:crypto')
+const { after, before, beforeEach, test } = require('node:test')
+const { URL } = require('node:url')
+const request = require('supertest')
+
+function requireLocalTestDatabase() {
+  const rawUrl = process.env.DATABASE_URL
+  if (!rawUrl) {
+    throw new Error(
+      'DATABASE_URL이 필요합니다. 운영 DB를 절대 사용하지 말고 localhost의 devdb를 실행한 뒤 npm test를 실행하세요.'
+    )
+  }
+  const databaseUrl = new URL(rawUrl)
+  const localHosts = new Set(['localhost', '127.0.0.1', '::1'])
+  const databaseName = databaseUrl.pathname.replace(/^\//, '')
+  if (!localHosts.has(databaseUrl.hostname) || databaseName !== 'devdb' || process.env.NODE_ENV === 'production') {
+    throw new Error('테스트는 localhost/devdb에서만 실행됩니다. 운영 Cloud SQL DATABASE_URL을 거부했습니다.')
+  }
+}
+
+requireLocalTestDatabase()
+process.env.NODE_ENV = 'test'
+process.env.JWT_SECRET = 'local-test-jwt-secret'
+process.env.TOSS_WEBHOOK_SECRET = ''
+
+const solapi = require('../src/solapi')
+const promoCalls = []
+let failNext = null // null | 'error'(확실한 실패) | 'timeout' | 'network'(결과 모름)
+solapi.sendPromoAlimtalk = async (payload) => {
+  promoCalls.push(payload)
+  if (failNext === 'error') {
+    failNext = null
+    const err = new Error('수신번호 오류(테스트)')
+    err.definiteFailure = true // solapi.js가 failedMessageList에서 만든 오류와 같은 표시
+    throw err
+  }
+  if (failNext === 'timeout') {
+    failNext = null
+    const err = new Error('Solapi 발송 시간 초과 (10초)')
+    err.code = 'SOLAPI_TIMEOUT'
+    throw err
+  }
+  if (failNext === 'network') { failNext = null; throw new Error('socket hang up') }
+  return { ok: true }
+}
+
+const { prisma } = require('../src/store')
+const { hashPassword, signAdminToken } = require('../src/auth')
+const { app } = require('../server')
+
+const testSerial = (name, fn) => test(name, { concurrency: false }, fn)
+
+let sequence = 0
+function unique(prefix) {
+  sequence += 1
+  return `${prefix}-${Date.now()}-${sequence}`
+}
+
+async function resetDatabase() {
+  await prisma.$executeRawUnsafe(
+    'TRUNCATE TABLE "MarketingOptOut", "PromoSend", "ErpCart", "RateLimitHit", "WebhookEvent", "Payment", "Reservation", "QueueCounter", "AdminUser", "Store" RESTART IDENTITY CASCADE'
+  )
+  promoCalls.length = 0
+  failNext = null
+}
+
+before(async () => {
+  await prisma.$queryRaw`SELECT 1`
+  await resetDatabase()
+})
+beforeEach(resetDatabase)
+after(async () => {
+  await prisma.$disconnect()
+})
+
+const DAY = 24 * 60 * 60 * 1000
+function kstDate(offsetDays = 0) {
+  return new Date(Date.now() + 9 * 3600 * 1000 + offsetDays * DAY).toISOString().slice(0, 10)
+}
+function isDaytimeKst() {
+  const h = new Date(Date.now() + 9 * 3600 * 1000).getUTCHours()
+  return h >= 8 && h < 21
+}
+
+async function createStore(label) {
+  return prisma.store.create({
+    data: {
+      merchantId: unique(`m-${label}`),
+      name: `테스트 매장 ${label}`,
+      posToken: crypto.randomBytes(32).toString('hex'),
+    },
+  })
+}
+
+async function adminToken(role, store) {
+  const admin = await prisma.adminUser.create({
+    data: {
+      email: `${unique(role)}@example.test`,
+      passwordHash: await hashPassword('test-password-123'),
+      role,
+      storeId: store ? store.id : null,
+    },
+  })
+  return { token: signAdminToken(admin), admin }
+}
+
+// 방문 기록. daysAgo로 접수 시각을 과거로 둔다.
+function visit(store, { phone, carNumber = '12가3456', marketing = true, daysAgo = 1, anonymized = false }) {
+  return prisma.reservation.create({
+    data: {
+      storeId: store.id,
+      carNumber,
+      phone,
+      serviceType: '엔진오일',
+      queueNumber: Math.floor(Math.random() * 9000) + 1000,
+      serviceDate: kstDate(-daysAgo),
+      status: 'completed',
+      privacyConsentAt: new Date(),
+      marketingConsentAt: marketing ? new Date(Date.now() - daysAgo * DAY) : null,
+      createdAt: new Date(Date.now() - daysAgo * DAY),
+      anonymizedAt: anonymized ? new Date() : null,
+    },
+  })
+}
+
+function preview(token, query) {
+  return request(app).get('/api/admin/promo-campaign/preview').set('Authorization', `Bearer ${token}`).query(query)
+}
+function send(token, body) {
+  return request(app).post('/api/admin/promo-campaign/send').set('Authorization', `Bearer ${token}`).send(body)
+}
+
+// --- 미리보기 ---------------------------------------------------------------------
+
+testSerial('미리보기: 기간 안에 방문한 동의자만 대상이고, 기간 밖 방문자와 비동의자는 빠진다', async () => {
+  const store = await createStore('basic')
+  const { token } = await adminToken('hq_admin')
+  await visit(store, { phone: '01011110001', daysAgo: 3 })
+  await visit(store, { phone: '01011110002', daysAgo: 4, marketing: false })
+  await visit(store, { phone: '01011110003', daysAgo: 40 }) // 기간 밖
+
+  const res = await preview(token, { storeId: store.id, from: kstDate(-7), to: kstDate(0) })
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal(res.body.visitors, 2)
+  assert.equal(res.body.eligible, 1)
+  assert.equal(res.body.excluded.noConsent, 1)
+  assert.equal(res.body.sample[0].phoneMasked, '010-****-0001')
+  assert.equal(JSON.stringify(res.body).includes('01011110001'), false) // 전화번호 원문은 내려가지 않는다
+})
+
+testSerial('미리보기: 기간 안에서 동의했어도 그 뒤 방문에서 동의하지 않았으면 제외한다(최근 의사 기준)', async () => {
+  const store = await createStore('latest')
+  const { token } = await adminToken('hq_admin')
+  await visit(store, { phone: '01022220001', daysAgo: 20, marketing: true })
+  await visit(store, { phone: '01022220001', daysAgo: 2, marketing: false })
+  const res = await preview(token, { storeId: store.id, from: kstDate(-30), to: kstDate(-10) })
+  assert.equal(res.body.visitors, 1)
+  assert.equal(res.body.eligible, 0)
+  assert.equal(res.body.excluded.noConsent, 1)
+})
+
+testSerial('미리보기: 같은 번호는 차가 여러 대여도 한 명으로 센다', async () => {
+  const store = await createStore('dedupe')
+  const { token } = await adminToken('hq_admin')
+  await visit(store, { phone: '01033330001', carNumber: '12가1111', daysAgo: 2 })
+  await visit(store, { phone: '01033330001', carNumber: '34나2222', daysAgo: 3 })
+  const res = await preview(token, { storeId: store.id, from: kstDate(-7), to: kstDate(0) })
+  assert.equal(res.body.visitors, 1)
+  assert.equal(res.body.eligible, 1)
+})
+
+testSerial('미리보기: 30일 안에 홍보를 받은 번호는 제외한다', async () => {
+  const store = await createStore('recent')
+  const { token } = await adminToken('hq_admin')
+  await visit(store, { phone: '01044440001', daysAgo: 2 })
+  await prisma.promoSend.create({ data: { storeId: store.id, phone: '01044440001', carNumber: '12가3456', sentAt: new Date(Date.now() - 10 * DAY) } })
+  const res = await preview(token, { storeId: store.id, from: kstDate(-7), to: kstDate(0) })
+  assert.equal(res.body.eligible, 0)
+  assert.equal(res.body.excluded.recentlySent, 1)
+})
+
+testSerial('미리보기: 다른 매장 방문·발송 기록과 익명화된 기록은 보지 않는다', async () => {
+  const store = await createStore('scope')
+  const other = await createStore('scope-other')
+  const { token } = await adminToken('hq_admin')
+  await visit(other, { phone: '01055550001', daysAgo: 2 })
+  await visit(store, { phone: '01055550002', daysAgo: 2, anonymized: true })
+  await visit(store, { phone: '01055550003', daysAgo: 2 })
+  await prisma.promoSend.create({ data: { storeId: other.id, phone: '01055550003', sentAt: new Date() } })
+  const res = await preview(token, { storeId: store.id, from: kstDate(-7), to: kstDate(0) })
+  assert.equal(res.body.visitors, 1)
+  assert.equal(res.body.eligible, 1)
+})
+
+testSerial('미리보기: 프론트 결제(Payment)로 방문한 손님도 포함한다', async () => {
+  const store = await createStore('payment')
+  const { token } = await adminToken('hq_admin')
+  await prisma.payment.create({
+    data: {
+      storeId: store.id, paymentKey: unique('pk'), phone: '01066660001', amount: 10000,
+      promoAt: new Date(Date.now() + 90 * DAY), marketingConsentAt: new Date(), privacyConsentAt: new Date(),
+      createdAt: new Date(Date.now() - 2 * DAY),
+    },
+  })
+  const res = await preview(token, { storeId: store.id, from: kstDate(-7), to: kstDate(0) })
+  assert.equal(res.body.eligible, 1)
+})
+
+testSerial('권한: 매장 관리자는 다른 매장을 지정해도 자기 매장으로 고정된다', async () => {
+  const mine = await createStore('mine')
+  const other = await createStore('other')
+  const { token } = await adminToken('store_admin', mine)
+  await visit(other, { phone: '01077770001', daysAgo: 2 })
+  const res = await preview(token, { storeId: other.id, from: kstDate(-7), to: kstDate(0) })
+  assert.equal(res.status, 200)
+  assert.equal(res.body.storeName, mine.name)
+  assert.equal(res.body.visitors, 0)
+})
+
+testSerial('권한: 본사 관리자는 매장을 지정해야 한다(전 매장 일괄 발송 없음)', async () => {
+  const { token } = await adminToken('hq_admin')
+  const res = await preview(token, { from: kstDate(-7), to: kstDate(0) })
+  assert.equal(res.status, 400)
+})
+
+testSerial('권한: 로그인하지 않으면 401', async () => {
+  const res = await request(app).get('/api/admin/promo-campaign/preview').query({ from: kstDate(-7), to: kstDate(0) })
+  assert.equal(res.status, 401)
+  const sent = await request(app).post('/api/admin/promo-campaign/send').send({ from: kstDate(-7), to: kstDate(0), confirmCount: 1 })
+  assert.equal(sent.status, 401)
+})
+
+testSerial('기간 검증: 형식 오류·역순·미래·366일 초과는 400', async () => {
+  const store = await createStore('dates')
+  const { token } = await adminToken('hq_admin')
+  for (const [from, to] of [['2026-1-1', kstDate(0)], [kstDate(0), kstDate(-1)], [kstDate(-1), kstDate(1)], [kstDate(-400), kstDate(0)]]) {
+    const res = await preview(token, { storeId: store.id, from, to })
+    assert.equal(res.status, 400, `${from}~${to}`)
+  }
+})
+
+// --- 발송 -------------------------------------------------------------------------
+
+testSerial('발송: 대상에게만 보내고 보낸 관리자를 기록하며, 보낸 번호는 다음 미리보기에서 빠진다', async () => {
+  if (!isDaytimeKst()) return
+  const store = await createStore('send')
+  const { token, admin } = await adminToken('hq_admin')
+  await visit(store, { phone: '01088880001', carNumber: '12가1111', daysAgo: 2 })
+  await visit(store, { phone: '01088880002', carNumber: '34나2222', daysAgo: 3 })
+  await visit(store, { phone: '01088880003', daysAgo: 3, marketing: false })
+
+  const res = await send(token, { storeId: store.id, from: kstDate(-7), to: kstDate(0), confirmCount: 2 })
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal(res.body.sent, 2)
+  assert.equal(res.body.remaining, 0)
+  assert.deepEqual(promoCalls.map((c) => c.phone).sort(), ['01088880001', '01088880002'])
+  assert.ok(promoCalls.every((c) => c.storeName === store.name))
+
+  const records = await prisma.promoSend.findMany({ where: { storeId: store.id } })
+  assert.equal(records.length, 2)
+  assert.ok(records.every((r) => r.sentBy === admin.id))
+
+  const again = await preview(token, { storeId: store.id, from: kstDate(-7), to: kstDate(0) })
+  assert.equal(again.body.eligible, 0)
+  assert.equal(again.body.excluded.recentlySent, 2)
+})
+
+testSerial('발송: 미리보기 이후 대상이 늘었으면 보내지 않는다(409)', async () => {
+  if (!isDaytimeKst()) return
+  const store = await createStore('changed')
+  const { token } = await adminToken('hq_admin')
+  await visit(store, { phone: '01099990001', daysAgo: 2 })
+  await visit(store, { phone: '01099990002', daysAgo: 2 })
+  const res = await send(token, { storeId: store.id, from: kstDate(-7), to: kstDate(0), confirmCount: 1 })
+  assert.equal(res.status, 409)
+  assert.equal(res.body.eligible, 2)
+  assert.equal(promoCalls.length, 0)
+  assert.equal(await prisma.promoSend.count(), 0)
+})
+
+testSerial('발송: 확실한 실패는 failed로 남아 나중에 다시 보낼 수 있고, 같은 발송 안에서는 다시 시도하지 않는다', async () => {
+  if (!isDaytimeKst()) return
+  const store = await createStore('fail')
+  const { token } = await adminToken('hq_admin')
+  await visit(store, { phone: '01012120001', daysAgo: 2 })
+  const period = { storeId: store.id, from: kstDate(-7), to: kstDate(0) }
+
+  failNext = 'error'
+  const first = await send(token, { ...period, confirmCount: 1 })
+  assert.equal(first.body.failed, 1)
+  assert.equal(first.body.uncertain, 0)
+  const record = await prisma.promoSend.findFirst({ where: { storeId: store.id } })
+  assert.equal(record.status, 'failed')
+
+  // 30일 제한에는 들어가지 않는다(미리보기에서 다시 대상)
+  const retry = await preview(token, period)
+  assert.equal(retry.body.eligible, 1)
+
+  // 하지만 이어 보내기에서는 방금 실패한 번호를 다시 시도하지 않는다
+  const again = await send(token, { ...period, confirmCount: 0 })
+  assert.equal(again.status, 200, JSON.stringify(again.body))
+  assert.equal(again.body.sent, 0)
+  assert.equal(promoCalls.length, 1)
+
+  // 30분이 지나면 다시 보낼 수 있다
+  await prisma.promoSend.update({ where: { id: record.id }, data: { sentAt: new Date(Date.now() - 31 * 60 * 1000) } })
+  const later = await send(token, { ...period, confirmCount: 1 })
+  assert.equal(later.body.sent, 1)
+  assert.equal(promoCalls.length, 2)
+})
+
+testSerial('발송: 시간 초과·알 수 없는 오류는 나갔을 수 있어 unknown으로 남기고 30일 제한에 넣는다', async () => {
+  if (!isDaytimeKst()) return
+  const store = await createStore('uncertain')
+  const { token } = await adminToken('hq_admin')
+  await visit(store, { phone: '01012130001', daysAgo: 2 })
+  await visit(store, { phone: '01012130002', daysAgo: 3 })
+  const period = { storeId: store.id, from: kstDate(-7), to: kstDate(0) }
+
+  failNext = 'timeout'
+  const first = await send(token, { ...period, confirmCount: 2 })
+  assert.equal(first.body.sent, 1)
+  assert.equal(first.body.uncertain, 1)
+  assert.equal(first.body.failed, 0)
+  assert.deepEqual((await prisma.promoSend.findMany({ where: { storeId: store.id } })).map((r) => r.status).sort(), ['sent', 'unknown'])
+
+  const after = await preview(token, period)
+  assert.equal(after.body.eligible, 0)
+  assert.equal(after.body.excluded.recentlySent, 2)
+})
+
+testSerial('발송: 태그 없는 일반 오류(네트워크 등)도 결과를 모르는 것으로 본다', async () => {
+  if (!isDaytimeKst()) return
+  const store = await createStore('network')
+  const { token } = await adminToken('hq_admin')
+  await visit(store, { phone: '01012140001', daysAgo: 2 })
+  failNext = 'network'
+  const res = await send(token, { storeId: store.id, from: kstDate(-7), to: kstDate(0), confirmCount: 1 })
+  assert.equal(res.body.uncertain, 1)
+  const record = await prisma.promoSend.findFirst({ where: { storeId: store.id } })
+  assert.equal(record.status, 'unknown')
+})
+
+testSerial('발송: 기록에 경로(via)와 근거 동의 시각(consentAt)을 남긴다', async () => {
+  if (!isDaytimeKst()) return
+  const store = await createStore('audit')
+  const { token } = await adminToken('hq_admin')
+  const r = await visit(store, { phone: '01012150001', daysAgo: 2 })
+  await send(token, { storeId: store.id, from: kstDate(-7), to: kstDate(0), confirmCount: 1 })
+  const record = await prisma.promoSend.findFirst({ where: { storeId: store.id } })
+  assert.equal(record.via, 'campaign-admin')
+  assert.equal(record.status, 'sent')
+  assert.equal(record.consentAt.getTime(), r.marketingConsentAt.getTime())
+})
+
+// --- 공통 판단: 수신거부·동의 2년·다른 경로 발송 ---------------------------------------
+
+function posOptOut(store, phone) {
+  return request(app).post('/api/pos/promo/opt-out').set('X-Store-Token', store.posToken).send({ phone })
+}
+
+testSerial('수신거부: 탭앱에서 등록한 번호는 대상에서 빠지고, 그 뒤 새로 동의하면 다시 대상이 된다', async () => {
+  const store = await createStore('optout')
+  const { token } = await adminToken('hq_admin')
+  await visit(store, { phone: '01016160001', daysAgo: 5 })
+  const period = { storeId: store.id, from: kstDate(-7), to: kstDate(0) }
+
+  const reg = await posOptOut(store, '010-1616-0001')
+  assert.equal(reg.status, 200, JSON.stringify(reg.body))
+  assert.equal(reg.body.phoneMasked, '010-****-0001')
+  const row = await prisma.marketingOptOut.findFirst({ where: { storeId: store.id } })
+  assert.equal(row.phone, '01016160001')
+  assert.equal(row.via, 'pos')
+
+  const blocked = await preview(token, period)
+  assert.equal(blocked.body.eligible, 0)
+  assert.equal(blocked.body.excluded.optedOut, 1)
+
+  // 거부 등록 뒤의 방문에서 새로 동의했다
+  await prisma.reservation.create({
+    data: {
+      storeId: store.id, carNumber: '12가3456', phone: '01016160001', serviceType: '엔진오일',
+      queueNumber: 4321, serviceDate: kstDate(0), status: 'completed',
+      privacyConsentAt: new Date(), marketingConsentAt: new Date(Date.now() + 1000), createdAt: new Date(Date.now() + 1000),
+    },
+  })
+  const again = await preview(token, period)
+  assert.equal(again.body.eligible, 1)
+})
+
+testSerial('수신거부: 다른 매장에 등록한 거부는 이 매장 대상에 영향이 없다', async () => {
+  const store = await createStore('optout-scope')
+  const other = await createStore('optout-scope-other')
+  const { token } = await adminToken('hq_admin')
+  await visit(store, { phone: '01016170001', daysAgo: 2 })
+  assert.equal((await posOptOut(other, '01016170001')).status, 200)
+  const res = await preview(token, { storeId: store.id, from: kstDate(-7), to: kstDate(0) })
+  assert.equal(res.body.eligible, 1)
+})
+
+testSerial('수신거부: 잘못된 번호는 400, 매장 토큰 없으면 401', async () => {
+  const store = await createStore('optout-bad')
+  assert.equal((await posOptOut(store, '1234')).status, 400)
+  assert.equal((await request(app).post('/api/pos/promo/opt-out').send({ phone: '01012345678' })).status, 401)
+})
+
+testSerial('수신거부: 관리자 웹 등록은 매장 관리자면 자기 매장으로 고정되고 등록자를 남긴다', async () => {
+  const mine = await createStore('optout-admin')
+  const other = await createStore('optout-admin-other')
+  const { token, admin } = await adminToken('store_admin', mine)
+  const res = await request(app).post('/api/admin/promo-opt-out').set('Authorization', `Bearer ${token}`)
+    .send({ storeId: other.id, phone: '01016180001' })
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  const row = await prisma.marketingOptOut.findFirst({ where: { phone: '01016180001' } })
+  assert.equal(row.storeId, mine.id)
+  assert.equal(row.recordedBy, admin.id)
+
+  const hq = await adminToken('hq_admin')
+  const noStore = await request(app).post('/api/admin/promo-opt-out').set('Authorization', `Bearer ${hq.token}`).send({ phone: '01016180002' })
+  assert.equal(noStore.status, 400)
+  assert.equal((await request(app).post('/api/admin/promo-opt-out').send({ phone: '01016180002' })).status, 401)
+})
+
+testSerial('동의 2년: 2년이 지난 동의는 대상에서 뺀다', async () => {
+  const store = await createStore('expired')
+  const { token } = await adminToken('hq_admin')
+  await visit(store, { phone: '01017170001', daysAgo: 750 })
+  await visit(store, { phone: '01017170002', daysAgo: 700 })
+  const res = await preview(token, { storeId: store.id, from: kstDate(-800), to: kstDate(-600) })
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal(res.body.visitors, 2)
+  assert.equal(res.body.eligible, 1)
+  assert.equal(res.body.excluded.consentExpired, 1)
+})
+
+testSerial('30일: 자동 홍보(Payment.promoSentAt)로 받은 번호도 빠진다', async () => {
+  const store = await createStore('auto-sent')
+  const { token } = await adminToken('hq_admin')
+  await visit(store, { phone: '01018180001', daysAgo: 2 })
+  await prisma.payment.create({
+    data: {
+      storeId: store.id, phone: '01018180001', amount: 10000, promoAt: new Date(Date.now() - 5 * DAY),
+      promoSent: true, promoSentAt: new Date(Date.now() - 5 * DAY), marketingConsentAt: new Date(Date.now() - 100 * DAY),
+      createdAt: new Date(Date.now() - 100 * DAY),
+    },
+  })
+  const res = await preview(token, { storeId: store.id, from: kstDate(-7), to: kstDate(0) })
+  assert.equal(res.body.eligible, 0)
+  assert.equal(res.body.excluded.recentlySent, 1)
+})
+
+testSerial('동시 발송: 같은 번호를 동시에 잡으면 한 건만 기록된다(번호 단위 잠금)', async () => {
+  const store = await createStore('race')
+  await visit(store, { phone: '01019190001', daysAgo: 2 })
+  const { claimPromoSend } = require('../src/store')
+  const claims = await Promise.all(Array.from({ length: 4 }, () =>
+    claimPromoSend({ storeId: store.id, phone: '01019190001', carNumber: '12가3456', sentBy: null, via: 'campaign-admin' })))
+  assert.equal(claims.filter((c) => c.ok).length, 1)
+  assert.deepEqual(claims.filter((c) => !c.ok).map((c) => c.status), ['recently_sent', 'recently_sent', 'recently_sent'])
+  assert.equal(await prisma.promoSend.count({ where: { storeId: store.id } }), 1)
+})
+
+// --- 자동 홍보(결제 3개월 뒤)도 같은 기준을 쓴다 -----------------------------------------
+
+function duePayment(store, phone, overrides = {}) {
+  return prisma.payment.create({
+    data: {
+      storeId: store.id, phone, carNumber: '12가3456', amount: 10000,
+      promoAt: new Date(Date.now() - 60 * 1000), marketingConsentAt: new Date(Date.now() - 90 * DAY),
+      createdAt: new Date(Date.now() - 90 * DAY), ...overrides,
+    },
+  })
+}
+
+testSerial('자동 홍보: 보내면 PromoSend(auto)를 남겨 다른 경로의 30일 제한에 걸린다', async () => {
+  const { sendDuePromotions } = require('../server')
+  const store = await createStore('auto-ok')
+  const p = await duePayment(store, '01020200001')
+  const result = await sendDuePromotions()
+  assert.equal(result.sent, 1, JSON.stringify(result))
+  const record = await prisma.promoSend.findFirst({ where: { storeId: store.id } })
+  assert.equal(record.via, 'auto')
+  assert.equal(record.status, 'sent')
+  const paid = await prisma.payment.findUnique({ where: { id: p.id } })
+  assert.equal(paid.promoSent, true)
+  assert.ok(paid.promoSentAt)
+})
+
+testSerial('자동 홍보: 수신거부한 번호는 보내지 않고 "보내지 않음"으로 닫는다', async () => {
+  const { sendDuePromotions } = require('../server')
+  const store = await createStore('auto-optout')
+  const p = await duePayment(store, '01020210001')
+  await posOptOut(store, '01020210001')
+  const result = await sendDuePromotions()
+  assert.equal(result.skipped, 1, JSON.stringify(result))
+  assert.equal(promoCalls.length, 0)
+  const row = await prisma.payment.findUnique({ where: { id: p.id } })
+  assert.equal(row.promoSent, true)
+  assert.equal(row.promoSentAt, null)
+})
+
+testSerial('자동 홍보: 최근 방문에서 동의하지 않았으면 보내지 않는다', async () => {
+  const { sendDuePromotions } = require('../server')
+  const store = await createStore('auto-latest')
+  await duePayment(store, '01020220001')
+  await visit(store, { phone: '01020220001', daysAgo: 1, marketing: false })
+  const result = await sendDuePromotions()
+  assert.equal(result.skipped, 1, JSON.stringify(result))
+  assert.equal(promoCalls.length, 0)
+})
+
+testSerial('자동 홍보: 30일 안에 다른 경로로 받았으면 30일이 끝날 때까지 미룬다', async () => {
+  const { sendDuePromotions } = require('../server')
+  const store = await createStore('auto-postpone')
+  const p = await duePayment(store, '01020230001')
+  const sentAt = new Date(Date.now() - 10 * DAY)
+  await prisma.promoSend.create({ data: { storeId: store.id, phone: '01020230001', sentAt } })
+  const result = await sendDuePromotions()
+  assert.equal(result.skipped, 1, JSON.stringify(result))
+  assert.equal(promoCalls.length, 0)
+  const row = await prisma.payment.findUnique({ where: { id: p.id } })
+  assert.equal(row.promoSent, false)
+  assert.equal(row.promoAt.getTime(), sentAt.getTime() + 30 * DAY)
+})
+
+testSerial('자동 홍보: 결과를 모르는 실패는 다시 보내지 않고, 확실한 실패는 다음에 다시 보낸다', async () => {
+  const { sendDuePromotions } = require('../server')
+  const store = await createStore('auto-fail')
+  const a = await duePayment(store, '01020240001')
+  failNext = 'timeout'
+  await sendDuePromotions()
+  const rowA = await prisma.payment.findUnique({ where: { id: a.id } })
+  assert.equal(rowA.promoSent, true)
+
+  const store2 = await createStore('auto-fail-2')
+  const b = await duePayment(store2, '01020240002')
+  failNext = 'error'
+  await sendDuePromotions()
+  const rowB = await prisma.payment.findUnique({ where: { id: b.id } })
+  assert.equal(rowB.promoSent, false)
+  assert.equal(rowB.promoClaimedAt, null)
+})
+
+testSerial('수동 홍보: 기간 발송으로 같은 번호에 보냈으면 다른 차여도 30일 동안 막는다', async () => {
+  if (!isDaytimeKst()) return // 야간에는 30일 판단 전에 야간으로 막힌다
+  const store = await createStore('manual-phone')
+  await visit(store, { phone: '01021210001', carNumber: '99하9999', daysAgo: 1 })
+  await prisma.promoSend.create({ data: { storeId: store.id, phone: '01021210001', carNumber: '12가3456', sentAt: new Date(Date.now() - 3 * DAY) } })
+  const res = await request(app).get('/api/pos/promo/eligibility?carNumber=' + encodeURIComponent('99하9999')).set('X-Store-Token', store.posToken)
+  assert.equal(res.body.canSend, false, JSON.stringify(res.body))
+  assert.equal(res.body.reason, 'recently_sent')
+})
+
+testSerial('수동 홍보: 수신거부한 번호에는 보낼 수 없다', async () => {
+  const store = await createStore('manual-optout')
+  await visit(store, { phone: '01021220001', carNumber: '88허8888', daysAgo: 1 })
+  await posOptOut(store, '01021220001')
+  const res = await request(app).post('/api/pos/promo/send').set('X-Store-Token', store.posToken).send({ carNumber: '88허8888' })
+  assert.equal(res.status, 403)
+  assert.equal(res.body.reason, 'opted_out')
+  assert.equal(promoCalls.length, 0)
+})
+
+testSerial('수동 홍보: 확실한 실패면 502(send_failed)이고 다시 보낼 수 있다', async () => {
+  if (!isDaytimeKst()) return
+  const store = await createStore('manual-fail')
+  await visit(store, { phone: '01021230001', carNumber: '77거7777', daysAgo: 1 })
+  failNext = 'error'
+  const res = await request(app).post('/api/pos/promo/send').set('X-Store-Token', store.posToken).send({ carNumber: '77거7777' })
+  assert.equal(res.status, 502)
+  assert.equal(res.body.reason, 'send_failed')
+  const el = await request(app).get('/api/pos/promo/eligibility?carNumber=' + encodeURIComponent('77거7777')).set('X-Store-Token', store.posToken)
+  assert.equal(el.body.canSend, true, JSON.stringify(el.body))
+  const ok = await request(app).post('/api/pos/promo/send').set('X-Store-Token', store.posToken).send({ carNumber: '77거7777' })
+  assert.equal(ok.status, 200, JSON.stringify(ok.body))
+  const statuses = (await prisma.promoSend.findMany({ where: { storeId: store.id }, orderBy: { sentAt: 'asc' } })).map((r) => r.status)
+  assert.deepEqual(statuses, ['failed', 'sent'])
+})
+
+testSerial('미리보기: 보낼 문구와 수신거부 문구 설정 여부를 함께 준다', async () => {
+  const store = await createStore('message')
+  const { token } = await adminToken('hq_admin')
+  const res = await preview(token, { storeId: store.id, from: kstDate(-7), to: kstDate(0) })
+  assert.equal(res.status, 200)
+  assert.ok(res.body.message.startsWith(`(광고) ${store.name}`), res.body.message)
+  assert.equal(res.body.optOutConfigured, Boolean(process.env.PROMO_OPT_OUT_TEXT))
+})
+
+testSerial('발송: confirmCount가 없으면 400', async () => {
+  const store = await createStore('noconfirm')
+  const { token } = await adminToken('hq_admin')
+  const res = await send(token, { storeId: store.id, from: kstDate(-7), to: kstDate(0) })
+  assert.equal(res.status, isDaytimeKst() ? 400 : 403)
+})
+
+// --- POS 탭앱 [홍보 문자] ------------------------------------------------------------
+
+function posPreview(store, query) {
+  return request(app).get('/api/pos/promo-campaign/preview').set('X-Store-Token', store.posToken).query(query)
+}
+function posSend(store, body) {
+  return request(app).post('/api/pos/promo-campaign/send').set('X-Store-Token', store.posToken).send(body)
+}
+
+testSerial('탭앱: 매장 토큰의 매장만 대상이고 storeId를 넣어도 다른 매장으로 바꿀 수 없다', async () => {
+  const store = await createStore('pos')
+  const other = await createStore('pos-other')
+  await visit(store, { phone: '01014140001', daysAgo: 2 })
+  await visit(other, { phone: '01014140002', daysAgo: 2 })
+  const res = await posPreview(store, { storeId: other.id, from: kstDate(-7), to: kstDate(0) })
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal(res.body.storeName, store.name)
+  assert.equal(res.body.eligible, 1)
+  assert.equal(res.body.sample[0].phoneMasked, '010-****-0001')
+})
+
+testSerial('탭앱: 매장 토큰이 없으면 401', async () => {
+  const res = await request(app).get('/api/pos/promo-campaign/preview').query({ from: kstDate(-7), to: kstDate(0) })
+  assert.equal(res.status, 401)
+})
+
+testSerial('탭앱: 기간이 잘못되면 400', async () => {
+  const store = await createStore('pos-dates')
+  const res = await posPreview(store, { from: kstDate(0), to: kstDate(-3) })
+  assert.equal(res.status, 400)
+})
+
+testSerial('탭앱 발송: 그 매장 대상에게 보내고 보낸 사람은 매장 단위(null)로 기록한다', async () => {
+  if (!isDaytimeKst()) return
+  const store = await createStore('pos-send')
+  await visit(store, { phone: '01015150001', daysAgo: 2 })
+  const res = await posSend(store, { from: kstDate(-7), to: kstDate(0), confirmCount: 1 })
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal(res.body.sent, 1)
+  const record = await prisma.promoSend.findFirst({ where: { storeId: store.id } })
+  assert.equal(record.sentBy, null)
+  assert.equal(record.phone, '01015150001')
+})
+
+testSerial('발송: 야간에는 막힌다(야간에 실행될 때만 확인)', async () => {
+  if (isDaytimeKst()) return
+  const store = await createStore('night')
+  const { token } = await adminToken('hq_admin')
+  await visit(store, { phone: '01013130001', daysAgo: 2 })
+  const res = await send(token, { storeId: store.id, from: kstDate(-7), to: kstDate(0), confirmCount: 1 })
+  assert.equal(res.status, 403)
+  assert.equal(res.body.reason, 'night')
+  assert.equal(promoCalls.length, 0)
+})

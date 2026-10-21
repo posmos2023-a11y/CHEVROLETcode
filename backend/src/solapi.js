@@ -24,7 +24,9 @@ const DEFAULT_TIMEOUT_MS = 10000
 function withTimeout(promise, timeoutMs) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
-      reject(new Error(`Solapi 발송 시간 초과 (${timeoutMs / 1000}초)`))
+      const err = new Error(`Solapi 발송 시간 초과 (${timeoutMs / 1000}초)`)
+      err.code = 'SOLAPI_TIMEOUT'
+      reject(err)
     }, timeoutMs)
     promise.then(
       (value) => {
@@ -67,7 +69,10 @@ async function sendAlimtalk({ phone, text, templateId, variables, storeId, recor
     if (failed?.length) {
       const firstErr = failed[0]
       const msg = firstErr?.resultMessage ?? firstErr?.statusMessage ?? firstErr?.reason ?? JSON.stringify(firstErr)
-      throw new Error(msg)
+      const err = new Error(msg)
+      // 문자 회사가 접수를 거부했다고 응답한 것 -- 확실히 안 나갔다.
+      err.definiteFailure = true
+      throw err
     }
     logger.info('[solapi] 알림 발송 성공', {
       channel: useKakao ? 'alimtalk' : 'sms',
@@ -162,15 +167,25 @@ async function sendReceiptAlimtalk({ phone, carNumber, serviceType, amount, stor
 // (법무 검토 전 기본값이라 운영 반영 전 확정 필요 — .env.example 참고).
 const DEFAULT_PROMO_OPT_OUT_TEXT = '무료수신거부: 매장으로 연락 주시면 즉시 처리해 드립니다.'
 
+function promoOptOutText() {
+  return process.env.PROMO_OPT_OUT_TEXT || DEFAULT_PROMO_OPT_OUT_TEXT
+}
+
+// 문자(SMS/LMS)로 나갈 때의 본문. 알림톡으로 나갈 때는 카카오에 승인된 템플릿 문구가 쓰인다.
+// "(광고)" 바로 뒤에 전송자 명칭(매장명)을 둔다(정보통신망법 시행령 제61조 명시사항).
+function buildPromoText(storeName) {
+  const name = storeName || '저희 매장'
+  return `(광고) ${name}\n그동안 ${name}을 이용해주셔서 감사합니다. 지금 다시 방문하시면 혜택을 드립니다.\n\n${promoOptOutText()}`
+}
+
 async function sendPromoAlimtalk({ phone, carNumber, storeName, storeId, paymentId }) {
-  const optOutText = process.env.PROMO_OPT_OUT_TEXT || DEFAULT_PROMO_OPT_OUT_TEXT
-  const body = `그동안 ${storeName || '저희 매장'}을 이용해주셔서 감사합니다. 지금 다시 방문하시면 혜택을 드립니다.`
+  const optOutText = promoOptOutText()
   return sendAlimtalk({
     phone,
     storeId,
     recordId: paymentId,
     recordType: 'payment',
-    text: `(광고)\n${body}\n\n${optOutText}`,
+    text: buildPromoText(storeName),
     templateId: process.env.SOLAPI_KAKAO_TEMPLATE_PROMO,
     variables: {
       '#{매장명}': storeName || '',
@@ -180,9 +195,31 @@ async function sendPromoAlimtalk({ phone, carNumber, storeName, storeId, payment
   })
 }
 
+// 발송 실패가 "확실히 안 나간" 것인지. 광고 발송 기록을 실패로 돌려 다시 보낼 수 있게 할지 정하는 데 쓴다.
+// 확실한 것만 true다: 문자 회사가 접수 거부를 응답했거나(failedMessageList, MessageNotReceivedError),
+// 요청 자체가 잘못돼 접수되지 않은 경우(BadRequestError, 4xx ClientError, ApiKeyError).
+// 시간 초과·네트워크 오류·5xx·응답 해석 실패는 문자 회사가 받아서 보냈을 수 있으므로 false다 --
+// 다시 보내면 같은 광고가 두 번 갈 수 있다.
+const DEFINITE_FAILURE_TAGS = new Set(['MessageNotReceivedError', 'BadRequestError', 'ApiKeyError'])
+
+function isDefiniteSendFailure(error) {
+  if (!error) return false
+  if (error.code === 'SOLAPI_TIMEOUT') return false
+  if (error.definiteFailure === true) return true
+  if (DEFINITE_FAILURE_TAGS.has(error._tag)) return true
+  if (error._tag === 'ClientError') {
+    const status = Number(error.httpStatus)
+    return status >= 400 && status < 500 && status !== 408 && status !== 429
+  }
+  return false
+}
+
 module.exports = {
   sendReservationAlimtalk,
   sendQueueTurnAlimtalk,
   sendReceiptAlimtalk,
   sendPromoAlimtalk,
+  buildPromoText,
+  isDefiniteSendFailure,
+  DEFAULT_PROMO_OPT_OUT_TEXT,
 }

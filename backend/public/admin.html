@@ -363,6 +363,33 @@
     <div id="pw-msg" style="font-size:12px;margin-top:8px;"></div>
   </details>
 
+  <details class="testform" id="promo-campaign-panel">
+    <summary>기간 지정 홍보 문자 보내기</summary>
+    <p style="font-size:12px;color:var(--muted);margin:8px 2px 12px;">
+      지정한 기간에 방문(예약·결제)한 손님 중 <strong>가장 최근 방문에서 광고 수신에 동의한 번호</strong>에게만
+      홍보 문자를 보냅니다. 같은 번호는 한 번만 보내고, 수신거부를 등록한 번호, 동의한 지 2년이 지난 번호,
+      최근 30일 안에 홍보(자동 발송 포함)를 받은 번호는 빠집니다. 야간(21시~8시)에는 보낼 수 없습니다.
+      문구는 등록된 홍보 템플릿("(광고)"·수신거부 안내 포함)을 씁니다. 본사 관리자는 상단에서 매장을 먼저 고르세요.
+    </p>
+    <div class="testform-body">
+      <input type="date" id="promo-from" aria-label="방문 시작일" />
+      <input type="date" id="promo-to" aria-label="방문 종료일" />
+      <button id="promo-preview-btn" type="button">대상 확인</button>
+    </div>
+    <div class="testform-msg" id="promo-msg"></div>
+    <div id="promo-result"></div>
+
+    <p style="font-size:12px;color:var(--muted);margin:16px 2px 8px;">
+      <strong>수신거부 등록</strong> — 손님이 광고를 받지 않겠다고 알려오면 번호를 등록하세요. 등록한 번호에는
+      자동·수동·기간 지정 어떤 홍보도 나가지 않습니다(손님이 나중에 다시 방문해 새로 동의하면 그 동의를 따릅니다).
+    </p>
+    <div class="testform-body">
+      <input type="tel" id="promo-optout-phone" placeholder="01012345678" inputmode="numeric" autocomplete="off" aria-label="수신거부할 전화번호" />
+      <button id="promo-optout-btn" type="button">수신거부 등록</button>
+    </div>
+    <div class="testform-msg" id="promo-optout-msg"></div>
+  </details>
+
   <details class="testform" id="erp-cart-panel">
     <summary>전산 주문 이력</summary>
     <p style="font-size:12px;color:var(--muted);margin:8px 2px 12px;">
@@ -846,6 +873,209 @@ if (erpCartPanel) {
   erpCartPanel.addEventListener('toggle', () => { if (erpCartPanel.open) loadErpCarts() })
   erpCartReload.addEventListener('click', () => loadErpCarts())
   erpCartStatus.addEventListener('change', () => loadErpCarts())
+}
+
+// --- 기간 지정 홍보 문자 ---
+// 순서: [대상 확인]으로 몇 명에게 가는지 보고 → [N명에게 보내기]. 서버는 대상을 다시 계산하고,
+// 화면이 본 수(에서 이미 처리한 수를 뺀 것)보다 늘었으면 보내지 않는다. 한 번 요청에 최대 200건씩
+// 보내고 남으면 이어서 부른다(이미 보낸 번호는 30일 제한으로, 방금 실패한 번호는 잠시 빠진다).
+const promoPanel = document.getElementById('promo-campaign-panel')
+const promoFrom = document.getElementById('promo-from')
+const promoTo = document.getElementById('promo-to')
+const promoPreviewBtn = document.getElementById('promo-preview-btn')
+const promoMsg = document.getElementById('promo-msg')
+const promoResult = document.getElementById('promo-result')
+const promoOptOutPhone = document.getElementById('promo-optout-phone')
+const promoOptOutBtn = document.getElementById('promo-optout-btn')
+const promoOptOutMsg = document.getElementById('promo-optout-msg')
+let promoPreviewState = null // { storeId, from, to, eligible }
+let promoSending = false
+const PROMO_MAX_ROUNDS = 100
+
+function shiftKstDate(days) {
+  return new Date(Date.now() + 9 * 60 * 60 * 1000 + days * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+}
+
+function setPromoMsg(text, kind) {
+  promoMsg.textContent = text || ''
+  promoMsg.className = 'testform-msg' + (kind ? ' ' + kind : '')
+}
+
+async function promoRequest(method, path, body) {
+  const res = await fetch(path, {
+    method,
+    headers: { authorization: 'Bearer ' + token, ...(body ? { 'Content-Type': 'application/json' } : {}) },
+    body: body ? JSON.stringify(body) : undefined,
+  })
+  const json = await res.json().catch(() => ({}))
+  if (res.status === 401) throw new Error('UNAUTHORIZED')
+  return { ok: res.ok, status: res.status, body: json }
+}
+
+function promoTargetStoreId() {
+  return adminRole === 'store_admin' ? adminStoreId : currentStoreId
+}
+
+// 보내는 동안에는 대상 확인·기간·매장을 바꾸지 못하게 잠근다(같은 매장에 발송이 겹치지 않게).
+function lockPromo(locked) {
+  promoSending = locked
+  for (const el of [promoPreviewBtn, promoFrom, promoTo, storeSelect]) {
+    if (el) el.disabled = locked
+  }
+}
+
+function promoExcludedText(ex, days) {
+  const parts = [
+    ex.optedOut ? `수신거부 ${ex.optedOut}` : '',
+    `광고 미동의 ${ex.noConsent}`,
+    ex.consentExpired ? `동의 2년 경과 ${ex.consentExpired}` : '',
+    `최근 ${days}일 내 발송 ${ex.recentlySent}`,
+  ].filter(Boolean)
+  return parts.join(' · ') + ' 제외'
+}
+
+async function previewPromoCampaign() {
+  if (promoSending) return
+  promoPreviewState = null
+  promoResult.innerHTML = ''
+  const storeId = promoTargetStoreId()
+  if (!storeId) {
+    setPromoMsg('상단에서 매장을 먼저 선택하세요. 전 매장에 한꺼번에 보낼 수는 없습니다.', 'err')
+    return
+  }
+  setPromoMsg('대상을 확인하는 중...')
+  const params = new URLSearchParams({ storeId, from: promoFrom.value, to: promoTo.value })
+  const { ok, body } = await promoRequest('GET', '/api/admin/promo-campaign/preview?' + params.toString())
+  if (!ok) {
+    setPromoMsg(body.error || '대상을 확인하지 못했습니다.', 'err')
+    return
+  }
+  promoPreviewState = { storeId, from: body.from, to: body.to, eligible: body.eligible }
+  setPromoMsg('')
+  const blocked = body.night
+    ? '<p class="testform-msg err">지금은 야간이라 보낼 수 없습니다(21시~8시). 낮에 다시 보내주세요.</p>'
+    : ''
+  const optOutWarn = body.optOutConfigured
+    ? ''
+    : '<p class="testform-msg err">수신거부 안내가 기본 문구("매장으로 연락")입니다. 080 무료수신거부 번호처럼 손님에게 비용이 들지 않는 방법을 서버 설정 PROMO_OPT_OUT_TEXT에 넣어 주세요.</p>'
+  promoResult.innerHTML = `
+    <div style="font-size:13px;margin:6px 2px 10px;line-height:1.7;">
+      <strong>${escapeHtml(body.storeName)}</strong> · ${escapeHtml(body.from)} ~ ${escapeHtml(body.to)} 방문 손님<br>
+      방문한 번호 <strong>${body.visitors}</strong>개 중 보낼 수 있는 번호 <strong style="color:var(--blue)">${body.eligible}</strong>개
+      <span class="muted">(${escapeHtml(promoExcludedText(body.excluded, body.minIntervalDays))})</span>
+      ${body.truncated ? '<br><span class="testform-msg err">방문 번호가 너무 많아 일부만 계산했습니다. 기간을 줄여주세요.</span>' : ''}
+    </div>
+    ${body.message ? `<pre style="white-space:pre-wrap;font:inherit;font-size:12px;background:var(--surface);border-radius:8px;padding:10px 12px;margin:0 2px 10px;">${escapeHtml(body.message)}</pre>` : ''}
+    ${optOutWarn}
+    ${body.sample.length ? `<table>
+      <thead><tr><th>전화번호</th><th>차량</th><th>최근 방문</th></tr></thead>
+      <tbody>${body.sample.map((r) => `<tr>
+        <td>${escapeHtml(r.phoneMasked)}</td><td>${escapeHtml(r.carNumber || '-')}</td><td>${escapeHtml(fmtDate(r.lastVisitAt))}</td>
+      </tr>`).join('')}</tbody>
+    </table>${body.eligible > body.sample.length ? `<p class="muted" style="font-size:12px;">외 ${body.eligible - body.sample.length}명</p>` : ''}` : ''}
+    ${blocked}
+    ${body.eligible > 0 && !body.night ? `<div class="testform-body"><button id="promo-send-btn" type="button">${body.eligible}명에게 보내기</button></div>` : ''}
+  `
+}
+
+// 결과 문구. failed는 확실히 안 나간 것(나중에 다시 보낼 수 있다), uncertain은 결과를 모르는 것
+// (나갔을 수 있어 30일 동안 다시 보내지 않는다).
+function promoSummary(t, remaining, reason) {
+  const lines = [`보냄 ${t.sent}건`]
+  if (t.failed) lines.push(`실패 ${t.failed}건(30분 뒤 [대상 확인]으로 다시 보낼 수 있습니다)`)
+  if (t.uncertain) lines.push(`결과 확인 안 됨 ${t.uncertain}건(이미 나갔을 수 있어 30일 동안 다시 보내지 않습니다)`)
+  if (t.skipped) lines.push(`보내기 직전 제외 ${t.skipped}건(다른 발송이 먼저 보냈거나 수신거부 등)`)
+  if (remaining) lines.push(`아직 ${remaining}명 남음 — ${reason || '[대상 확인]을 다시 눌러 이어서 보내세요.'}`)
+  return lines.join(' · ')
+}
+
+async function sendPromoCampaign() {
+  const state = promoPreviewState
+  if (!state || !state.eligible || promoSending) return
+  const ok = window.confirm(`${state.from} ~ ${state.to} 방문 손님 ${state.eligible}명에게 홍보 문자를 보냅니다.\n보낸 뒤에는 취소할 수 없습니다. 보낼까요?`)
+  if (!ok) return
+  const btn = document.getElementById('promo-send-btn')
+  if (btn) btn.disabled = true
+  lockPromo(true)
+  const t = { sent: 0, failed: 0, uncertain: 0, skipped: 0 }
+  let remaining = state.eligible
+  let stopReason = ''
+  let errorText = ''
+  try {
+    for (let round = 0; round < PROMO_MAX_ROUNDS; round += 1) {
+      setPromoMsg(`보내는 중... (${promoSummary(t, 0)})`)
+      const processed = t.sent + t.failed + t.uncertain + t.skipped
+      const { ok: sentOk, body } = await promoRequest('POST', '/api/admin/promo-campaign/send', {
+        storeId: state.storeId, from: state.from, to: state.to, confirmCount: Math.max(0, state.eligible - processed),
+      })
+      if (!sentOk) {
+        errorText = body.error || '발송하지 못했습니다.'
+        break
+      }
+      for (const k of Object.keys(t)) t[k] += body[k] || 0
+      remaining = body.remaining
+      const progressed = (body.sent || 0) + (body.failed || 0) + (body.uncertain || 0) + (body.skipped || 0)
+      if (body.stopped === 'night') { stopReason = '21시가 가까워 멈췄습니다. 내일 8시 이후 [대상 확인]으로 이어서 보내세요.'; break }
+      if (!remaining || !progressed) break
+    }
+  } catch (e) {
+    errorText = e.message === 'UNAUTHORIZED' ? '로그인이 만료됐습니다.' : '연결이 끊겼습니다.'
+  } finally {
+    lockPromo(false)
+  }
+  // 끝나면(중간에 멈췄어도) 미리보기를 지운다 -- 남은 건은 [대상 확인]으로 지금 기준을 다시 보고 보낸다.
+  promoResult.innerHTML = ''
+  promoPreviewState = null
+  if (errorText) {
+    setPromoMsg(`${errorText} (${promoSummary(t, 0)}) [대상 확인]으로 남은 대상을 다시 확인하세요.`, 'err')
+    return
+  }
+  const clean = !t.failed && !t.uncertain && !remaining
+  setPromoMsg(promoSummary(t, remaining, stopReason), clean ? 'ok' : 'err')
+}
+
+async function registerPromoOptOut() {
+  const storeId = promoTargetStoreId()
+  const phone = (promoOptOutPhone.value || '').replace(/\D/g, '')
+  const show = (text, kind) => {
+    promoOptOutMsg.textContent = text
+    promoOptOutMsg.className = 'testform-msg' + (kind ? ' ' + kind : '')
+  }
+  if (!storeId) return show('상단에서 매장을 먼저 선택하세요.', 'err')
+  if (!/^01[0-9]{8,9}$/.test(phone)) return show('전화번호를 01012345678 형식으로 입력하세요.', 'err')
+  if (!window.confirm(`${phone} 번호를 수신거부로 등록합니다. 이 번호에는 홍보 문자가 나가지 않습니다. 등록할까요?`)) return
+  promoOptOutBtn.disabled = true
+  try {
+    const { ok, body } = await promoRequest('POST', '/api/admin/promo-opt-out', { storeId, phone })
+    if (!ok) return show(body.error || '등록하지 못했습니다.', 'err')
+    promoOptOutPhone.value = ''
+    show(`${body.phoneMasked} 수신거부를 등록했습니다(${body.storeName}).`, 'ok')
+  } finally {
+    promoOptOutBtn.disabled = false
+  }
+}
+
+if (promoPanel) {
+  promoFrom.value = shiftKstDate(-30)
+  promoTo.value = shiftKstDate(0)
+  promoFrom.max = promoTo.max = shiftKstDate(0)
+  promoPreviewBtn.addEventListener('click', () => previewPromoCampaign().catch((e) => setPromoMsg(e.message, 'err')))
+  promoResult.addEventListener('click', (e) => {
+    if (e.target.id === 'promo-send-btn') sendPromoCampaign().catch((err) => setPromoMsg(err.message, 'err'))
+  })
+  promoOptOutBtn.addEventListener('click', () => registerPromoOptOut().catch((e) => {
+    promoOptOutMsg.textContent = e.message
+    promoOptOutMsg.className = 'testform-msg err'
+  }))
+  // 기간이나 매장을 바꾸면 이전 미리보기로 보내지 않게 지운다(보내는 중에는 잠겨 있어 바뀌지 않는다).
+  for (const el of [promoFrom, promoTo, storeSelect]) {
+    el.addEventListener('change', () => {
+      if (promoSending) return
+      promoPreviewState = null
+      promoResult.innerHTML = ''
+      setPromoMsg('')
+    })
+  }
 }
 
 // --- POS 토큰 관리 (본사는 전체 매장, 매장관리자는 자기 매장만) ---
@@ -1558,7 +1788,7 @@ function renderPayments(list, total, hasMore) {
       <td>${escapeHtml(p.phone)}</td>
       <td>${fmtAmount(p.amount)}</td>
       <td><span class="badge ${escapeHtml(p.status)}">${escapeHtml(STATUS_LABEL[p.status] || p.status)}</span></td>
-      <td>${p.promoSent ? '발송완료' : fmtDate(p.promoAt)}</td>
+      <td>${p.promoSent ? (p.promoSentAt ? '발송완료' : '보내지 않음') : fmtDate(p.promoAt)}</td>
       <td>${fmtDate(p.createdAt)}</td>
       <td class="row-actions">${canRetry ? `<button class="row-btn retry" data-id="${p.id}">재발송</button>` : ''}</td>
     </tr>

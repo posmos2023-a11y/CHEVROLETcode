@@ -8,6 +8,8 @@ import { posPluginSdk } from '@tossplace/pos-plugin-sdk'
 import { initErpCarts, refreshErpCarts, applyErpCarts, applyFrontCarts } from './erpCarts.js'
 // 오늘 결제된 전산 주문과 결제 취소. 같은 대기열 폴링 응답(settledCarts)으로 갱신한다.
 import { initSettledCarts, applySettledCarts } from './settledCarts.js'
+// [홍보 문자] 화면: 기간을 정해 방문 손님에게 홍보 문자를 한 번에 보낸다.
+import { initPromoCampaign } from './promoCampaign.js'
 // 차량번호로 지난 정비 내역을 보는 화면. 정비소에서 가장 자주 나오는 질문이라 대기 카드에서
 // 바로 열 수 있게 해뒀다.
 import { initHistory, openHistoryFor, loadRecentHistory } from './history.js'
@@ -640,6 +642,7 @@ async function main() {
 // 막기 위해서다.
 initErpCarts({ apiGet, apiPost, notify, escapeHtml, onUnauthorized: handleUnauthorized })
 initSettledCarts({ apiPost, notify, escapeHtml, onUnauthorized: handleUnauthorized })
+initPromoCampaign({ apiGet, apiPost, notify, escapeHtml, onUnauthorized: handleUnauthorized })
 initHistory({ apiGet, apiPost, notify, escapeHtml, onUnauthorized: handleUnauthorized })
 initNav({ notify })
 

@@ -90,7 +90,15 @@ const {
   listRecentRepairHistory,
   findMarketingContactByCarNumber,
   findLastPromoSend,
-  recordPromoSend,
+  PROMO_MIN_INTERVAL_DAYS,
+  PROMO_CONSENT_MAX_AGE_DAYS,
+  assessPromoPhones,
+  claimPromoSend,
+  finishPromoSend,
+  registerMarketingOptOut,
+  skipDuePromotion,
+  postponeDuePromotion,
+  listPromoCampaignCandidates,
   completeReservationAfterPayment,
   findOpenReservationByCarNumber,
   cancelErpCart,
@@ -100,7 +108,6 @@ const { PostgresRateLimitStore } = require('./src/rateLimitStore')
 const logger = require('./src/logger')
 const solapi = require('./src/solapi')
 const { hashPassword, verifyPassword, signAdminToken, verifyAdminToken } = require('./src/auth')
-const { sendPromoAlimtalk } = require('./src/solapi')
 const { securityHeaders } = require('./src/securityHeaders')
 
 // --- 부팅 가드 (계약 §10) ---
@@ -2071,14 +2078,27 @@ app.get('/api/pos/summary', posIpFloodLimiter, posQueueReadLimiter, requireStore
 //
 // 1) 수신 동의 없으면 발송 불가. 가장 최근 방문에서 동의하지 않았다면 그게 지금의 의사다.
 // 2) 야간(21시~08시) 발송 금지. 야간 광고는 별도의 동의가 필요한데 우리는 그 동의를 받지 않는다.
-// 3) 같은 차에 30일 안에 다시 보낼 수 없다. 스팸이 되면 수신거부와 과태료로 돌아온다.
-const PROMO_MIN_INTERVAL_DAYS = 30
+// 3) 같은 번호·같은 차에 30일 안에 다시 보낼 수 없다. 스팸이 되면 수신거부와 과태료로 돌아온다.
+//    번호 기준은 자동 발송·기간 지정 발송과 공유한다(store.assessPromoPhones).
+// 4) 수신거부를 등록한 번호, 동의한 지 2년이 지난 번호에는 보내지 않는다.
 const PROMO_NIGHT_START_HOUR = 21 // 이 시각부터
 const PROMO_NIGHT_END_HOUR = 8 //   이 시각 전까지 금지
 
 function kstHour(now) {
   // 서버는 UTC로 돌지만 야간 규제는 한국 시각 기준이다.
   return new Date((now || Date.now()) + 9 * 60 * 60 * 1000).getUTCHours()
+}
+
+// 판단 결과(store.assessPromoPhones의 status)를 직원에게 보여줄 문구로.
+const PROMO_BLOCK_MESSAGES = {
+  opted_out: '광고 수신을 거부한 손님입니다. 보낼 수 없습니다.',
+  no_consent: '광고 수신에 동의하지 않은 손님입니다. 보낼 수 없습니다.',
+  consent_expired: `광고 수신 동의를 받은 지 ${Math.round(PROMO_CONSENT_MAX_AGE_DAYS / 365)}년이 지났습니다. 다시 동의를 받아야 보낼 수 있습니다.`,
+}
+
+function recentlySentMessage(lastSentAt) {
+  const days = (Date.now() - new Date(lastSentAt).getTime()) / (24 * 60 * 60 * 1000)
+  return `${Math.max(1, Math.ceil(PROMO_MIN_INTERVAL_DAYS - days))}일 뒤에 다시 보낼 수 있습니다.`
 }
 
 // 보낼 수 있으면 { ok: true, phone }, 아니면 { ok: false, reason, message }.
@@ -2091,11 +2111,13 @@ async function evaluatePromoEligibility(storeId, carNumber) {
     return { ok: false, reason: 'no_phone', message: '연락처가 없어 보낼 수 없습니다.' }
   }
   if (!contact.marketingConsentAt) {
-    return {
-      ok: false,
-      reason: 'no_consent',
-      message: '광고 수신에 동의하지 않은 손님입니다. 보낼 수 없습니다.',
-    }
+    return { ok: false, reason: 'no_consent', message: PROMO_BLOCK_MESSAGES.no_consent }
+  }
+
+  // 차의 최근 연락처로 찾은 번호를 번호 기준으로 다시 본다(수신거부·그 번호의 최근 의사·2년·30일).
+  const assessed = (await assessPromoPhones(storeId, [contact.phone])).get(contact.phone)
+  if (PROMO_BLOCK_MESSAGES[assessed.status]) {
+    return { ok: false, reason: assessed.status, message: PROMO_BLOCK_MESSAGES[assessed.status] }
   }
 
   const hour = kstHour()
@@ -2107,19 +2129,14 @@ async function evaluatePromoEligibility(storeId, carNumber) {
     }
   }
 
-  const last = await findLastPromoSend(storeId, carNumber)
-  if (last) {
-    const days = (Date.now() - new Date(last.sentAt).getTime()) / (24 * 60 * 60 * 1000)
-    if (days < PROMO_MIN_INTERVAL_DAYS) {
-      return {
-        ok: false,
-        reason: 'recently_sent',
-        message: `${Math.ceil(PROMO_MIN_INTERVAL_DAYS - days)}일 뒤에 다시 보낼 수 있습니다.`,
-        lastSentAt: last.sentAt,
-      }
-    }
+  // 30일: 번호 기준(다른 경로 발송 포함)과 차량 기준(번호가 바뀐 같은 차) 중 더 최근 것.
+  const lastCar = await findLastPromoSend(storeId, carNumber)
+  const candidates = [assessed.lastSentAt, lastCar?.sentAt].filter(Boolean).map((d) => new Date(d))
+  const lastSentAt = candidates.length ? new Date(Math.max(...candidates)) : null
+  if (lastSentAt && Date.now() - lastSentAt.getTime() < PROMO_MIN_INTERVAL_DAYS * 24 * 60 * 60 * 1000) {
+    return { ok: false, reason: 'recently_sent', message: recentlySentMessage(lastSentAt), lastSentAt }
   }
-  return { ok: true, phone: contact.phone, lastSentAt: last ? last.sentAt : null }
+  return { ok: true, phone: contact.phone, lastSentAt }
 }
 
 // 이 차에 지금 홍보를 보낼 수 있는지 알려준다. 화면에서 버튼을 켤지 끌지 판단하는 데 쓴다
@@ -2152,31 +2169,278 @@ app.post('/api/pos/promo/send', posIpFloodLimiter, posLimiter, requireStoreToken
     return res.status(403).json({ ok: false, error: eligible.message, reason: eligible.reason })
   }
 
-  // 발송 기록을 **먼저** 남긴다. 발송이 성공했는데 기록이 실패하면 30일 제한이 풀려서
-  // 같은 손님에게 계속 보낼 수 있게 된다 — 그쪽이 더 위험하다.
-  await recordPromoSend({
+  // 발송 기록을 **먼저** 남긴다(store.claimPromoSend -- 번호 단위 잠금 안에서 다시 확인하고 기록).
+  // 발송이 성공했는데 기록이 실패하면 30일 제한이 풀려서 같은 손님에게 계속 보낼 수 있게 된다.
+  const claim = await claimPromoSend({
     storeId: req.store.id,
     carNumber,
     phone: eligible.phone,
     sentBy: null, // POS 탭앱은 매장 단위 인증이라 개인을 특정할 수 없다
+    via: 'manual',
   })
+  if (!claim.ok) {
+    const message = PROMO_BLOCK_MESSAGES[claim.status] || recentlySentMessage(claim.lastSentAt || new Date())
+    return res.status(403).json({ ok: false, error: message, reason: claim.status })
+  }
 
-  const sent = await sendPromoAlimtalk({
-    phone: eligible.phone,
-    carNumber,
-    storeName: req.store.name,
-    storeId: req.store.id,
-    paymentId: null,
-  })
-  if (!sent) {
-    logger.error('[promo] 수동 발송 실패', { storeId: req.store.id })
+  try {
+    await solapi.sendPromoAlimtalk({
+      phone: eligible.phone,
+      carNumber,
+      storeName: req.store.name,
+      storeId: req.store.id,
+      paymentId: null,
+    })
+  } catch (e) {
+    const definite = solapi.isDefiniteSendFailure(e)
+    await finishPromoSend(claim.record.id, definite ? 'failed' : 'unknown')
+    logger.error('[promo] 수동 발송 실패', { storeId: req.store.id, definite, error: e.message })
     return res.status(502).json({
       ok: false,
-      error: '발송에 실패했습니다. 잠시 후 다시 시도해주세요.',
-      reason: 'send_failed',
+      error: definite
+        ? '발송에 실패했습니다. 잠시 후 다시 시도해주세요.'
+        : `발송 결과를 확인하지 못했습니다. 이미 나갔을 수 있어 ${PROMO_MIN_INTERVAL_DAYS}일 동안 다시 보내지 않습니다.`,
+      reason: definite ? 'send_failed' : 'send_unknown',
     })
   }
+  await finishPromoSend(claim.record.id, 'sent')
   return res.json({ ok: true })
+}))
+
+// ── 광고 수신거부 등록 ──────────────────────────────────────────────────────────
+//
+// 홍보 문자 끝의 수신거부 안내를 보고 손님이 매장에 거부를 알려오면 직원이 여기서 등록한다. 등록된
+// 번호에는 자동·수동·기간 지정 어떤 광고도 나가지 않는다(store.assessPromoPhones). 거부는 직원이 풀 수
+// 없다 -- 손님이 다시 방문해 광고 수신에 새로 동의하면 그 동의가 거부보다 나중이라 다시 받게 된다.
+function parseOptOutPhone(raw) {
+  const phone = String(raw ?? '').replace(/\D/g, '')
+  return PHONE_RE.test(phone) ? phone : null
+}
+
+app.post('/api/pos/promo/opt-out', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  const phone = parseOptOutPhone(req.body?.phone)
+  if (!phone) return res.status(400).json({ ok: false, error: '전화번호를 01012345678 형식으로 입력해주세요.' })
+  const row = await registerMarketingOptOut({ storeId: req.store.id, phone, recordedBy: null, via: 'pos' })
+  logger.info('[promo] 수신거부 등록', { storeId: req.store.id, via: 'pos' })
+  return res.json({ ok: true, phoneMasked: maskPhone(phone), optedOutAt: row.optedOutAt })
+}))
+
+app.post('/api/admin/promo-opt-out', requireAuth, asyncHandler(async (req, res) => {
+  const storeId = req.admin.role === 'store_admin' ? req.admin.storeId : String(req.body?.storeId || '').trim()
+  if (!storeId) return res.status(400).json({ ok: false, error: '매장을 선택해주세요.' })
+  const store = await prisma.store.findUnique({ where: { id: storeId } })
+  if (!store) return res.status(404).json({ ok: false, error: '매장을 찾을 수 없습니다.' })
+  const phone = parseOptOutPhone(req.body?.phone)
+  if (!phone) return res.status(400).json({ ok: false, error: '전화번호를 01012345678 형식으로 입력해주세요.' })
+  const row = await registerMarketingOptOut({ storeId, phone, recordedBy: req.admin.id, via: 'admin' })
+  logger.info('[promo] 수신거부 등록', { storeId, via: 'admin', adminId: req.admin.id })
+  return res.json({ ok: true, storeName: store.name, phoneMasked: maskPhone(phone), optedOutAt: row.optedOutAt })
+}))
+
+// ── 기간 지정 홍보 문자 (관리자 웹) ──────────────────────────────────────────────
+//
+// "○월 ○일 ~ ○월 ○일에 방문한 손님"에게 홍보 문자를 한 번에 보낸다. 광고라서 수동 발송(위)과
+// 같은 차단 조건을 그대로 서버에서 건다: 수신 동의자만, 야간 금지, 같은 번호 30일 내 재발송 금지.
+// 문구는 기존 홍보 템플릿(solapi.sendPromoAlimtalk -- "(광고)" + 수신거부 문구 포함)을 쓴다.
+// 알림톡은 사전 승인된 템플릿만 보낼 수 있어 자유 문구는 받지 않는다.
+//
+// 누가 보냈는지 남아야 하는 대량 광고라 로그인한 관리자만 쓴다(PromoSend.sentBy = 관리자 id).
+// store_admin은 자기 매장으로 고정되고, hq_admin은 매장을 반드시 지정해야 한다(전 매장 일괄 발송 없음).
+const PROMO_CAMPAIGN_MAX_DAYS = 366
+const PROMO_CAMPAIGN_BATCH_MAX = 200 // 요청 한 번에 보내는 최대 건수(남으면 화면이 이어서 다시 부른다)
+const PROMO_CAMPAIGN_TIME_BUDGET_MS = 40 * 1000
+const PROMO_CAMPAIGN_CONCURRENCY = 5
+const POS_PROMO_CAMPAIGN_LIMITS = { batchMax: 60, timeBudgetMs: 8 * 1000 }
+// 묶음 하나는 문자 회사 응답을 기다리느라 최대 SOLAPI_TIMEOUT_MS(기본 10초)쯤 걸린다. 21시 직전에 시작한
+// 묶음이 21시를 넘겨 나가지 않도록, 이만큼 여유를 두고 새 묶음을 시작하지 않는다.
+const PROMO_NIGHT_MARGIN_MS = 60 * 1000
+const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/
+// 같은 매장에 같은 인스턴스에서 발송 요청이 겹치면 바로 돌려보낸다(화면을 두 번 누른 경우 등).
+// 여러 인스턴스 사이의 중복 발송은 이걸로 막지 못한다 -- 그건 번호 단위 잠금(store.claimPromoSend)이 막는다.
+const promoCampaignBusy = new Set()
+
+// 관리자 웹: store_admin은 자기 매장으로 고정, hq_admin은 매장 필수.
+async function resolvePromoCampaignTarget(req, source) {
+  const storeId = req.admin.role === 'store_admin'
+    ? req.admin.storeId
+    : String(source?.storeId || '').trim()
+  if (!storeId) return { error: { status: 400, body: { ok: false, error: '매장을 선택해주세요.' } } }
+  const store = await prisma.store.findUnique({ where: { id: storeId } })
+  if (!store) return { error: { status: 404, body: { ok: false, error: '매장을 찾을 수 없습니다.' } } }
+  const period = resolvePromoCampaignPeriod(source)
+  if (period.error) return period
+  return { store, ...period }
+}
+
+// 기간 검증(관리자 웹·POS 탭앱 공통). 반환: { from, to, start, end } | { error }
+function resolvePromoCampaignPeriod(source) {
+  const from = String(source?.from || '').trim()
+  const to = String(source?.to || '').trim()
+  if (!DATE_ONLY_RE.test(from) || !DATE_ONLY_RE.test(to)) {
+    return { error: { status: 400, body: { ok: false, error: '기간을 YYYY-MM-DD 형식으로 입력해주세요.' } } }
+  }
+  if (from > to) return { error: { status: 400, body: { ok: false, error: '시작일이 종료일보다 늦습니다.' } } }
+  if (to > kstDateString()) return { error: { status: 400, body: { ok: false, error: '종료일은 오늘 이전이어야 합니다.' } } }
+  const start = kstDateRangeUtc(from).start
+  const end = kstDateRangeUtc(to).end
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+    return { error: { status: 400, body: { ok: false, error: '날짜가 올바르지 않습니다.' } } }
+  }
+  if ((end - start) / (24 * 60 * 60 * 1000) > PROMO_CAMPAIGN_MAX_DAYS) {
+    return { error: { status: 400, body: { ok: false, error: `기간은 최대 ${PROMO_CAMPAIGN_MAX_DAYS}일까지 지정할 수 있습니다.` } } }
+  }
+  return { from, to, start, end }
+}
+
+// 지금 야간이거나, 여유(PROMO_NIGHT_MARGIN_MS) 안에 야간이 시작되면 true. 아침 8시 경계는 지금 시각만 본다.
+function isPromoNightNow() {
+  const now = Date.now()
+  const night = (at) => {
+    const hour = kstHour(at)
+    return hour >= PROMO_NIGHT_START_HOUR || hour < PROMO_NIGHT_END_HOUR
+  }
+  return night(now) || night(now + PROMO_NIGHT_MARGIN_MS)
+}
+
+// 대상 미리보기 응답(관리자 웹·POS 탭앱 공통). 전화번호는 가린다.
+// message: 문자로 나갈 때의 본문(알림톡으로 나가면 카카오에 승인된 템플릿 문구가 쓰인다).
+// optOutConfigured: 수신거부 안내 문구(PROMO_OPT_OUT_TEXT)를 운영에서 정했는지. 기본 문구("매장으로 연락")는
+// 손님에게 비용이 드는 방법이라, 080 무료수신거부처럼 무료 수단으로 바꾸라고 화면에서 알린다.
+async function buildPromoCampaignPreview(target) {
+  const result = await listPromoCampaignCandidates(target.store.id, target.start, target.end)
+  return {
+    ok: true,
+    storeName: target.store.name,
+    from: target.from,
+    to: target.to,
+    visitors: result.visitors,
+    eligible: result.recipients.length,
+    excluded: result.excluded,
+    truncated: result.truncated,
+    night: isPromoNightNow(),
+    minIntervalDays: PROMO_MIN_INTERVAL_DAYS,
+    message: solapi.buildPromoText(target.store.name),
+    optOutConfigured: Boolean(process.env.PROMO_OPT_OUT_TEXT),
+    sample: result.recipients.slice(0, 50).map((r) => ({
+      phoneMasked: maskPhone(r.phone),
+      carNumber: r.carNumber,
+      lastVisitAt: r.lastVisitAt,
+    })),
+  }
+}
+
+// 발송(관리자 웹·POS 탭앱 공통). 반환: { status, body }.
+// 대상은 **여기서 다시** 계산한다(미리보기를 믿지 않는다). 한 번에 최대 PROMO_CAMPAIGN_BATCH_MAX건,
+// 남은 건은 remaining으로 알려주고 화면이 다시 부른다 -- 이미 보낸 번호는 30일 제한에 걸려 자연히
+// 빠지고, 방금 확실히 실패한 번호도 잠시 빠지므로 다시 불러도 같은 번호를 두 번 시도하지 않는다.
+// confirmCount: 화면이 본 대상 수에서 이미 처리한 수를 뺀 값. 지금 대상이 그보다 많으면(새 방문 등)
+// 보내지 않고 다시 확인하게 한다 -- 화면에서 본 것보다 많이 보내지 않기 위해서다.
+// sentBy: 관리자 웹은 관리자 id, POS 탭앱은 매장 단위 인증이라 null(기존 차량별 홍보 발송과 같다).
+// limits: 한 요청의 발송 상한. POS 탭앱은 POST를 20초에 포기하므로(pos-plugin/src/app.js POST_TIMEOUT_MS)
+// 시간 예산을 짧게 준다 -- 마지막 묶음이 솔라피 타임아웃(기본 10초)만큼 걸려도 20초 안에 응답한다.
+//
+// 응답: sent(나감) · failed(확실히 안 나감 -- 나중에 다시 보낼 수 있다) · uncertain(결과 모름 -- 나갔을 수
+// 있어 30일 동안 다시 보내지 않는다) · skipped(보내기 직전 확인에서 빠짐 -- 다른 발송이 먼저 보냈거나
+// 그 사이 수신거부 등) · remaining(아직 안 보낸 대상) · stopped(night | time | null)
+async function runPromoCampaignSend(target, confirmCountRaw, sentBy, via, limits = {}) {
+  const batchMax = limits.batchMax || PROMO_CAMPAIGN_BATCH_MAX
+  const timeBudgetMs = limits.timeBudgetMs || PROMO_CAMPAIGN_TIME_BUDGET_MS
+  if (isPromoNightNow()) {
+    return {
+      status: 403,
+      body: { ok: false, reason: 'night', error: `야간(${PROMO_NIGHT_START_HOUR}시~${PROMO_NIGHT_END_HOUR}시)에는 광고를 보낼 수 없습니다.` },
+    }
+  }
+  const confirmCount = Number(confirmCountRaw)
+  if (!Number.isSafeInteger(confirmCount) || confirmCount < 0) {
+    return { status: 400, body: { ok: false, error: '발송 대상 수(confirmCount)가 필요합니다. 미리보기를 먼저 해주세요.' } }
+  }
+  if (promoCampaignBusy.has(target.store.id)) {
+    return { status: 409, body: { ok: false, reason: 'busy', error: '이 매장에 다른 발송이 진행 중입니다. 잠시 후 다시 시도해주세요.' } }
+  }
+
+  promoCampaignBusy.add(target.store.id)
+  try {
+    const { recipients } = await listPromoCampaignCandidates(target.store.id, target.start, target.end, { skipRecentFailures: true })
+    if (recipients.length > confirmCount) {
+      return {
+        status: 409,
+        body: {
+          ok: false,
+          reason: 'count_changed',
+          eligible: recipients.length,
+          error: `미리보기 이후 대상이 ${recipients.length}명으로 늘었습니다. 다시 확인한 뒤 보내주세요.`,
+        },
+      }
+    }
+
+    const batch = recipients.slice(0, batchMax)
+    const startedAt = Date.now()
+    const counts = { sent: 0, failed: 0, uncertain: 0, skipped: 0 }
+    let processed = 0
+    let stopped = null
+    for (let i = 0; i < batch.length; i += PROMO_CAMPAIGN_CONCURRENCY) {
+      if (isPromoNightNow()) { stopped = 'night'; break }
+      if (Date.now() - startedAt >= timeBudgetMs) { stopped = 'time'; break }
+      const chunk = batch.slice(i, i + PROMO_CAMPAIGN_CONCURRENCY)
+      await Promise.all(chunk.map(async (r) => {
+        const claim = await claimPromoSend({ storeId: target.store.id, carNumber: r.carNumber, phone: r.phone, sentBy, via: `campaign-${via}` })
+        if (!claim.ok) { counts.skipped += 1; return }
+        try {
+          await solapi.sendPromoAlimtalk({
+            phone: r.phone,
+            carNumber: r.carNumber,
+            storeName: target.store.name,
+            storeId: target.store.id,
+            paymentId: null,
+          })
+          counts.sent += 1
+          await finishPromoSend(claim.record.id, 'sent')
+        } catch (e) {
+          const definite = solapi.isDefiniteSendFailure(e)
+          counts[definite ? 'failed' : 'uncertain'] += 1
+          await finishPromoSend(claim.record.id, definite ? 'failed' : 'unknown')
+          logger.error('[promo-campaign] 발송 실패', { storeId: target.store.id, definite, error: e.message })
+        }
+      }))
+      processed += chunk.length
+    }
+    const remaining = Math.max(0, recipients.length - processed)
+    logger.info('[promo-campaign] 발송', {
+      storeId: target.store.id, via, adminId: sentBy, from: target.from, to: target.to, ...counts, remaining, stopped,
+    })
+    return { status: 200, body: { ok: true, ...counts, remaining, stopped } }
+  } finally {
+    promoCampaignBusy.delete(target.store.id)
+  }
+}
+
+// 관리자 웹
+app.get('/api/admin/promo-campaign/preview', requireAuth, asyncHandler(async (req, res) => {
+  const target = await resolvePromoCampaignTarget(req, req.query)
+  if (target.error) return res.status(target.error.status).json(target.error.body)
+  return res.json(await buildPromoCampaignPreview(target))
+}))
+
+app.post('/api/admin/promo-campaign/send', requireAuth, asyncHandler(async (req, res) => {
+  const target = await resolvePromoCampaignTarget(req, req.body)
+  if (target.error) return res.status(target.error.status).json(target.error.body)
+  const { status, body } = await runPromoCampaignSend(target, req.body?.confirmCount, req.admin.id, 'admin')
+  return res.status(status).json(body)
+}))
+
+// POS 탭앱 [홍보 문자] 화면. 매장 토큰으로 인증하고 그 매장에만 보낸다(다른 매장 지정 불가).
+app.get('/api/pos/promo-campaign/preview', posIpFloodLimiter, posQueueReadLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  const period = resolvePromoCampaignPeriod(req.query)
+  if (period.error) return res.status(period.error.status).json(period.error.body)
+  return res.json(await buildPromoCampaignPreview({ store: req.store, ...period }))
+}))
+
+app.post('/api/pos/promo-campaign/send', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  const period = resolvePromoCampaignPeriod(req.body)
+  if (period.error) return res.status(period.error.status).json(period.error.body)
+  const { status, body } = await runPromoCampaignSend({ store: req.store, ...period }, req.body?.confirmCount, null, 'pos', POS_PROMO_CAMPAIGN_LIMITS)
+  return res.status(status).json(body)
 }))
 
 // 매장의 최근 정비 이력. 이력 화면을 열자마자 보여줄 목록이다.
@@ -2983,6 +3247,7 @@ async function sendDuePromotions() {
   let claimed = 0
   let sent = 0
   let failed = 0
+  let skipped = 0
   let batches = 0
   let exhausted = false
 
@@ -2998,6 +3263,26 @@ async function sendDuePromotions() {
     if (!due.length) break // 더 이상 대상이 없다 = 자연 종료(exhausted=false)
 
     for (const payment of due) {
+      // 수동·기간 지정 발송과 같은 기준으로 다시 본다(store.assessPromoPhones): 수신거부, 그 번호의 최근
+      // 의사, 동의 2년, 30일 안의 다른 광고. 발송 기록(PromoSend)도 같이 남겨 다른 경로가 이 발송을 본다.
+      const claim = await claimPromoSend({
+        storeId: payment.storeId,
+        phone: payment.phone,
+        carNumber: payment.carNumber,
+        sentBy: null,
+        via: 'auto',
+      })
+      if (!claim.ok) {
+        skipped += 1
+        if (claim.status === 'recently_sent' && claim.lastSentAt) {
+          // 다른 경로로 최근에 받았다 -- 30일이 끝날 때까지 미룬다.
+          const until = new Date(new Date(claim.lastSentAt).getTime() + PROMO_MIN_INTERVAL_DAYS * 24 * 60 * 60 * 1000)
+          await postponeDuePromotion(payment.id, until)
+        } else {
+          await skipDuePromotion(payment.id)
+        }
+        continue
+      }
       try {
         await solapi.sendPromoAlimtalk({
           phone: payment.phone,
@@ -3006,15 +3291,22 @@ async function sendDuePromotions() {
           storeId: payment.storeId,
           paymentId: payment.id,
         })
+        await finishPromoSend(claim.record.id, 'sent')
         if (await markPromoSent(payment.id)) sent += 1
       } catch (notifyError) {
         failed += 1
+        const definite = solapi.isDefiniteSendFailure(notifyError)
         logger.error('프로모션 알림톡 발송 실패', {
           paymentId: payment.id,
           storeId: payment.storeId,
+          definite,
           error: notifyError.message,
         })
-        await releasePromoClaim(payment.id)
+        await finishPromoSend(claim.record.id, definite ? 'failed' : 'unknown')
+        // 확실히 안 나갔으면 다음 실행에서 다시 보낸다. 결과를 모르면(시간 초과 등) 나갔을 수 있으므로
+        // 보낸 것으로 닫는다 -- 같은 광고가 두 번 가는 쪽이 더 나쁘다.
+        if (definite) await releasePromoClaim(payment.id)
+        else await markPromoSent(payment.id)
       }
     }
     claimed += due.length
@@ -3023,7 +3315,7 @@ async function sendDuePromotions() {
     if (due.length < batchLimit) break
   }
 
-  return { claimed, sent, failed, batches, exhausted }
+  return { claimed, sent, failed, skipped, batches, exhausted }
 }
 
 // Cloud Scheduler가 매일 오전 10시(KST)에 호출한다. Cloud Run 인스턴스마다 cron을 띄우지

@@ -11,6 +11,7 @@ const VIEW_TITLE = {
   queue: '정비 대기',
   erp: '전산 주문',
   history: '정비 이력',
+  promo: '홍보 문자',
   today: '오늘 현황',
   settings: '설정',
 }

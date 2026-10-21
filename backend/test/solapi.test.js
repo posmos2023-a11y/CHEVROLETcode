@@ -102,3 +102,38 @@ test('SOLAPI_TIMEOUT_MS에 음수가 들어가도 기본값으로 떨어진다',
     delete process.env.SOLAPI_TIMEOUT_MS
   }
 })
+
+test('failedMessageList 오류와 시간 초과 오류는 확실한 실패/결과 모름으로 구분된다', async () => {
+  sendImpl = () => Promise.resolve({ failedMessageList: [{ statusMessage: '수신번호 형식 오류' }] })
+  const definite = await solapi.sendPromoAlimtalk({ phone: '01000000000', storeName: '테스트매장', storeId: 1 }).catch((e) => e)
+  assert.equal(solapi.isDefiniteSendFailure(definite), true)
+
+  process.env.SOLAPI_TIMEOUT_MS = '20'
+  sendImpl = () => delay(500, { groupId: 'slow' })
+  try {
+    const timeout = await solapi.sendPromoAlimtalk({ phone: '01000000000', storeName: '테스트매장', storeId: 1 }).catch((e) => e)
+    assert.equal(timeout.code, 'SOLAPI_TIMEOUT')
+    assert.equal(solapi.isDefiniteSendFailure(timeout), false)
+  } finally {
+    delete process.env.SOLAPI_TIMEOUT_MS
+  }
+})
+
+test('SDK 오류 태그: 접수 거부·잘못된 요청·4xx만 확실한 실패다', () => {
+  const tagged = (props) => Object.assign(new Error('x'), props)
+  assert.equal(solapi.isDefiniteSendFailure(tagged({ _tag: 'MessageNotReceivedError' })), true)
+  assert.equal(solapi.isDefiniteSendFailure(tagged({ _tag: 'BadRequestError' })), true)
+  assert.equal(solapi.isDefiniteSendFailure(tagged({ _tag: 'ApiKeyError' })), true)
+  assert.equal(solapi.isDefiniteSendFailure(tagged({ _tag: 'ClientError', httpStatus: 400 })), true)
+  assert.equal(solapi.isDefiniteSendFailure(tagged({ _tag: 'ClientError', httpStatus: 429 })), false)
+  assert.equal(solapi.isDefiniteSendFailure(tagged({ _tag: 'ServerError', httpStatus: 500 })), false)
+  assert.equal(solapi.isDefiniteSendFailure(tagged({ _tag: 'NetworkError' })), false)
+  assert.equal(solapi.isDefiniteSendFailure(tagged({ _tag: 'ResponseSchemaMismatchError' })), false)
+  assert.equal(solapi.isDefiniteSendFailure(new Error('socket hang up')), false)
+})
+
+test('홍보 문자 본문은 "(광고) 매장명"으로 시작하고 수신거부 안내로 끝난다', () => {
+  const text = solapi.buildPromoText('쉐보레 테스트점')
+  assert.ok(text.startsWith('(광고) 쉐보레 테스트점\n'), text)
+  assert.ok(text.endsWith(process.env.PROMO_OPT_OUT_TEXT || solapi.DEFAULT_PROMO_OPT_OUT_TEXT), text)
+})
