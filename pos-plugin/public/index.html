@@ -845,6 +845,16 @@
   }
   .history-recent-won { font-size: 13px; font-weight: 700; }
 
+  .history-owner {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 6px 10px;
+    padding: 4px 2px 6px;
+  }
+  .history-owner-car { font-size: 17px; letter-spacing: -0.04em; }
+  .history-owner-contact { font-size: 14px; color: var(--ink); }
+  .history-owner-note { font-size: 12px; color: var(--sub); }
   .history-service { margin-top: 5px; color: var(--sub); font-size: 13px; letter-spacing: -0.03em; }
 
   .history-items { margin: 8px 0 0; padding-left: 18px; color: var(--sub); font-size: 13px; line-height: 1.7; }
@@ -1399,8 +1409,8 @@
           <section class="view" id="view-history">
       <div class="history-panel" id="history-panel">
         <form class="history-form" id="history-form">
-          <input type="text" id="history-input" placeholder="차량번호 (예: 12가3456)"
-                 maxlength="12" autocomplete="off" spellcheck="false" />
+          <input type="text" id="history-input" placeholder="차량번호 또는 전화번호 (예: 12가3456 / 01012345678)"
+                 maxlength="13" autocomplete="off" spellcheck="false" />
           <button type="submit">조회</button>
         </form>
         <div class="history-body" id="history-body"></div>

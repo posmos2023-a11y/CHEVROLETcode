@@ -1657,15 +1657,54 @@ testSerial('이력: 차량번호로 지난 방문과 품목이 나온다', async
   assert.equal(visit.orders[0].paid, true)
 })
 
-testSerial('이력: 전화번호는 돌려주지 않는다', async () => {
-  // 이력 확인에 필요 없는 개인정보다. 목적 밖 이용이 되지 않게 응답에서 뺀다.
+testSerial('이력: 연락처는 가운데를 가린 번호로만 주고, 전산 고객명을 함께 준다', async () => {
+  // 직원이 "이 차가 누구 차인지" 알아볼 수 있게 가린 번호(010-****-5678)와 고객명만 준다. 원문은 없다.
   const store = await createStore('hist-nophone')
   await visitWithOrder(store, '22나2222', '타이어 교체')
 
   const res = await getHistory(store, '22나2222')
   const raw = JSON.stringify(res.body)
-  assert.equal(raw.includes('01012345678'), false, '전화번호가 응답에 들어 있습니다')
-  assert.equal(raw.includes('phone'), false, 'phone 필드가 응답에 있습니다')
+  assert.equal(raw.includes('01012345678'), false, '전화번호 원문이 응답에 들어 있습니다')
+  assert.equal(res.body.contactMasked, '010-****-5678')
+  assert.equal(res.body.visits[0].contactMasked, '010-****-5678')
+  assert.equal(res.body.customerName, '김민준님')
+  assert.equal(res.body.visits[0].orders[0].customerName, '김민준님')
+})
+
+testSerial('이력: 전화번호로 찾으면 그 번호의 차 이력이 나오고, 차가 여러 대면 차량 목록을 준다', async () => {
+  const store = await createStore('hist-byphone')
+  await visitWithOrder(store, '23다2323', '엔진오일 교환')
+  const byPhone = (phone) => request(app).get('/api/pos/history?phone=' + encodeURIComponent(phone)).set('X-Store-Token', store.posToken)
+
+  const one = await byPhone('010-1234-5678')
+  assert.equal(one.status, 200, JSON.stringify(one.body))
+  assert.equal(one.body.carNumber, '23다2323')
+  assert.equal(one.body.phoneSearch, '010-****-5678')
+  assert.equal(one.body.visits.length, 1)
+  assert.equal(JSON.stringify(one.body).includes('01012345678'), false)
+
+  // 같은 번호로 다른 차도 방문했다
+  const today = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10)
+  await prisma.reservation.create({
+    data: {
+      storeId: store.id, carNumber: '45라4545', phone: '01012345678', serviceType: '점검',
+      queueNumber: 77, serviceDate: today, status: 'completed', completedAt: new Date(),
+    },
+  })
+  const two = await byPhone('01012345678')
+  assert.equal(two.body.carNumber, null)
+  assert.deepEqual(two.body.cars.sort(), ['23다2323', '45라4545'])
+  assert.equal(two.body.visits.length, 0)
+
+  const none = await byPhone('01099990000')
+  assert.deepEqual(none.body.cars, [])
+
+  assert.equal((await byPhone('1234')).status, 400)
+
+  // 다른 매장 토큰으로는 이 번호의 차가 안 보인다
+  const other = await createStore('hist-byphone-other')
+  const leak = await request(app).get('/api/pos/history?phone=01012345678').set('X-Store-Token', other.posToken)
+  assert.deepEqual(leak.body.cars, [])
 })
 
 testSerial('이력: 다른 매장 이력은 보이지 않는다', async () => {
@@ -2100,16 +2139,24 @@ testSerial('최근 이력: 다른 매장 건이 섞이지 않는다', async () =
   assert.equal(res.body.visits.length, 0)
 })
 
-testSerial('최근 이력: 전화번호는 절대 실려 나오지 않는다', async () => {
+testSerial('최근 이력: 전화번호 원문은 나가지 않고, 가린 번호와 전산 고객명이 나온다', async () => {
   const store = await createStore('recent-privacy')
+  const today = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10)
+  await prisma.reservation.create({
+    data: {
+      storeId: store.id, carNumber: '12가3456', phone: '01012345678', serviceType: '점검',
+      queueNumber: 5, serviceDate: today, status: 'completed', completedAt: new Date(Date.now() - 60 * 60 * 1000),
+    },
+  })
   assert.equal((await postCart(validBody(store, { carNumber: '12가3456' }))).status, 201)
   const cartId = (await getPosCarts(store)).body.carts[0].id
   await consumeCart(store, cartId, { result: 'loaded' })
 
   const res = await getRecent(store)
-  // 이용 목적은 "정비 이력 관리"다. 연락처는 그 목적에 필요하지 않으므로 나가면 안 된다.
   assert.equal(JSON.stringify(res.body).includes('01012345678'), false)
-  assert.equal(JSON.stringify(res.body).includes('phone'), false)
+  const order = res.body.visits.find((v) => v.kind === 'order')
+  assert.equal(order.contactMasked, '010-****-5678')
+  assert.equal(order.customerName, '김민준님')
 })
 
 testSerial('최근 이력: 매장 토큰 없이는 볼 수 없다', async () => {

@@ -1,11 +1,13 @@
-// 차량번호로 정비 이력을 보는 화면.
+// 차량번호(또는 전화번호)로 정비 이력을 보는 화면.
 //
 // 왜 필요한가: 정비소에서 가장 자주 나오는 질문이 "이 차 지난번에 뭐 갈았지?"다. 지금은 전산을
 // 따로 열어야 하는데, 손님이 POS 앞에 서 있는 상황이라 그 사이 손이 비면 안 된다.
 //
 // 개인정보 관점에서 좁혀둔 것:
 //   - 조회는 서버가 매장 토큰으로 자기 매장 것만 돌려준다.
-//   - 전화번호는 응답에 아예 없다. 이력 확인에 필요 없다.
+//   - 전화번호는 가운데를 가린 번호(010-****-1234)만 온다. "이 차가 누구 차인지" 알아보는 데는
+//     끝 네 자리면 충분하다. 원문은 서버가 내려주지 않는다.
+//   - 전산 주문에는 전산이 보낸 고객명(예: 김민준님)이 함께 온다.
 //   - 보관기간이 지나 파기(익명화)된 건은 차량번호가 덮여 있어 검색되지 않는다.
 //     "지운다고 해놓고 조회에는 남아 있는" 상황이 구조적으로 생기지 않는다.
 //
@@ -57,7 +59,7 @@ export function openHistoryFor(carNumber) {
     search(carNumber)
     return
   }
-  bodyEl().innerHTML = '<div class="empty"><div class="empty-copy">차량번호를 입력하면 지난 정비 내역을 보여드립니다.</div></div>'
+  bodyEl().innerHTML = '<div class="empty"><div class="empty-copy">차량번호나 전화번호를 입력하면 지난 정비 내역을 보여드립니다.</div></div>'
   const promo = promoEl()
   if (promo) promo.hidden = true
   input.focus()
@@ -89,12 +91,25 @@ function claimRender() {
   return () => mine === renderSeq
 }
 
-function renderVisits(carNumber, visits) {
+function ownerLine(info) {
+  const parts = [info.contactMasked, info.customerName].filter(Boolean)
+  return parts.length ? parts.map((p) => deps.escapeHtml(p)).join(' · ') : ''
+}
+
+function renderVisits(carNumber, visits, info = {}) {
   const body = bodyEl()
   if (!body) return
+  const owner = ownerLine(info)
+  const head = `
+    <div class="history-owner">
+      <strong class="history-owner-car">${deps.escapeHtml(carNumber)}</strong>
+      ${owner ? `<span class="history-owner-contact">${owner}</span>` : '<span class="history-owner-contact">연락처 기록 없음</span>'}
+      ${info.phoneSearch ? `<span class="history-owner-note">${deps.escapeHtml(info.phoneSearch)}(으)로 찾음</span>` : ''}
+    </div>
+  `
 
   if (!visits.length) {
-    body.innerHTML = `
+    body.innerHTML = head + `
       <div class="empty">
         <div class="empty-mark" aria-hidden="true">✓</div>
         <div class="empty-title">${deps.escapeHtml(carNumber)} 방문 이력이 없습니다</div>
@@ -104,12 +119,16 @@ function renderVisits(carNumber, visits) {
     return
   }
 
-  body.innerHTML = visits.map((v) => {
+  body.innerHTML = head + visits.map((v) => {
     // 한 방문에 전산 주문이 여러 건일 수 있다(부품을 나눠 담은 경우).
     const orders = v.orders || []
     const total = orders.reduce((sum, o) => sum + (o.totalAmount || 0), 0)
     const itemLines = orders.flatMap((o) => o.items || [])
     const paid = orders.some((o) => o.paid)
+    // 지금 연락처·고객명과 다를 때만 그 방문의 값을 따로 보여준다(번호를 바꾼 손님 등).
+    const visitContact = v.contactMasked && v.contactMasked !== info.contactMasked ? v.contactMasked : ''
+    const visitName = orders.map((o) => o.customerName).find((n) => n && n !== info.customerName) || ''
+    const visitOwner = [visitContact, visitName].filter(Boolean).map((p) => deps.escapeHtml(p)).join(' · ')
 
     return `
       <article class="history-visit">
@@ -119,6 +138,7 @@ function renderVisits(carNumber, visits) {
           ${paid ? '<span class="history-badge paid">결제완료</span>' : ''}
         </div>
         ${v.serviceType ? `<div class="history-service">${deps.escapeHtml(v.serviceType)}</div>` : ''}
+        ${visitOwner ? `<div class="history-service">${visitOwner}</div>` : ''}
         ${itemLines.length ? `<ul class="history-items">${itemLines.map((i) => `
           <li>${deps.escapeHtml(i.name)} <span class="history-qty">×${i.quantity}</span></li>
         `).join('')}</ul>` : ''}
@@ -168,7 +188,7 @@ function renderRecent(visits) {
       <div class="empty">
         <div class="empty-mark" aria-hidden="true">\u2713</div>
         <div class="empty-title">아직 정비 이력이 없습니다</div>
-        <div class="empty-copy">정비가 끝나거나 전산 주문을 담으면 여기에 쌓입니다. 위에 차량번호를 넣어 찾아볼 수도 있습니다.</div>
+        <div class="empty-copy">정비가 끝나거나 전산 주문을 담으면 여기에 쌓입니다. 위에 차량번호나 전화번호를 넣어 찾아볼 수도 있습니다.</div>
       </div>
     `
     return
@@ -177,12 +197,13 @@ function renderRecent(visits) {
     <div class="history-recent-head">최근 ${visits.length}건 · 차량을 누르면 그 차의 전체 이력을 봅니다</div>
     ${visits.map((v) => {
       const names = (v.items || []).map((i) => i.name).join(', ')
+      const owner = ownerLine(v)
       return `
         <button class="history-recent-row" type="button" data-car="${deps.escapeHtml(v.carNumber || '')}">
           <span class="history-recent-car">${deps.escapeHtml(v.carNumber || '-')}</span>
           <span class="history-recent-mid">
             <span class="history-recent-desc">${deps.escapeHtml(v.serviceType || names || '정비')}</span>
-            <span class="history-recent-date">${deps.escapeHtml(formatDate(v.at))}</span>
+            <span class="history-recent-date">${deps.escapeHtml(formatDate(v.at))}${owner ? ` · ${owner}` : ''}</span>
           </span>
           <span class="history-recent-right">
             ${v.totalAmount ? `<span class="history-recent-won">${formatWon(v.totalAmount)}</span>` : ''}
@@ -194,20 +215,52 @@ function renderRecent(visits) {
   `
 }
 
+// 입력이 숫자(하이픈·공백 허용)로만 된 010 번호면 전화번호로 찾는다.
+function asPhone(raw) {
+  const digits = String(raw || '').replace(/[s-]/g, '')
+  return /^01[0-9]{8,9}$/.test(digits) ? digits : null
+}
+
+// 전화번호로 찾았는데 차가 여러 대(또는 0대)일 때. 차를 누르면 그 차의 이력을 본다.
+function renderCarChoices(res) {
+  const body = bodyEl()
+  if (!body) return
+  const cars = res.cars || []
+  if (!cars.length) {
+    body.innerHTML = `
+      <div class="empty">
+        <div class="empty-title">${deps.escapeHtml(res.phoneSearch || '')} 번호로 방문한 기록이 없습니다</div>
+        <div class="empty-copy">번호를 다시 확인하거나 차량번호로 찾아보세요.</div>
+      </div>
+    `
+    return
+  }
+  body.innerHTML = `
+    <div class="history-recent-head">${deps.escapeHtml(res.phoneSearch || '')} 번호로 방문한 차량 ${cars.length}대 · 차량을 누르면 그 차의 이력을 봅니다</div>
+    ${cars.map((car) => `
+      <button class="history-recent-row" type="button" data-car="${deps.escapeHtml(car)}">
+        <span class="history-recent-car">${deps.escapeHtml(car)}</span>
+      </button>
+    `).join('')}
+  `
+}
+
 async function search(rawCarNumber) {
   const isLatest = claimRender()
   const carNumber = String(rawCarNumber || '').trim()
   const body = bodyEl()
   if (!carNumber) {
-    body.innerHTML = '<div class="empty"><div class="empty-copy">차량번호를 입력해주세요.</div></div>'
+    body.innerHTML = '<div class="empty"><div class="empty-copy">차량번호나 전화번호를 입력해주세요.</div></div>'
     return
   }
+  const phone = asPhone(carNumber)
 
   body.innerHTML = '<div class="empty"><div class="empty-copy">불러오는 중...</div></div>'
   const promo = promoEl()
   if (promo) promo.hidden = true
   try {
-    const { ok, status, body: res } = await deps.apiGet(`/api/pos/history?carNumber=${encodeURIComponent(carNumber)}`)
+    const query = phone ? `phone=${encodeURIComponent(phone)}` : `carNumber=${encodeURIComponent(carNumber)}`
+    const { ok, status, body: res } = await deps.apiGet(`/api/pos/history?${query}`)
     if (!ok) {
       if (status === 401) {
         deps.onUnauthorized(res.error)
@@ -217,9 +270,13 @@ async function search(rawCarNumber) {
       return
     }
     if (!isLatest()) return
-    shownCarNumber = carNumber
-    renderVisits(carNumber, res.visits || [])
-    refreshPromo(carNumber)
+    if (!res.carNumber) {
+      renderCarChoices(res)
+      return
+    }
+    shownCarNumber = res.carNumber
+    renderVisits(res.carNumber, res.visits || [], res)
+    refreshPromo(res.carNumber)
   } catch {
     body.innerHTML = '<div class="empty"><div class="empty-copy">네트워크 연결을 확인한 뒤 다시 시도해주세요.</div></div>'
   }

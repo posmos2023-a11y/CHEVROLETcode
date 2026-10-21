@@ -1700,7 +1700,7 @@ async function listRecentRepairHistory(storeId, limit = 20) {
     take,
     select: {
       id: true, carNumber: true, itemsJson: true, totalAmount: true,
-      status: true, createdAt: true, paidAt: true, reservationId: true,
+      status: true, createdAt: true, paidAt: true, reservationId: true, memo: true,
     },
   })
 
@@ -1731,7 +1731,7 @@ async function findRepairHistoryByCarNumber(storeId, carNumber, limit = 10) {
     take: Math.min(Math.max(Number(limit) || 10, 1), 50),
     select: {
       id: true, serviceType: true, serviceDate: true, status: true,
-      createdAt: true, completedAt: true,
+      createdAt: true, completedAt: true, phone: true,
     },
   })
 
@@ -1742,11 +1742,71 @@ async function findRepairHistoryByCarNumber(storeId, carNumber, limit = 10) {
     take: 50,
     select: {
       id: true, reservationId: true, itemsJson: true, totalAmount: true,
-      status: true, createdAt: true, paidAt: true,
+      status: true, createdAt: true, paidAt: true, memo: true,
     },
   })
 
   return { reservations, carts }
+}
+
+// 차량번호마다 지금 연락처(가장 최근 예약·결제 기록의 전화번호). 정비 이력 화면에서 "이 차가 누구
+// 차인지"를 보여주는 데 쓴다(화면에는 가운데를 가린 번호만 나간다). 반환: Map(carNumber -> phone)
+async function latestPhonesByCarNumbers(storeId, carNumbers) {
+  const cars = [...new Set((carNumbers || []).filter(Boolean))]
+  const result = new Map()
+  if (!cars.length) return result
+  const select = { carNumber: true, phone: true, createdAt: true }
+  const [res, pay] = await Promise.all([
+    prisma.reservation.findMany({
+      where: { storeId, carNumber: { in: cars }, anonymizedAt: null },
+      orderBy: { createdAt: 'desc' },
+      distinct: ['carNumber'],
+      select,
+    }),
+    prisma.payment.findMany({
+      where: { storeId, carNumber: { in: cars }, anonymizedAt: null, phone: { not: null } },
+      orderBy: { createdAt: 'desc' },
+      distinct: ['carNumber'],
+      select,
+    }),
+  ])
+  const latest = new Map()
+  for (const r of [...res, ...pay]) {
+    if (!r.phone) continue
+    const prev = latest.get(r.carNumber)
+    if (!prev || new Date(r.createdAt) > new Date(prev.createdAt)) latest.set(r.carNumber, r)
+  }
+  for (const [car, r] of latest) result.set(car, r.phone)
+  return result
+}
+
+// 전화번호로 그 손님의 차량번호들을 찾는다(정비 이력을 전화번호로 조회할 때). 최근 방문한 차가 앞에 온다.
+async function findCarNumbersByPhone(storeId, phone, limit = 10) {
+  if (!phone) return []
+  const select = { carNumber: true, createdAt: true }
+  const [res, pay] = await Promise.all([
+    prisma.reservation.findMany({
+      where: { storeId, phone, anonymizedAt: null },
+      orderBy: { createdAt: 'desc' },
+      distinct: ['carNumber'],
+      take: limit,
+      select,
+    }),
+    prisma.payment.findMany({
+      where: { storeId, phone, anonymizedAt: null, carNumber: { not: null } },
+      orderBy: { createdAt: 'desc' },
+      distinct: ['carNumber'],
+      take: limit,
+      select,
+    }),
+  ])
+  const latest = new Map()
+  for (const r of [...res, ...pay]) {
+    if (!r.carNumber) continue
+    const prev = latest.get(r.carNumber)
+    if (!prev || new Date(r.createdAt) > new Date(prev)) latest.set(r.carNumber, r.createdAt)
+  }
+  return [...latest.entries()].sort((a, b) => new Date(b[1]) - new Date(a[1])).slice(0, limit).map(([car]) => car)
 }
 
 // 관리자 웹에서 전산 주문 이력을 보는 용도. 매장이 "전산에서 보냈는데 POS에 안 떴어요" 할 때
@@ -2160,6 +2220,8 @@ module.exports = {
   listErpCarts,
   getPosDailySummary,
   findRepairHistoryByCarNumber,
+  latestPhonesByCarNumbers,
+  findCarNumbersByPhone,
   listRecentRepairHistory,
   findMarketingContactByCarNumber,
   findLastPromoSend,

@@ -86,6 +86,8 @@ const {
   listErpCarts,
   getPosDailySummary,
   findRepairHistoryByCarNumber,
+  latestPhonesByCarNumbers,
+  findCarNumbersByPhone,
   pingDatabaseReady,
   listRecentRepairHistory,
   findMarketingContactByCarNumber,
@@ -2493,9 +2495,12 @@ app.post('/api/pos/promo-campaign/send', posIpFloodLimiter, posLimiter, requireS
 
 // 매장의 최근 정비 이력. 이력 화면을 열자마자 보여줄 목록이다.
 //
-// 개별 조회와 같은 성격의 자료이므로 돌려주는 항목도 똑같이 최소로 한다 — 전화번호는 없다.
+// 직원이 "이 차가 누구 차인지" 알아볼 수 있게 차의 지금 연락처를 가운데를 가린 번호(010-****-1234)로,
+// 전산 주문에는 전산이 보낸 고객명을 함께 준다. 전화번호 원문은 내려주지 않는다.
 app.get('/api/pos/history/recent', posIpFloodLimiter, posQueueReadLimiter, requireStoreToken, asyncHandler(async (req, res) => {
   const { carts, reservations } = await listRecentRepairHistory(req.store.id, 20)
+  const phones = await latestPhonesByCarNumbers(req.store.id, [...carts, ...reservations].map((v) => v.carNumber))
+  const contactOf = (car) => (phones.get(car) ? maskPhone(phones.get(car)) : null)
 
   const visits = []
   for (const c of carts) {
@@ -2504,6 +2509,8 @@ app.get('/api/pos/history/recent', posIpFloodLimiter, posQueueReadLimiter, requi
     visits.push({
       kind: 'order',
       carNumber: c.carNumber,
+      contactMasked: contactOf(c.carNumber),
+      customerName: customerNameFromMemo(c.memo, c.carNumber),
       at: c.paidAt || c.createdAt,
       paid: c.status === 'paid',
       serviceType: null,
@@ -2515,6 +2522,8 @@ app.get('/api/pos/history/recent', posIpFloodLimiter, posQueueReadLimiter, requi
     visits.push({
       kind: 'reservation',
       carNumber: r.carNumber,
+      contactMasked: contactOf(r.carNumber),
+      customerName: null,
       at: r.completedAt,
       paid: false,
       serviceType: r.serviceType,
@@ -2527,28 +2536,63 @@ app.get('/api/pos/history/recent', posIpFloodLimiter, posQueueReadLimiter, requi
   return res.json({ ok: true, visits: visits.slice(0, 20) })
 }))
 
-// 차량번호로 정비 이력을 조회한다. 직원이 "이 차 지난번에 뭐 갈았지?"를 POS에서 바로 본다.
+// 전산 주문 memo에서 고객명만 뽑는다. 전산은 memo에 "12가3456 김민준님"처럼 차량번호와 고객명을 함께
+// 넣는다(형식은 자유 문자열). 차량번호 모양의 토큰(이 차의 번호와 같거나 12가3456 형식)을 빼고 남은 것을
+// 고객명으로 본다. 파기(익명화)된 건은 memo가 비어 있어 null이다.
+function customerNameFromMemo(memo, carNumber) {
+  const text = String(memo || '').trim()
+  if (!text) return null
+  const car = normalizeCarNumber(carNumber)
+  const isCarToken = (t) => {
+    const v = normalizeCarNumber(t)
+    return Boolean(v) && (v === car || CAR_NUMBER_RE.test(v))
+  }
+  const rest = text.split(/\s+/).filter((t) => !isCarToken(t)).join(' ').trim()
+  return rest ? rest.slice(0, 40) : null
+}
+
+// 차량번호 또는 전화번호로 정비 이력을 조회한다. 직원이 "이 차 지난번에 뭐 갈았지?"를 POS에서 바로 본다.
 //
-// 손님에게 받은 동의의 이용 목적에 "정비 이력 관리"가 들어 있어야 쓸 수 있는 기능이다
-// (front-plugin의 동의 문구 참고). 목적 밖 이용이 되지 않도록 돌려주는 항목을 최소로 한다 —
-// 전화번호는 포함하지 않는다.
+// 전화번호로 찾으면 그 번호로 방문한 차가 여러 대일 수 있다. 한 대면 바로 그 차의 이력을, 여러 대면
+// 차량 목록(cars)만 주고 화면이 고르게 한다. 연락처는 가운데를 가린 번호만 내려준다(원문 없음).
 app.get('/api/pos/history', posIpFloodLimiter, posQueueReadLimiter, requireStoreToken, asyncHandler(async (req, res) => {
-  const carNumber = String(req.query.carNumber || '').trim()
+  let carNumber = String(req.query.carNumber || '').trim()
+  const rawPhone = String(req.query.phone || '').replace(/\D/g, '')
+  let searchedPhone = null
+  if (!carNumber && rawPhone) {
+    if (!PHONE_RE.test(rawPhone)) {
+      return res.status(400).json({ ok: false, error: '전화번호를 01012345678 형식으로 입력해주세요.' })
+    }
+    searchedPhone = rawPhone
+    const cars = await findCarNumbersByPhone(req.store.id, rawPhone)
+    if (cars.length !== 1) {
+      return res.json({ ok: true, carNumber: null, phoneSearch: maskPhone(rawPhone), cars, visits: [] })
+    }
+    carNumber = cars[0]
+  }
   if (!carNumber) {
-    return res.status(400).json({ ok: false, error: '차량번호를 입력해주세요.' })
+    return res.status(400).json({ ok: false, error: '차량번호나 전화번호를 입력해주세요.' })
   }
 
-  const { reservations, carts } = await findRepairHistoryByCarNumber(req.store.id, carNumber, 10)
+  const [{ reservations, carts }, phones] = await Promise.all([
+    findRepairHistoryByCarNumber(req.store.id, carNumber, 10),
+    latestPhonesByCarNumbers(req.store.id, [normalizeCarNumber(carNumber)]),
+  ])
+  const currentPhone = phones.get(normalizeCarNumber(carNumber))
 
   // 방문 단위로 묶는다. 전산 주문은 예약에 이어져 있으면 그 예약 밑으로, 아니면 따로 세운다 —
   // 예약 없이 그냥 온 손님도 정비는 받았으므로 이력에서 빠지면 안 된다.
   const cartsByReservation = new Map()
   const standalone = []
+  let customerName = null
   for (const c of carts) {
     let items = []
     try { items = JSON.parse(c.itemsJson) } catch { /* 손상된 건은 품목 없이 금액만 보여준다 */ }
+    const name = customerNameFromMemo(c.memo, carNumber)
+    if (name && !customerName) customerName = name // carts는 최근 것부터 온다
     const view = {
       id: c.id,
+      customerName: name,
       items: items.map((i) => ({ name: i.name, quantity: i.quantity, unitPrice: i.unitPrice })),
       totalAmount: c.totalAmount,
       paid: c.status === 'paid',
@@ -2569,15 +2613,23 @@ app.get('/api/pos/history', posIpFloodLimiter, posQueueReadLimiter, requireStore
     serviceType: r.serviceType,
     status: r.status,
     at: r.completedAt || r.createdAt,
+    contactMasked: r.phone ? maskPhone(r.phone) : null,
     orders: cartsByReservation.get(r.id) || [],
   }))
   for (const c of standalone) {
-    visits.push({ kind: 'order', date: null, serviceType: null, status: null, at: c.at, orders: [c] })
+    visits.push({ kind: 'order', date: null, serviceType: null, status: null, at: c.at, contactMasked: null, orders: [c] })
   }
   // 최근 방문이 위로.
   visits.sort((a, b) => new Date(b.at) - new Date(a.at))
 
-  return res.json({ ok: true, carNumber, visits: visits.slice(0, 10) })
+  return res.json({
+    ok: true,
+    carNumber,
+    phoneSearch: searchedPhone ? maskPhone(searchedPhone) : null,
+    contactMasked: currentPhone ? maskPhone(currentPhone) : null,
+    customerName,
+    visits: visits.slice(0, 10),
+  })
 }))
 
 // POS에서 결제가 실제로 끝났을 때 탭앱이 알려준다(posPluginSdk.payment.on('paid')).
