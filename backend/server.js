@@ -879,8 +879,30 @@ app.post('/api/reservations/:id/complete', requireAuth, asyncHandler(async (req,
     }
     return res.status(409).json({ ok: false, error: '호출완료 또는 알림실패 상태의 예약만 완료할 수 있습니다.' })
   }
-  return res.json({ ok: true, id: reservation.id, status: reservation.status })
+  const notified = await notifyRepairDone(reservation)
+  return res.json({ ok: true, id: reservation.id, status: reservation.status, notified })
 }))
+
+// 정비 완료(출고) 안내 문자. [완료]가 실제로 상태를 바꾼 때만 보낸다(같은 버튼을 두 번 눌러도 한 번만 간다).
+// 결제 뒤 자동 완료(completeReservationAfterPayment)에서는 보내지 않는다 -- 손님이 이미 카운터에서 결제하고
+// 있으니 "차를 찾으러 오세요"가 어색하고, 영수증이 따로 간다.
+// 실패해도 완료 처리는 그대로 두고 false를 돌려준다 -- 화면이 "직접 연락하세요"라고 알린다.
+async function notifyRepairDone(reservation) {
+  try {
+    await solapi.sendRepairDoneAlimtalk({
+      phone: reservation.phone,
+      carNumber: reservation.carNumber,
+      serviceType: reservation.serviceType,
+      storeName: reservation.store?.name,
+      storeId: reservation.storeId,
+      reservationId: reservation.id,
+    })
+    return true
+  } catch (error) {
+    logger.error('[repair-done] 정비 완료 안내 발송 실패', { reservationId: reservation.id, storeId: reservation.storeId, error: error.message })
+    return false
+  }
+}
 
 // 예약 목록 (관리자 화면용). hq_admin은 ?storeId=로 특정 매장 필터/생략시 전체,
 // store_admin은 항상 자기 매장으로 고정된다. 페이지네이션 + 필터를 전부 DB에 위임한다(계약 §3.3) —
@@ -1236,7 +1258,8 @@ app.post('/api/pos/queue/:id/complete', posIpFloodLimiter, posLimiter, requireSt
     }
     return res.status(409).json({ ok: false, error: '호출완료 또는 알림실패 상태의 예약만 완료할 수 있습니다.' })
   }
-  return res.json({ ok: true, id: reservation.id, status: reservation.status })
+  const notified = await notifyRepairDone(reservation)
+  return res.json({ ok: true, id: reservation.id, status: reservation.status, notified })
 }))
 
 // 노쇼 손님을 대기열에서 빼는 용도 (계약 §3.16 신규). complete와 동일하게(계약 v3 §4.3) 해당
@@ -3036,6 +3059,37 @@ app.post('/api/front/erp-carts/:id/start', posIpFloodLimiter, posLimiter, requir
   })
 }))
 
+// 프론트에서 결제가 끝난 전산 주문의 전자영수증 알림톡. 예약과 이어진 주문만 보낸다 -- 손님이 그 예약에서
+// 직접 넣은 번호라 확실하다. 차량번호로 연락처를 짐작해 보내면 차를 판 이전 주인처럼 엉뚱한 사람에게 갈 수
+// 있다. 실패해도 결제 기록에는 영향이 없다(로그만 남긴다).
+// 반환: sent | failed | no_reservation | no_phone
+async function sendErpCartReceipt(cart, storeName) {
+  if (!cart.reservationId) return 'no_reservation'
+  const reservation = await prisma.reservation.findUnique({
+    where: { id: cart.reservationId },
+    select: { phone: true, carNumber: true, serviceType: true, anonymizedAt: true },
+  })
+  if (!reservation || reservation.anonymizedAt || !reservation.phone) return 'no_phone'
+  let names = []
+  try { names = JSON.parse(cart.itemsJson).map((i) => i?.name).filter(Boolean) } catch { /* 품목을 못 읽으면 정비 항목으로 */ }
+  const summary = names.length > 1 ? `${names[0]} 외 ${names.length - 1}건` : (names[0] || reservation.serviceType)
+  try {
+    await solapi.sendReceiptAlimtalk({
+      phone: reservation.phone,
+      carNumber: cart.carNumber || reservation.carNumber,
+      serviceType: summary,
+      amount: cart.totalAmount,
+      storeName,
+      storeId: cart.storeId,
+      paymentId: cart.id,
+    })
+    return 'sent'
+  } catch (e) {
+    logger.error('[front] 결제 영수증 발송 실패', { cartId: cart.id, storeId: cart.storeId, error: e.message })
+    return 'failed'
+  }
+}
+
 // 결제 결과 보고. result: 'paid' | 'cancelled' | 'failed'.
 app.post('/api/front/erp-carts/:id/result', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
   const result = req.body?.result
@@ -3091,7 +3145,9 @@ app.post('/api/front/erp-carts/:id/result', posIpFloodLimiter, posLimiter, requi
         logger.error('[front] 결제 후 예약 자동완료 실패', { cartId: cart.id, error: e.message })
       }
     }
-    return res.json({ ok: true, alreadyProcessed: false, status: 'paid', reservationCompleted })
+    // 결제 기록이 끝난 뒤에 보낸다(이 요청이 paid로 바꾼 한 번만 -- 재시도 보고는 위에서 이미 돌려보냈다).
+    const receipt = await sendErpCartReceipt(cart, req.store.name)
+    return res.json({ ok: true, alreadyProcessed: false, status: 'paid', reservationCompleted, receipt })
   }
 
   // cancelled/failed: 돈이 나가지 않았으므로 다시 결제할 수 있게 되돌린다.

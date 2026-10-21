@@ -46,6 +46,18 @@ process.env.NODE_ENV = 'test'
 process.env.JWT_SECRET = 'local-test-jwt-secret'
 process.env.TOSS_WEBHOOK_SECRET = ''
 
+// 알림(문자) 발송을 가짜로 바꾼다 -- 정비 완료 안내·결제 영수증이 실제 문자 회사로 나가지 않게.
+// 보낸 내용은 global.__notifications에 쌓여 테스트가 확인할 수 있다.
+const __solapi = require('../src/solapi')
+global.__notifications = []
+for (const method of ['sendReservationAlimtalk', 'sendQueueTurnAlimtalk', 'sendReceiptAlimtalk', 'sendRepairDoneAlimtalk', 'sendPromoAlimtalk']) {
+  __solapi[method] = async (payload) => {
+    global.__notifications.push({ method, payload })
+    if (global.__failNotification === method) { global.__failNotification = null; throw new Error('강제 실패(테스트 전용)') }
+    return { ok: true }
+  }
+}
+
 // ERP 연동 관련 환경변수 -- server.js를 require하기 전에 미리 세팅해둔다. ERP_API_TOKEN은
 // requireErpToken이 요청마다 process.env에서 읽으므로 테스트 중간에 지웠다 되돌리는 식으로도
 // 쓸 수 있다(§6 "토큰 없음 → 503" 케이스).

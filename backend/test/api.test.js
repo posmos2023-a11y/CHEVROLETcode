@@ -35,6 +35,7 @@ for (const method of [
   'sendReservationAlimtalk',
   'sendQueueTurnAlimtalk',
   'sendReceiptAlimtalk',
+  'sendRepairDoneAlimtalk',
   'sendPromoAlimtalk',
 ]) {
   solapi[method] = async (payload) => {

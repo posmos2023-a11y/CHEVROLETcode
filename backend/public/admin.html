@@ -1625,6 +1625,7 @@ document.getElementById('reservations-view').addEventListener('click', async (e)
     try {
       const { ok, body } = await apiPost(`/api/reservations/${id}/complete`)
       if (!ok) alert(body.error || '처리에 실패했습니다.')
+      else if (body.notified === false) alert('정비완료로 처리했지만 완료 안내 문자를 보내지 못했습니다. 손님께 직접 연락해 주세요.')
     } catch (err) {
       if (err.message === 'UNAUTHORIZED') {
         clearSession()

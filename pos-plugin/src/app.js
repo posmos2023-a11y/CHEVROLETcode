@@ -256,6 +256,11 @@ async function runAction(id, action) {
       return
     }
     notify('error', body.error || '처리 중 오류가 발생했습니다.')
+  } else if (action === 'complete' && body.notified === false) {
+    // 완료 처리는 됐지만 손님에게 완료 안내 문자가 안 갔다. 직원이 직접 연락하도록 알린다.
+    notify('error', '정비완료로 처리했지만 완료 안내 문자를 보내지 못했습니다. 손님께 직접 연락해 주세요.')
+  } else if (action === 'complete' && body.notified === true) {
+    notify('success', '정비완료로 처리하고 손님께 완료 안내 문자를 보냈습니다.')
   } else {
     notify('success', ACTION_SUCCESS_MESSAGE[action](body.alreadyProcessed))
   }

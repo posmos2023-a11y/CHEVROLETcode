@@ -140,6 +140,24 @@ async function sendQueueTurnAlimtalk({ phone, carNumber, queueNumber, serviceTyp
   })
 }
 
+// 정비 완료(출고) 안내. 직원이 [완료]를 누를 때 보낸다. 카카오 템플릿(SOLAPI_KAKAO_TEMPLATE_REPAIR_DONE)이
+// 승인되기 전에는 일반 문자로 나간다(sendAlimtalk 참고).
+async function sendRepairDoneAlimtalk({ phone, carNumber, serviceType, storeName, storeId, reservationId }) {
+  return sendAlimtalk({
+    phone,
+    storeId,
+    recordId: reservationId,
+    recordType: 'reservation',
+    text: `[${storeName || '정비 완료'}]\n차량번호 ${carNumber} 정비가 완료되었습니다. 차량을 찾으러 와주세요.`,
+    templateId: process.env.SOLAPI_KAKAO_TEMPLATE_REPAIR_DONE,
+    variables: {
+      '#{매장명}': storeName || '',
+      '#{차량번호}': carNumber,
+      '#{정비항목}': serviceType || '',
+    },
+  })
+}
+
 // 결제 완료 전자영수증. carNumber/serviceType은 결제 화면에서 다시 입력받는 게 아니라
 // 전화번호로 찾은 예약 기록에서 가져온 값이라 없을 수도 있다(예약 없이 바로 결제한 손님).
 async function sendReceiptAlimtalk({ phone, carNumber, serviceType, amount, storeName, storeId, paymentId }) {
@@ -218,6 +236,7 @@ module.exports = {
   sendReservationAlimtalk,
   sendQueueTurnAlimtalk,
   sendReceiptAlimtalk,
+  sendRepairDoneAlimtalk,
   sendPromoAlimtalk,
   buildPromoText,
   isDefiniteSendFailure,

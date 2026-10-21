@@ -37,6 +37,18 @@ process.env.NODE_ENV = 'test'
 process.env.JWT_SECRET = 'local-test-jwt-secret'
 process.env.TOSS_WEBHOOK_SECRET = ''
 
+// 알림(문자) 발송을 가짜로 바꾼다 -- 정비 완료 안내·결제 영수증이 실제 문자 회사로 나가지 않게.
+// 보낸 내용은 global.__notifications에 쌓여 테스트가 확인할 수 있다.
+const __solapi = require('../src/solapi')
+global.__notifications = []
+for (const method of ['sendReservationAlimtalk', 'sendQueueTurnAlimtalk', 'sendReceiptAlimtalk', 'sendRepairDoneAlimtalk', 'sendPromoAlimtalk']) {
+  __solapi[method] = async (payload) => {
+    global.__notifications.push({ method, payload })
+    if (global.__failNotification === method) { global.__failNotification = null; throw new Error('강제 실패(테스트 전용)') }
+    return { ok: true }
+  }
+}
+
 // ERP 연동 관련 환경변수 -- server.js를 require하기 전에 미리 세팅해둔다. 이 파일은 토스를
 // 전혀 호출하지 않지만(ErpCart 라우트는 토스 API와 무관), server.js 모듈이 로드되는 시점에
 // tossOrderClient 관련 설정이 없어도 부팅에는 지장이 없으므로 최소한만 채운다.
@@ -2164,4 +2176,61 @@ testSerial('최근 이력: 매장 토큰 없이는 볼 수 없다', async () => 
 testSerial('POS 오늘 현황: 매장 토큰 없이는 볼 수 없다', async () => {
   const res = await request(app).get('/api/pos/summary')
   assert.equal(res.status, 401)
+})
+
+// --- 정비 완료 안내 문자 -----------------------------------------------------------
+
+async function calledReservation(store, carNumber = '12가3456') {
+  return prisma.reservation.create({
+    data: {
+      storeId: store.id, carNumber, phone: '01055556666', serviceType: '엔진오일',
+      queueNumber: Math.floor(Math.random() * 9000) + 1000,
+      serviceDate: new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10),
+      status: 'called', calledAt: new Date(),
+    },
+  })
+}
+
+function posComplete(store, id) {
+  return request(app).post(`/api/pos/queue/${id}/complete`).set('X-Store-Token', store.posToken)
+}
+
+testSerial('완료 안내: 탭앱에서 [완료]를 누르면 손님에게 정비 완료 문자가 한 번 간다', async () => {
+  global.__notifications.length = 0
+  const store = await createStore('done-notice')
+  const r = await calledReservation(store)
+  const res = await posComplete(store, r.id)
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal(res.body.notified, true)
+  const sent = global.__notifications.filter((n) => n.method === 'sendRepairDoneAlimtalk')
+  assert.equal(sent.length, 1)
+  assert.equal(sent[0].payload.phone, '01055556666')
+  assert.equal(sent[0].payload.carNumber, '12가3456')
+  assert.equal(sent[0].payload.storeName, store.name)
+
+  // 다시 눌러도 다시 보내지 않는다
+  const again = await posComplete(store, r.id)
+  assert.equal(again.body.alreadyCompleted, true)
+  assert.equal(global.__notifications.filter((n) => n.method === 'sendRepairDoneAlimtalk').length, 1)
+})
+
+testSerial('완료 안내: 문자가 실패해도 완료 처리는 되고 notified:false로 알린다', async () => {
+  global.__notifications.length = 0
+  const store = await createStore('done-notice-fail')
+  const r = await calledReservation(store)
+  global.__failNotification = 'sendRepairDoneAlimtalk'
+  const res = await posComplete(store, r.id)
+  assert.equal(res.status, 200)
+  assert.equal(res.body.notified, false)
+  assert.equal((await prisma.reservation.findUnique({ where: { id: r.id } })).status, 'completed')
+})
+
+testSerial('완료 안내: 완료할 수 없는 상태(대기중)면 문자를 보내지 않는다', async () => {
+  global.__notifications.length = 0
+  const store = await createStore('done-notice-waiting')
+  const r = await calledReservation(store)
+  await prisma.reservation.update({ where: { id: r.id }, data: { status: 'waiting', calledAt: null } })
+  const res = await posComplete(store, r.id)
+  assert.equal(res.status, 409)
+  assert.equal(global.__notifications.filter((n) => n.method === 'sendRepairDoneAlimtalk').length, 0)
 })

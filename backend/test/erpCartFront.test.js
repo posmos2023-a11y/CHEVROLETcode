@@ -29,6 +29,18 @@ process.env.NODE_ENV = 'test'
 process.env.JWT_SECRET = 'local-test-jwt-secret'
 process.env.TOSS_WEBHOOK_SECRET = ''
 
+// 알림(문자) 발송을 가짜로 바꾼다 -- 정비 완료 안내·결제 영수증이 실제 문자 회사로 나가지 않게.
+// 보낸 내용은 global.__notifications에 쌓여 테스트가 확인할 수 있다.
+const __solapi = require('../src/solapi')
+global.__notifications = []
+for (const method of ['sendReservationAlimtalk', 'sendQueueTurnAlimtalk', 'sendReceiptAlimtalk', 'sendRepairDoneAlimtalk', 'sendPromoAlimtalk']) {
+  __solapi[method] = async (payload) => {
+    global.__notifications.push({ method, payload })
+    if (global.__failNotification === method) { global.__failNotification = null; throw new Error('강제 실패(테스트 전용)') }
+    return { ok: true }
+  }
+}
+
 const ERP_TOKEN = 'test-erp-cart-front-token-0000'
 process.env.ERP_API_TOKEN = ERP_TOKEN
 process.env.ERP_STORE_LIMIT_PER_MIN = '1000'
@@ -558,4 +570,66 @@ testSerial('재전송: 취소된 referenceId를 다시 보내면 이전 프론�
   assert.equal(row.payTarget, 'pos')
   assert.equal(row.frontPaymentKey, null)
   assert.equal(row.frontPaymentJson, null)
+})
+
+// --- 결제 영수증 알림톡 ---------------------------------------------------------------
+
+async function linkedFrontCart(label) {
+  const store = await createStore(label)
+  const reservation = await prisma.reservation.create({
+    data: {
+      storeId: store.id, carNumber: '12가3456', phone: '01012345678', serviceType: '엔진오일',
+      queueNumber: 1, serviceDate: new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10), status: 'called',
+    },
+  })
+  const created = await postCart(validBody(store, { payTarget: 'front', carNumber: '12가3456' }))
+  assert.equal(created.body.linkedReservation, true)
+  return { store, reservation, cartId: created.body.cartId }
+}
+
+testSerial('영수증: 예약과 이어진 주문을 프론트에서 결제하면 손님 번호로 영수증이 한 번 간다', async () => {
+  global.__notifications.length = 0
+  const { store, cartId } = await linkedFrontCart('receipt')
+  const paymentKey = newPaymentKey()
+  await startFront(store, cartId, paymentKey)
+  const res = await reportFront(store, cartId, { result: 'paid', paymentKey, payment: SAMPLE_CARD_PAYMENT })
+  assert.equal(res.body.receipt, 'sent', JSON.stringify(res.body))
+  const receipts = global.__notifications.filter((n) => n.method === 'sendReceiptAlimtalk')
+  assert.equal(receipts.length, 1)
+  assert.equal(receipts[0].payload.phone, '01012345678')
+  assert.equal(receipts[0].payload.amount, 65000)
+  assert.equal(receipts[0].payload.carNumber, '12가3456')
+  assert.equal(receipts[0].payload.serviceType, '엔진오일 5W30 (4L) 외 1건')
+  assert.equal(receipts[0].payload.storeName, store.name)
+
+  // 같은 보고를 다시 보내도(프론트 재시도) 영수증은 다시 가지 않는다
+  const again = await reportFront(store, cartId, { result: 'paid', paymentKey, payment: SAMPLE_CARD_PAYMENT })
+  assert.equal(again.body.alreadyProcessed, true)
+  assert.equal(global.__notifications.filter((n) => n.method === 'sendReceiptAlimtalk').length, 1)
+  // 결제 뒤 자동 완료에서는 정비 완료 안내를 보내지 않는다(손님이 이미 카운터에 있다)
+  assert.equal(global.__notifications.filter((n) => n.method === 'sendRepairDoneAlimtalk').length, 0)
+})
+
+testSerial('영수증: 예약과 이어지지 않은 주문은 번호를 모르므로 보내지 않는다', async () => {
+  global.__notifications.length = 0
+  const { store, cartId } = await frontCart('receipt-none')
+  const paymentKey = newPaymentKey()
+  await startFront(store, cartId, paymentKey)
+  const res = await reportFront(store, cartId, { result: 'paid', paymentKey, payment: SAMPLE_CARD_PAYMENT })
+  assert.equal(res.body.status, 'paid')
+  assert.equal(res.body.receipt, 'no_reservation')
+  assert.equal(global.__notifications.filter((n) => n.method === 'sendReceiptAlimtalk').length, 0)
+})
+
+testSerial('영수증: 발송에 실패해도 결제 완료 기록은 그대로다', async () => {
+  global.__notifications.length = 0
+  const { store, cartId } = await linkedFrontCart('receipt-fail')
+  const paymentKey = newPaymentKey()
+  await startFront(store, cartId, paymentKey)
+  global.__failNotification = 'sendReceiptAlimtalk'
+  const res = await reportFront(store, cartId, { result: 'paid', paymentKey, payment: SAMPLE_CARD_PAYMENT })
+  assert.equal(res.status, 200)
+  assert.equal(res.body.receipt, 'failed')
+  const row = await prisma.erpCart.findUnique({ where: { id: cartId } })
+  assert.equal(row.status, 'paid')
 })
