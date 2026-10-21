@@ -105,21 +105,22 @@
       // 않고 영수증 발송만 건너뛴 채 결제완료 안내로 끝낸다(showDeclinedResult).
       function showConsent({ paymentKey, amount }) {
         sdk.template.renderSelectPage({
-          title: '전자영수증을 받으시려면 동의가 필요합니다',
+          // 예약 동의 화면(reservation.html)과 같은 이유로 짧게 줄였다(4가지 고지 항목은 한 줄씩 유지).
+          title: '전자영수증을 받으시려면\n동의가 필요해요',
           subtitle:
-            '수집 항목: 전화번호(예약 시 등록된 차량번호가 있으면 함께 사용)\n' +
-            '수집 목적: 전자영수증 발송, 정비 이력 관리\n' +
-            '보유 기간: 수집일로부터 3년, 이후 지체 없이 파기\n' +
-            '동의를 거부하실 수 있으며, 거부하셔도 결제는 정상 진행됩니다(영수증만 발송되지 않습니다).\n' +
-            '광고성 정보 수신 동의는 선택이며, 거부하셔도 결제·영수증 수신에 제한이 없습니다.',
+            '수집: 전화번호(예약한 차량번호가 있으면 함께)\n' +
+            '목적: 전자영수증 발송, 정비 이력 관리\n' +
+            '보관: 3년 후 파기 · 거부하셔도 결제는 그대로 돼요',
           options: [
             {
-              title: '필수 항목에만 동의하고 계속',
+              title: '동의하고 계속',
+              subtitle: '필수 항목만',
               onClick: () =>
                 askPhoneForReceipt({ paymentKey, amount, consent: { privacyConsent: true, marketingConsent: false } }),
             },
             {
-              title: '필수 + 광고성 정보 수신에 모두 동의',
+              title: '홍보 문자 수신까지 동의',
+              subtitle: '선택 · 할인·이벤트 소식(광고성 정보)',
               onClick: () =>
                 askPhoneForReceipt({ paymentKey, amount, consent: { privacyConsent: true, marketingConsent: true } }),
             },

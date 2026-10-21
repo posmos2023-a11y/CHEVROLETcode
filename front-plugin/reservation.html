@@ -90,22 +90,26 @@
       // 하고 멈춘 것처럼 느꼈다(실제 "안 넘어간다" 문의로 확인). 게다가 select 화면의 onClick에서 또
       // select 화면을 그리는 흐름이라 SDK 렌더가 꼬일 여지도 있었다. 그래서 결제 화면(showDeclinedResult)
       // 과 동일하게, 왜 멈추는지 안내하는 결과 화면을 띄우고 대기화면으로 깔끔하게 빠져나간다.
+      //
+      // 손님이 서서 읽는 화면이라 짧게 줄였다(4가지 고지 항목은 한 줄씩 그대로 담는다). 템플릿은 정렬을
+      // 바꿀 수 없어서(토스 Template API만 허용) 줄 길이를 비슷하게 맞춰 한쪽으로 쏠려 보이지 않게 한다.
+      // 목적에 "정비 완료·결제 안내"를 넣었다 -- [완료] 안내 문자와 결제 영수증을 이 번호로 보낸다.
       function showConsent(carNumber, serviceType) {
         sdk.template.renderSelectPage({
-          title: '순서 안내를 위해 동의가 필요합니다',
+          title: '알림 안내를 위해\n동의가 필요해요',
           subtitle:
-            '수집 항목: 차량번호, 전화번호, 정비 항목\n' +
-            '수집 목적: 예약 접수와 순서 안내(알림톡), 정비 이력 관리\n' +
-            '보유 기간: 수집일로부터 3년, 이후 지체 없이 파기\n' +
-            '동의를 거부하실 수 있으나, 거부하시면 예약 접수와 순서 안내를 해드릴 수 없습니다.\n' +
-            '광고성 정보 수신은 선택이며, 거부하셔도 예약·순서 안내에는 제한이 없습니다.',
+            '수집: 차량번호·전화번호·정비 항목\n' +
+            '목적: 예약·순서·정비 완료·결제 안내, 정비 이력 관리\n' +
+            '보관: 3년 후 파기 · 거부하셔도 직원 안내로 정비받을 수 있어요',
           options: [
             {
-              title: '필수 항목에만 동의하고 계속',
+              title: '동의하고 계속',
+              subtitle: '필수 항목만',
               onClick: () => showPhoneInput(carNumber, serviceType, { privacyConsent: true, marketingConsent: false }),
             },
             {
-              title: '필수 + 광고성 정보 수신에 모두 동의',
+              title: '홍보 문자 수신까지 동의',
+              subtitle: '선택 · 할인·이벤트 소식(광고성 정보)',
               onClick: () => showPhoneInput(carNumber, serviceType, { privacyConsent: true, marketingConsent: true }),
             },
             {
@@ -147,8 +151,8 @@
         sdk.template.renderInputPage({
           type: 'phone',
           top: {
-            title: '전화번호를 입력해주세요',
-            subtitle: errorText || '순서가 되면 알림톡으로 안내드려요',
+            title: '순서 안내를 받을\n전화번호를 입력해주세요',
+            subtitle: errorText || '번호를 끝까지 누르면 바로 접수돼요',
           },
           input: { placeholder: '전화번호 입력' },
           button: { label: '예약 완료' },
