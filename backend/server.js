@@ -2506,16 +2506,11 @@ app.post('/api/pos/erp-carts/:id/refund-withdraw', posIpFloodLimiter, posLimiter
   return res.json({ ok: true, alreadyProcessed: false, status: 'paid' })
 }))
 
-// 취소 완료 기록. method:
-//   'pos'  -- POS 결제 건을 탭앱이 POS SDK로 취소함(또는 POS에서 직접 취소함)
-//   'toss' -- 프론트 결제 건을 탭앱이 토스 결제 ID로 POS SDK에서 바로 취소함. 프론트 SDK로는 취소할 수
-//             없는 결제(페이스페이 등 -- 간편결제 취소는 손님 QR을 다시 찍어야 한다)를 위한 경로라
-//             토스 결제내역과 이어진(토스 확인된) 건만 받는다.
-//   'cash' -- 현금영수증 없는 현금을 돌려줌(기록만)
+// 취소 완료 기록. method: 'pos'(탭앱이 POS SDK로 취소함) | 'cash'(현금영수증 없는 현금을 돌려줌)
 app.post('/api/pos/erp-carts/:id/refunded', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
   const method = req.body?.method
-  if (method !== 'pos' && method !== 'cash' && method !== 'toss') {
-    return res.status(400).json({ ok: false, error: "method는 'pos', 'toss', 'cash' 중 하나여야 합니다." })
+  if (method !== 'pos' && method !== 'cash') {
+    return res.status(400).json({ ok: false, error: "method는 'pos' 또는 'cash'여야 합니다." })
   }
   const cart = await prisma.erpCart.findUnique({ where: { id: req.params.id } })
   if (!cart || cart.storeId !== req.store.id) {
@@ -2541,21 +2536,6 @@ app.post('/api/pos/erp-carts/:id/refunded', posIpFloodLimiter, posLimiter, requi
       return res.status(409).json({ ok: false, error: '결제 완료된 주문만 취소로 기록할 수 있습니다.', status: latest?.status })
     }
     return res.json({ ok: true, alreadyProcessed: false, status: 'refunded', refundedCartIds: ids })
-  }
-
-  if (method === 'toss') {
-    if (cart.payTarget !== 'front') {
-      return res.status(409).json({ ok: false, error: 'POS에서 결제한 주문은 POS 결제 취소로 기록합니다.', payTarget: cart.payTarget })
-    }
-    if (!cart.tossPaymentId) {
-      return res.status(409).json({ ok: false, error: '토스 결제내역과 이어지지 않은 결제라 바로 취소할 수 없습니다.', code: 'NOT_LINKED' })
-    }
-    const changed = await markErpCartRefunded(cart.id, req.store.id, ['paid', 'refund_requested'], '정비 대기열에서 토스 결제 직접 취소')
-    if (!changed) {
-      const latest = await prisma.erpCart.findUnique({ where: { id: cart.id } })
-      return res.status(409).json({ ok: false, error: '결제 완료된 주문만 취소로 기록할 수 있습니다.', status: latest?.status })
-    }
-    return res.json({ ok: true, alreadyProcessed: false, status: 'refunded', refundedCartIds: [cart.id] })
   }
 
   // method === 'cash'

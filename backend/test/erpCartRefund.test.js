@@ -447,45 +447,6 @@ testSerial('POS 취소: 프론트 결제 건은 POS 취소로 기록할 수 없�
   assert.equal(res.status, 409)
 })
 
-testSerial('토스 직접 취소: 토스 결제내역과 이어진 프론트 결제는 정비 대기열에서 바로 취소로 기록된다', async () => {
-  const store = await createStore('toss-direct')
-  const { cartId, referenceId } = await frontPaidCart(store)
-  const tp = tossPayment(store)
-  await webhook('payment.payment.approved.v1', tp)
-  assert.ok((await row(cartId)).tossVerifiedAt)
-
-  const res = await pos(store, 'post', `/api/pos/erp-carts/${cartId}/refunded`, { method: 'toss' })
-  assert.equal(res.status, 200, JSON.stringify(res.body))
-  const cart = await row(cartId)
-  assert.equal(cart.status, 'refunded')
-  assert.equal(cart.refundNote, '정비 대기열에서 토스 결제 직접 취소')
-  assert.equal((await erp.get(referenceId)).body.status, 'refunded')
-
-  // 이어서 토스 취소 웹훅이 와도 문제없다(이미 refunded).
-  const again = await webhook('payment.payment.cancelled.v1', { ...tp, state: 'CANCELLED' })
-  assert.equal(again.status, 200)
-  assert.equal((await row(cartId)).status, 'refunded')
-})
-
-testSerial('토스 직접 취소: 토스 결제내역과 이어지지 않은 건은 거부한다(409 NOT_LINKED)', async () => {
-  const store = await createStore('toss-direct-unlinked')
-  const { cartId } = await frontPaidCart(store)
-  const res = await pos(store, 'post', `/api/pos/erp-carts/${cartId}/refunded`, { method: 'toss' })
-  assert.equal(res.status, 409)
-  assert.equal(res.body.code, 'NOT_LINKED')
-  assert.equal((await row(cartId)).status, 'paid')
-})
-
-testSerial('토스 직접 취소: 취소 요청 중인 건도 바로 취소로 기록할 수 있다', async () => {
-  const store = await createStore('toss-direct-requested')
-  const { cartId } = await frontPaidCart(store)
-  await webhook('payment.payment.approved.v1', tossPayment(store))
-  await pos(store, 'post', `/api/pos/erp-carts/${cartId}/refund-request`)
-  const res = await pos(store, 'post', `/api/pos/erp-carts/${cartId}/refunded`, { method: 'toss' })
-  assert.equal(res.status, 200)
-  assert.equal((await row(cartId)).status, 'refunded')
-})
-
 testSerial('POS 취소: method 값이 틀리면 400', async () => {
   const store = await createStore('refund-bad')
   const cartId = await posPaidCart(store, unique('640'))

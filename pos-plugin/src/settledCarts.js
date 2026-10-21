@@ -20,14 +20,6 @@ const confirming = new Map() // `${action}:${cartId}` -> timeoutId
 const busy = new Set()
 // SDK로 취소를 시도했다가 실패한 POS 결제. 이 카드에는 [POS에서 취소했어요] 버튼을 보여준다.
 const sdkCancelFailed = new Set()
-// 프론트 결제를 토스 결제 ID로 POS에서 바로 취소하려다 실패한 건. 같은 실패를 반복하지 않게 버튼을 숨긴다.
-const tossCancelFailed = new Set()
-
-// 프론트 결제 중 토스 결제내역과 이어진(토스 결제·주문 ID가 있는) 건은 POS SDK로 바로 취소를 시도할 수
-// 있다. 프론트 SDK로는 취소가 막히는 결제(페이스페이 등 간편결제는 손님 QR을 다시 찍어야 한다)를 위한 길이다.
-function canTossCancel(cart) {
-  return cart.payTarget === 'front' && cart.tossPaymentId && cart.tossOrderId && !cart.cashWithoutReceipt && !tossCancelFailed.has(cart.id)
-}
 
 export function initSettledCarts(injected) {
   deps = injected
@@ -94,16 +86,10 @@ function actionsFor(cart) {
 
   if (cart.payTarget === 'front' && cart.status === 'paid') {
     if (cart.cashWithoutReceipt) return button('cash-refund', cart, '현금 환불 처리', '현금을 돌려줬나요?', 'danger')
-    const parts = [button('front-request', cart, '프론트에서 취소', '프론트로 취소 요청할까요?', 'danger')]
-    if (canTossCancel(cart)) parts.push(button('toss-cancel', cart, 'POS에서 바로 취소', '정말 결제 취소할까요?', 'danger'))
-    return parts.join('')
+    return button('front-request', cart, '프론트에서 취소', '프론트로 취소 요청할까요?', 'danger')
   }
 
-  if (cart.status === 'refund_requested') {
-    const parts = [button('front-withdraw', cart, '취소 요청 철회', '요청을 철회할까요?')]
-    if (canTossCancel(cart)) parts.push(button('toss-cancel', cart, 'POS에서 바로 취소', '정말 결제 취소할까요?', 'danger'))
-    return parts.join('')
-  }
+  if (cart.status === 'refund_requested') return button('front-withdraw', cart, '취소 요청 철회', '요청을 철회할까요?')
   return ''
 }
 
@@ -192,7 +178,6 @@ async function run(action, cartId) {
   render()
   try {
     if (action === 'pos-cancel') return await cancelOnPos(cart)
-    if (action === 'toss-cancel') return await cancelFrontPaymentOnPos(cart)
     if (action === 'pos-recorded') return await recordRefund(cart, 'pos', 'POS 결제 취소를 기록했습니다.')
     if (action === 'cash-refund') return await recordRefund(cart, 'cash', '현금 환불로 기록했습니다.')
     if (action === 'front-request') {
@@ -227,30 +212,6 @@ async function cancelOnPos(cart) {
   }
   // 결제는 이미 취소됐다. 기록이 실패해도 토스 취소 웹훅이 오면 서버가 맞춘다.
   await recordRefund(cart, 'pos', '결제를 취소했습니다.')
-}
-
-// 프론트 결제를 토스 결제·주문 ID로 POS SDK에서 바로 취소한다. 프론트에서 결제한 건도 토스에는 같은
-// 매장의 결제로 남으므로(웹훅으로 ID를 받았다) POS에서 취소가 되는지 시험하는 경로다. 안 되면 결제는
-// 그대로이고, [프론트에서 취소]나 토스 POS 결제내역에서 취소하면 된다.
-async function cancelFrontPaymentOnPos(cart) {
-  try {
-    await posPluginSdk.payment.cancel({ id: cart.tossOrderId }, { id: cart.tossPaymentId })
-  } catch (e) {
-    tossCancelFailed.add(cart.id)
-    deps.notify(
-      'error',
-      `POS에서 바로 취소하지 못했습니다. [프론트에서 취소]로 하거나 토스 POS 결제내역에서 취소해주세요. (${e?.message || e})`
-    )
-    return
-  }
-  // 결제는 이미 취소됐다. 기록이 실패해도 토스 취소 웹훅이 오면 서버가 맞춘다.
-  const res = await post(`/api/pos/erp-carts/${cart.id}/refunded`, { method: 'toss' })
-  if (!res.ok) {
-    deps.notify('error', `결제는 취소됐지만 기록하지 못했습니다. 잠시 뒤 자동으로 맞춰집니다. (${res.body.error || res.status})`)
-    return
-  }
-  markLocal([cart.id], { status: 'refunded', refundNote: '정비 대기열에서 토스 결제 직접 취소', refundedAt: new Date().toISOString() })
-  deps.notify('success', '결제를 취소했습니다.')
 }
 
 async function recordRefund(cart, method, successMessage) {
