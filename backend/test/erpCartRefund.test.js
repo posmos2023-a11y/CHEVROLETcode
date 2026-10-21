@@ -241,6 +241,55 @@ testSerial('매핑: 취소 웹훅이 프론트 보고보다 먼저 왔으면 보
   assert.equal((await row(cartId)).status, 'refunded')
 })
 
+// 현금영수증 없는 현금은 프론트가 승인번호를 받지 못한다 -- 같은 매장·금액·최근 현금 1건이면 잇는다.
+async function frontCashCart(store, totalAmount = 45000) {
+  return frontPaidCart(store, { paymentMethod: 'CASH', isCashReceipt: false, approvalNumber: null, totalAmount })
+}
+
+testSerial('매핑(현금): 프론트 보고 후 현금 웹훅이 오면 같은 금액 1건으로 잇는다', async () => {
+  const store = await createStore('cash-after')
+  const { cartId } = await frontCashCart(store)
+  const tp = tossPayment(store, { sourceType: 'CASH', paymentMethod: 'CASH', approvedNo: '00000000' })
+  await webhook('payment.payment.approved.v1', tp)
+  const cart = await row(cartId)
+  assert.equal(cart.tossPaymentId, tp.id)
+  assert.ok(cart.tossVerifiedAt)
+})
+
+testSerial('매핑(현금): 현금 웹훅이 먼저 오고 프론트 보고가 나중이어도 잇는다', async () => {
+  const store = await createStore('cash-before')
+  const tp = tossPayment(store, { sourceType: 'CASH', paymentMethod: 'CASH', approvedNo: '00000000' })
+  await webhook('payment.payment.approved.v1', tp)
+  const { cartId } = await frontCashCart(store)
+  assert.equal((await row(cartId)).tossPaymentId, tp.id)
+})
+
+testSerial('매핑(현금): 같은 금액 현금 결제가 둘이면 애매하므로 잇지 않는다', async () => {
+  const store = await createStore('cash-ambiguous')
+  const a = await frontCashCart(store)
+  const b = await frontCashCart(store)
+  await webhook('payment.payment.approved.v1', tossPayment(store, { sourceType: 'CASH', approvedNo: '00000000' }))
+  assert.equal((await row(a.cartId)).tossPaymentId, null)
+  assert.equal((await row(b.cartId)).tossPaymentId, null)
+})
+
+testSerial('매핑(현금): 카드 결제 웹훅은 승인번호가 안 맞으면 같은 금액의 현금 주문과 잇지 않는다', async () => {
+  const store = await createStore('cash-vs-card')
+  const { cartId } = await frontCashCart(store)
+  await webhook('payment.payment.approved.v1', tossPayment(store, { sourceType: 'CARD', approvedNo: '12121212' }))
+  assert.equal((await row(cartId)).tossPaymentId, null)
+})
+
+testSerial('매핑(현금): 이미 다른 주문에 이어진 현금 결제는 다시 쓰지 않는다', async () => {
+  const store = await createStore('cash-taken')
+  const tp = tossPayment(store, { sourceType: 'CASH', approvedNo: '00000000' })
+  const first = await frontCashCart(store)
+  await webhook('payment.payment.approved.v1', tp)
+  assert.equal((await row(first.cartId)).tossPaymentId, tp.id)
+  const second = await frontCashCart(store)
+  assert.equal((await row(second.cartId)).tossPaymentId, null)
+})
+
 testSerial('웹훅 서명: 서버 비밀키 끝에 줄바꿈이 붙어 있어도 토스가 보낸 서명을 통과시킨다', async () => {
   const store = await createStore('sig-newline')
   const secret = 'GA1k8THAGeGihd_Z0rW0MqpRTDQGYIktHBfmCWbsZn0'

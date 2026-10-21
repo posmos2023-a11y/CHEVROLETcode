@@ -1077,6 +1077,11 @@ async function markErpCartFrontPaid(id, paymentKey, paymentJson, approvalNo) {
 
 const PAID_LIKE_STATUSES = ['paid', 'refund_requested', 'refunding']
 
+// 승인번호 없이(같은 매장·같은 금액으로) 이을 때 허용하는 시각 차이. 프론트 결제 보고와 토스 웹훅은
+// 보통 몇 초 안에 오지만, 네트워크 재시도·웹훅 재전송을 감안해 넉넉히 둔다. 그 안에 같은 금액 건이
+// 둘 이상이면 잇지 않는다.
+const NO_APPROVAL_MATCH_WINDOW_MS = 10 * 60 * 1000
+
 function toDateOrNull(value) {
   if (!value) return null
   const d = new Date(value)
@@ -1116,18 +1121,41 @@ async function linkErpCartsToTossPayment(tossPayment) {
     return byId
   }
 
-  if (!tossPayment.storeId || !tossPayment.approvedNo || tossPayment.amount === null) return []
-  const candidates = await prisma.erpCart.findMany({
-    where: {
-      storeId: tossPayment.storeId,
-      payTarget: 'front',
-      frontApprovalNo: tossPayment.approvedNo,
-      totalAmount: tossPayment.amount,
-      tossPaymentId: null,
-      status: { in: [...PAID_LIKE_STATUSES, 'refunded'] },
-    },
-    take: 2,
-  })
+  if (!tossPayment.storeId || tossPayment.amount === null) return []
+  let candidates = []
+  if (tossPayment.approvedNo) {
+    candidates = await prisma.erpCart.findMany({
+      where: {
+        storeId: tossPayment.storeId,
+        payTarget: 'front',
+        frontApprovalNo: tossPayment.approvedNo,
+        totalAmount: tossPayment.amount,
+        tossPaymentId: null,
+        status: { in: [...PAID_LIKE_STATUSES, 'refunded'] },
+      },
+      take: 2,
+    })
+  }
+  if (candidates.length === 0 && tossPayment.sourceType === 'CASH') {
+    // 프론트가 승인번호를 받지 못한 현금 결제(현금영수증 없음)는 승인번호로 이을 수 없다.
+    // 같은 매장·같은 금액·가까운 시각에 결제된 현금 건이 정확히 1건일 때만 잇는다. 현금으로
+    // 한정하는 이유: 아직 보고가 안 들어온 같은 금액의 카드 결제를 엉뚱하게 가져가지 않게 하려고.
+    const recent = await prisma.erpCart.findMany({
+      where: {
+        storeId: tossPayment.storeId,
+        payTarget: 'front',
+        frontApprovalNo: null,
+        totalAmount: tossPayment.amount,
+        tossPaymentId: null,
+        status: { in: [...PAID_LIKE_STATUSES, 'refunded'] },
+        paidAt: { gte: new Date(Date.now() - NO_APPROVAL_MATCH_WINDOW_MS) },
+      },
+      take: 5,
+    })
+    candidates = recent.filter((c) => {
+      try { return JSON.parse(c.frontPaymentJson || '{}').paymentMethod === 'CASH' } catch { return false }
+    })
+  }
   if (candidates.length !== 1) return []
   const updated = await prisma.erpCart.updateMany({
     where: { id: candidates[0].id, tossPaymentId: null },
@@ -1137,17 +1165,39 @@ async function linkErpCartsToTossPayment(tossPayment) {
 }
 
 // 프론트 결제 보고가 웹훅보다 늦게 온 경우: 이미 받아둔 토스 결제 중 이 주문과 맞는 것을 찾아 잇는다.
-async function linkFrontCartToRecordedTossPayment(cart) {
-  if (!cart.frontApprovalNo) return null
-  const candidates = await prisma.tossPayment.findMany({
-    where: { storeId: cart.storeId, approvedNo: cart.frontApprovalNo, amount: cart.totalAmount },
-    take: 2,
-  })
+async function linkFrontCartToRecordedTossPayment(cart, paymentMethod) {
+  let candidates
+  if (cart.frontApprovalNo) {
+    candidates = await prisma.tossPayment.findMany({
+      where: { storeId: cart.storeId, approvedNo: cart.frontApprovalNo, amount: cart.totalAmount },
+      take: 2,
+    })
+  } else if (paymentMethod === 'CASH') {
+    // 승인번호가 없는 현금 결제: 같은 매장·같은 금액·최근 현금 결제 중 아직 어떤 주문과도 이어지지
+    // 않은 것이 정확히 1건일 때만 잇는다(linkErpCartsToTossPayment의 현금 기준과 같다).
+    candidates = await prisma.tossPayment.findMany({
+      where: {
+        storeId: cart.storeId,
+        amount: cart.totalAmount,
+        sourceType: 'CASH',
+        createdAt: { gte: new Date(Date.now() - NO_APPROVAL_MATCH_WINDOW_MS) },
+      },
+      take: 5,
+    })
+  } else {
+    return null
+  }
+  // 이미 다른 주문에 이어진 토스 결제는 후보에서 뺀다.
+  if (candidates.length) {
+    const linked = await prisma.erpCart.findMany({
+      where: { tossPaymentId: { in: candidates.map((p) => p.id) }, NOT: { id: cart.id } },
+      select: { tossPaymentId: true },
+    })
+    const taken = new Set(linked.map((l) => l.tossPaymentId))
+    candidates = candidates.filter((p) => !taken.has(p.id))
+  }
   if (candidates.length !== 1) return null
   const tp = candidates[0]
-  // 그 토스 결제가 이미 다른 주문에 이어져 있으면 잇지 않는다.
-  const taken = await prisma.erpCart.count({ where: { tossPaymentId: tp.id, NOT: { id: cart.id } } })
-  if (taken) return null
   await prisma.erpCart.updateMany({
     where: { id: cart.id, tossPaymentId: null },
     data: { tossPaymentId: tp.id, tossOrderId: tp.orderId, tossVerifiedAt: new Date() },

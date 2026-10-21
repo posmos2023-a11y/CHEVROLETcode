@@ -1675,6 +1675,24 @@ async function processWebhookPayment(body, webhookId) {
       }
       return
     }
+    // 잇지 못했다. 전산과 무관한 일반 결제일 수도 있고, 프론트 보고가 아직 안 왔을 수도 있다(그러면
+    // 보고 때 이어진다). 끝내 안 이어지면 이 로그로 승인번호·금액·결제수단을 최근 프론트 결제와 비교한다.
+    if (mappedStore && eventType === 'payment.payment.approved.v1') {
+      const recentFront = await prisma.erpCart.findMany({
+        where: { storeId: mappedStore.id, payTarget: 'front', paidAt: { gte: new Date(Date.now() - 30 * 60 * 1000) } },
+        orderBy: { paidAt: 'desc' },
+        take: 5,
+        select: { id: true, frontApprovalNo: true, totalAmount: true, status: true, tossPaymentId: true, frontPaymentJson: true },
+      })
+      logger.info('[webhook] 결제 승인을 전산 주문과 잇지 못함', {
+        webhookId,
+        toss: { id: tossPayment.id, approvedNo: tossPayment.approvedNo, amount: tossPayment.amount, sourceType: tossPayment.sourceType, paymentMethod: payment.paymentMethod },
+        recentFront: recentFront.map((c) => ({
+          cartId: c.id, approvalNo: c.frontApprovalNo, amount: c.totalAmount, status: c.status, linked: Boolean(c.tossPaymentId),
+          method: (() => { try { return JSON.parse(c.frontPaymentJson || '{}').paymentMethod || null } catch { return null } })(),
+        })),
+      })
+    }
   }
 
   if (eventType === 'payment.payment.approved.v1') {
@@ -2679,7 +2697,14 @@ app.post('/api/front/erp-carts/:id/result', posIpFloodLimiter, posLimiter, requi
 
     // 토스 웹훅이 이 보고보다 먼저 와 있었다면 지금 잇는다. 매핑 실패는 결제 기록을 막지 않는다.
     try {
-      await linkFrontCartToRecordedTossPayment({ ...cart, frontApprovalNo: payment.approvalNumber })
+      const linked = await linkFrontCartToRecordedTossPayment({ ...cart, frontApprovalNo: payment.approvalNumber }, payment.paymentMethod)
+      if (!linked) {
+        // 웹훅이 아직 안 왔을 수도 있다(그러면 웹훅이 올 때 이어진다). 끝내 안 이어지면 이 로그와
+        // 웹훅 쪽 로그의 승인번호·금액·결제수단을 비교해 원인을 찾는다. 승인번호·금액은 개인정보가 아니다.
+        logger.info('[front] 결제 보고 시점에 토스 결제와 잇지 못함(웹훅 대기)', {
+          cartId: cart.id, approvalNo: payment.approvalNumber, amount: cart.totalAmount, paymentMethod: payment.paymentMethod,
+        })
+      }
     } catch (e) {
       logger.error('[front] 토스 결제 매핑 실패', { cartId: cart.id, error: e.message })
     }
