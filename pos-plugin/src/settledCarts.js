@@ -1,4 +1,4 @@
-// 오늘 결제된 전산 주문과 결제 취소.
+// 최근 7일 결제된 전산 주문과 결제 취소.
 //
 // 결제한 곳에서만 취소할 수 있다:
 //   - POS 결제: posPluginSdk.payment.cancel로 직접 취소를 시도한다. SDK 문서에는 카드·현금 결제 취소를
@@ -13,7 +13,6 @@
 import { posPluginSdk } from '@tossplace/pos-plugin-sdk'
 
 const listEl = document.getElementById('settled-cart-list')
-const sectionEl = document.getElementById('settled-cart-section')
 
 let deps = null
 let lastCarts = []
@@ -38,9 +37,15 @@ function formatWon(value) {
   return `${Number(value || 0).toLocaleString('ko-KR')}원`
 }
 
+// 오늘이면 시각만, 그 전이면 날짜까지 보여준다(최근 7일 목록이라 날짜가 섞인다).
 function formatTime(value) {
   if (!value) return ''
-  return new Intl.DateTimeFormat('ko-KR', { hour: '2-digit', minute: '2-digit' }).format(new Date(value))
+  const d = new Date(value)
+  const sameDay = d.toDateString() === new Date().toDateString()
+  const opts = sameDay
+    ? { hour: '2-digit', minute: '2-digit' }
+    : { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }
+  return new Intl.DateTimeFormat('ko-KR', opts).format(d)
 }
 
 const METHOD_LABEL = { CARD: '카드', CASH: '현금', BARCODE: '간편결제' }
@@ -90,7 +95,17 @@ function actionsFor(cart) {
 
 function render() {
   if (!listEl) return
-  if (sectionEl) sectionEl.hidden = lastCarts.length === 0
+  // 비어 있어도 칸은 남긴다 -- 숨기면 결제 취소를 어디서 하는지 찾을 수 없다.
+  if (!lastCarts.length) {
+    listEl.innerHTML = `
+      <div class="empty">
+        <div class="empty-mark" aria-hidden="true">✓</div>
+        <div class="empty-title">최근 결제한 전산 주문이 없습니다</div>
+        <div class="empty-copy">전산 주문을 결제하면 이곳에 표시되고, 여기서 취소할 수 있습니다.</div>
+      </div>
+    `
+    return
+  }
   listEl.innerHTML = lastCarts
     .map((cart) => {
       const s = statusLabel(cart)

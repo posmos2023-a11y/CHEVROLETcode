@@ -378,7 +378,18 @@ testSerial('POS 취소: method 값이 틀리면 400', async () => {
   assert.equal((await pos(store, 'post', `/api/pos/erp-carts/${cartId}/refunded`, { method: 'card' })).status, 400)
 })
 
-// --- 정비 대기열 "오늘 결제" 목록 ------------------------------------------------------
+// --- 정비 대기열 "최근 결제" 목록 ------------------------------------------------------
+
+testSerial('최근 결제 목록: 최근 7일 결제는 나오고 그보다 오래된 결제는 나오지 않는다', async () => {
+  const store = await createStore('settled-window')
+  const recent = await posPaidCart(store, unique('640'))
+  const old = await posPaidCart(store, unique('640'))
+  const day = 24 * 60 * 60 * 1000
+  await prisma.erpCart.update({ where: { id: recent }, data: { paidAt: new Date(Date.now() - 3 * day) } })
+  await prisma.erpCart.update({ where: { id: old }, data: { paidAt: new Date(Date.now() - 8 * day) } })
+  const queue = await pos(store, 'get', '/api/pos/queue')
+  assert.deepEqual(queue.body.settledCarts.map((c) => c.id), [recent])
+})
 
 testSerial('오늘 결제 목록: 결제·취소된 주문이 품목, 결제 위치, 함께 결제된 건수와 함께 내려온다', async () => {
   const store = await createStore('settled')

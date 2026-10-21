@@ -996,6 +996,9 @@ async function rejectPosAuthFailure(req, res, unauthorizedBody) {
 // (계약 v3 §4.1~4.2). 응답 최상위 serviceDate(오늘 날짜)는 그대로 유지하고, 각 item에도
 // serviceDate를 실어보내 POS 화면이 "오늘 최상위 serviceDate와 다르면 이월 건"으로 배지를 붙일 수
 // 있게 한다.
+// 정비 대기열 "최근 결제" 목록이 오늘 말고 며칠 전까지 보여줄지. 6이면 오늘 포함 7일.
+const SETTLED_LOOKBACK_DAYS_BEFORE_TODAY = 6
+
 app.get('/api/pos/queue', posIpFloodLimiter, posQueueReadLimiter, requireStoreToken, asyncHandler(async (req, res) => {
   const serviceDate = kstDateString()
   // 대기열과 전산 장바구니를 한 응답에 함께 담는다. 예전에는 탭앱이 두 경로를 각각 폴링해서
@@ -1005,7 +1008,8 @@ app.get('/api/pos/queue', posIpFloodLimiter, posQueueReadLimiter, requireStoreTo
     listActiveQueueForStore(req.store.id, serviceDate),
     loadPendingErpCartsForResponse(req.store.id),
     listFrontErpCartsForPos(req.store.id, 20),
-    listSettledErpCartsForPos(req.store.id, kstDateRangeUtc(serviceDate).start, 30),
+    // 최근 7일(오늘 포함, KST 자정 기준). 정비 후 며칠 지나 환불을 요청하는 손님도 있다.
+    listSettledErpCartsForPos(req.store.id, new Date(kstDateRangeUtc(serviceDate).start.getTime() - SETTLED_LOOKBACK_DAYS_BEFORE_TODAY * 24 * 60 * 60 * 1000), 50),
   ])
   // 같은 POS 결제로 함께 결제된 주문 수. 그 결제를 취소하면 전부 취소되므로 탭앱이 미리 알려야 한다.
   const sharedCount = new Map()
@@ -1034,7 +1038,7 @@ app.get('/api/pos/queue', posIpFloodLimiter, posQueueReadLimiter, requireStoreTo
         createdAt: row.createdAt,
       }
     }),
-    // 오늘 결제된 전산 주문(결제 완료·취소 진행·취소됨). 정비 대기열의 결제 취소는 여기서 한다.
+    // 최근 7일 결제된 전산 주문(결제 완료·취소 진행·취소됨). 정비 대기열의 결제 취소는 여기서 한다.
     // 구버전 탭앱은 이 필드를 무시한다.
     settledCarts: settledRows.map((row) => {
       let items = []
