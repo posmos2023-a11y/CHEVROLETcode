@@ -51,6 +51,12 @@
           showMessage('error', status === 401 ? '매장 토큰이 올바르지 않습니다' : '주문을 불러오지 못했습니다', body.error)
           return
         }
+        // 정비 대기열에서 요청한 결제 취소가 있으면 먼저 처리한다(손님이 환불받으러 프론트 앞에 와 있다).
+        const refunds = (body.refunds || []).filter((r) => !pay.isSnoozed(`refund:${r.id}`))
+        if (refunds.length) {
+          showRefund(token, refunds[0])
+          return
+        }
         const carts = (body.carts || []).filter((c) => !pay.isSnoozed(c.id))
         if (!carts.length) {
           goHome()
@@ -177,6 +183,100 @@
             pay.snooze(cart.id)
             goHome()
           },
+        })
+      }
+
+      // --- 결제 취소 ---------------------------------------------------------------
+      // 정비 대기열(POS 탭앱)에서 [프론트에서 취소]를 누르면 여기로 온다. 카드 결제는 결제했던 카드를
+      // 다시 꽂아야 한다(NICE VAN 카드는 카드 없이 취소된다 -- erp-front-pay.js requestRefund).
+      function showRefund(token, item) {
+        const isCard = item.refund.paymentMethod === 'CARD' || item.refund.paymentMethod === 'BARCODE'
+        sdk.template.renderSelectPage({
+          title: '결제를 취소합니다',
+          subtitle: `${cartTitle(item)} · ${pay.formatWon(item.totalAmount)}` +
+            (isCard ? '\n결제했던 카드(또는 간편결제)를 준비해주세요.' : ''),
+          options: [
+            { title: '취소 진행하기', onClick: () => runRefund(token, item) },
+            {
+              title: '나중에 하기',
+              onClick: () => {
+                pay.snooze(`refund:${item.id}`)
+                goHome()
+              },
+            },
+          ],
+          onBack: () => {
+            pay.snooze(`refund:${item.id}`)
+            goHome()
+          },
+        })
+      }
+
+      async function runRefund(token, item) {
+        const started = await pay.startRefund(token, item.id)
+        if (!started.ok) {
+          showMessage('error', '취소를 시작하지 못했습니다', started.body.error || '정비 대기열에서 상태를 확인해주세요.')
+          return
+        }
+        const refund = started.body.refund || item.refund
+        // 취소창을 띄우기 **전에** 기록한다(결제와 같은 이유 -- 도중 재시작돼도 결과를 복구한다).
+        await pay.saveRefundInflight({ cartId: item.id, paymentKey: refund.paymentKey })
+
+        let result
+        try {
+          result = await pay.requestRefund(refund)
+        } catch (err) {
+          console.error('[erp-pay] 결제 취소 요청 예외', err)
+          const recovered = await pay.recoverRefundInflight(token)
+          if (recovered === 'refunded') showRefunded(item)
+          else if (recovered === 'released') showMessage('error', '결제 취소가 완료되지 않았습니다', '다시 시도하려면 직원에게 알려주세요.')
+          else showMessage('error', '취소 상태를 확인하지 못했습니다', '직원에게 알려주세요. 취소됐는지 확인이 필요합니다.', 8000)
+          return
+        }
+
+        if (result.type === 'SUCCESS') {
+          const res = await pay.reportRefund(token, item.id, { result: 'refunded' })
+          if (res.ok || (res.status >= 400 && res.status < 500)) await pay.clearRefundInflight()
+          // 보고가 끝내 실패하면 기록을 남겨두고 다음에 대기화면이 켜질 때 다시 보고한다.
+          showRefunded(item)
+          return
+        }
+
+        const failed = result.type !== 'CANCELED' && result.type !== 'TIMEOUT'
+        const res = await pay.reportRefund(token, item.id, {
+          result: failed ? 'failed' : 'cancelled',
+          errorMessage: failed ? `프론트 결제 취소 실패(${result.type})` : undefined,
+        })
+        if (res.ok || (res.status >= 400 && res.status < 500)) await pay.clearRefundInflight()
+        sdk.template.renderSelectPage({
+          title: failed ? '결제 취소에 실패했습니다' : '결제 취소를 중단했습니다',
+          subtitle: `${cartTitle(item)} · ${pay.formatWon(item.totalAmount)}`,
+          options: [
+            { title: '다시 시도하기', onClick: () => runRefund(token, item) },
+            {
+              title: '처음 화면으로',
+              onClick: () => {
+                pay.snooze(`refund:${item.id}`)
+                goHome()
+              },
+            },
+          ],
+          onBack: () => {
+            pay.snooze(`refund:${item.id}`)
+            goHome()
+          },
+        })
+      }
+
+      function showRefunded(item) {
+        sdk.template.renderResultPage({
+          type: 'text',
+          text: pay.formatWon(item.totalAmount),
+          title: '결제가 취소되었습니다',
+          description: `${cartTitle(item)} 결제를 취소했습니다.`,
+          timerMs: 5000,
+          onTimeout: goHome,
+          localeCode: 'ko',
         })
       }
 

@@ -6,6 +6,8 @@ import { posPluginSdk } from '@tossplace/pos-plugin-sdk'
 // 전산(ERP)이 담아둔 장바구니를 POS로 옮기는 화면. 대기열 폴링/토큰 화면과 관심사가 달라
 // 별도 파일로 뒀다 — app.js에서는 초기화와 "같은 폴링 타이머에서 같이 불러오기"만 담당한다.
 import { initErpCarts, refreshErpCarts, applyErpCarts, applyFrontCarts } from './erpCarts.js'
+// 오늘 결제된 전산 주문과 결제 취소. 같은 대기열 폴링 응답(settledCarts)으로 갱신한다.
+import { initSettledCarts, applySettledCarts } from './settledCarts.js'
 // 차량번호로 지난 정비 내역을 보는 화면. 정비소에서 가장 자주 나오는 질문이라 대기 카드에서
 // 바로 열 수 있게 해뒀다.
 import { initHistory, openHistoryFor, loadRecentHistory } from './history.js'
@@ -432,6 +434,7 @@ async function loadQueue({ manual = false, bypassGuard = false } = {}) {
       // 프론트 결제 대기 목록을 먼저 반영한다 -- 방금 프론트로 넘긴 카드를 기억하는 목록(sentToFront)이
       // 여기서 정리되므로, 그 뒤에 그려야 POS 목록이 최신 기준으로 걸러진다.
       applyFrontCarts(body.frontCarts)
+      applySettledCarts(body.settledCarts)
       applyErpCarts(body.erpCarts)
       updateBadges({ erpCarts: body.erpCarts.length })
       notifyNewErpCarts(body.erpCarts)
@@ -636,6 +639,7 @@ async function main() {
 // 401 처리(handleUnauthorized)를 그대로 주입받아 쓴다 — 같은 로직이 두 파일에 따로 생기는 것을
 // 막기 위해서다.
 initErpCarts({ apiGet, apiPost, notify, escapeHtml, onUnauthorized: handleUnauthorized })
+initSettledCarts({ apiPost, notify, escapeHtml, onUnauthorized: handleUnauthorized })
 initHistory({ apiGet, apiPost, notify, escapeHtml, onUnauthorized: handleUnauthorized })
 initNav({ notify })
 

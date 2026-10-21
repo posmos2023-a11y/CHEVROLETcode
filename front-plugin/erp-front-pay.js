@@ -117,8 +117,12 @@
       timestamp: source.timestamp,
       installment: detail?.installment ?? 0,
       vanTransactionKey: r.vanTransactionKey,
+      // VAN은 취소 방식을 고르는 데 쓴다(NICE 카드는 카드 없이 취소 가능).
+      van: source.van,
       tid: r.tid,
       isCashReceipt: method === 'CASH' ? Boolean(r.cash?.isCashReceipt) : undefined,
+      // 현금영수증 자진발급 건은 취소할 때 같은 값을 넘겨야 번호 입력 없이 취소된다.
+      isSelfIssuance: cashReceipt ? Boolean(cashReceipt.isSelfIssuance) : undefined,
       easyPayProvider: r.easyPay?.provider,
     }
   }
@@ -195,6 +199,83 @@
     return 'pending'
   }
 
+  // --- 결제 취소(정비 대기열에서 [프론트에서 취소]를 누른 건) ---------------------------
+  // 결제와 같은 구조다: 서버가 취소 요청을 내려주고, 이 프론트가 잡은 뒤(refund-start) SDK로 취소하고
+  // 결과를 보고한다. 취소 도중 재시작되면 sdk.payment.getPaymentCancel로 결과를 다시 읽어 보고한다.
+  const REFUND_INFLIGHT_KEY = 'chevrolet_front_refund_inflight'
+
+  function startRefund(token, cartId) {
+    return api('POST', `/api/front/erp-carts/${encodeURIComponent(cartId)}/refund-start`, token)
+  }
+
+  async function reportRefund(token, cartId, body) {
+    let last = { ok: false, status: 0, body: {} }
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      last = await api('POST', `/api/front/erp-carts/${encodeURIComponent(cartId)}/refund-result`, token, body)
+      if (last.ok) return last
+      if (last.status >= 400 && last.status < 500) return last
+      await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)))
+    }
+    return last
+  }
+
+  // 원거래와 같은 값으로 취소를 요청한다. NICE VAN 카드 결제는 카드 없이(무카드) 취소할 수 있다.
+  function requestRefund(refund) {
+    const base = {
+      paymentKey: refund.paymentKey,
+      tax: refund.tax,
+      supplyValue: refund.supplyValue,
+      tip: 0,
+      timestamp: refund.timestamp,
+      approvalNumber: refund.approvalNumber,
+      installment: refund.installment || 0,
+      timeoutMs: 60000,
+      localeCode: 'ko',
+    }
+    if (refund.paymentMethod === 'CARD' && refund.van === 'NICE' && refund.vanTransactionKey && sdk.payment.requestCardlessPaymentCancel) {
+      return sdk.payment.requestCardlessPaymentCancel({ ...base, paymentMethod: 'CARD', vanTransactionKey: refund.vanTransactionKey })
+    }
+    const params = { ...base, paymentMethod: refund.paymentMethod }
+    if (refund.paymentMethod === 'CASH') params.isSelfIssuance = Boolean(refund.isSelfIssuance)
+    return sdk.payment.requestPaymentCancel(params)
+  }
+
+  async function saveRefundInflight(record) {
+    await storageSet(REFUND_INFLIGHT_KEY, JSON.stringify({ ...record, at: Date.now() }))
+  }
+
+  function clearRefundInflight() {
+    return storageRemove(REFUND_INFLIGHT_KEY)
+  }
+
+  // 반환: 'none' | 'refunded' | 'released' | 'pending'
+  async function recoverRefundInflight(token) {
+    const raw = await storageGet(REFUND_INFLIGHT_KEY)
+    if (!raw) return 'none'
+    let inflight
+    try { inflight = JSON.parse(raw) } catch { await clearRefundInflight(); return 'none' }
+    if (!inflight?.cartId || !inflight?.paymentKey) { await clearRefundInflight(); return 'none' }
+
+    let result
+    try {
+      result = await sdk.payment.getPaymentCancel({ paymentKey: inflight.paymentKey })
+    } catch (e) {
+      if (String(e?.message || e).includes('PAYMENT_NOT_FOUND')) {
+        const res = await reportRefund(token, inflight.cartId, { result: 'cancelled' })
+        if (res.ok || (res.status >= 400 && res.status < 500)) { await clearRefundInflight(); return 'released' }
+        return 'pending'
+      }
+      console.warn('[erp-front-pay] 지난 결제 취소 확인 실패, 다음에 다시 확인합니다.', e)
+      return 'pending'
+    }
+    const res = await reportRefund(token, inflight.cartId, { result: result?.type === 'SUCCESS' ? 'refunded' : 'cancelled' })
+    if (res.ok || (res.status >= 400 && res.status < 500)) {
+      await clearRefundInflight()
+      return result?.type === 'SUCCESS' ? 'refunded' : 'released'
+    }
+    return 'pending'
+  }
+
   // 손님이 "처음 화면으로"를 고른 주문은 잠시 대기화면에서 다시 띄우지 않는다. 안 그러면 대기화면이
   // 폴링하자마자 같은 주문 화면으로 되돌아가 빠져나갈 수 없다.
   const SNOOZE_KEY = 'chevrolet_front_pay_snooze'
@@ -235,6 +316,12 @@
     saveInflight,
     clearInflight,
     recoverInflight,
+    startRefund,
+    reportRefund,
+    requestRefund,
+    saveRefundInflight,
+    clearRefundInflight,
+    recoverRefundInflight,
     snooze,
     isSnoozed,
     formatWon,

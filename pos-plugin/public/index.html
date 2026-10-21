@@ -438,6 +438,56 @@
     color: #6b3fd4;
   }
 
+  /* 오늘 결제(settledCarts.js) */
+  .settled-status {
+    display: inline-flex;
+    align-items: center;
+    min-height: 21px;
+    padding: 0 7px;
+    border-radius: 7px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: -0.03em;
+    background: var(--green-soft);
+    color: #008b5a;
+  }
+  .settled-status.pending { background: #fff5dc; color: #8a6100; }
+  .settled-status.paying { background: #f3ecff; color: #6b3fd4; }
+  .settled-status.refunded { background: var(--red-soft); color: var(--red); }
+
+  .settled-verified {
+    display: inline-flex;
+    align-items: center;
+    min-height: 21px;
+    padding: 0 7px;
+    border-radius: 7px;
+    background: var(--blue-soft, #eaf3ff);
+    color: #1b64da;
+    font-size: 11px;
+    font-weight: 700;
+  }
+
+  .settled-cart-item.is-refunded .erp-cart-total { color: var(--sub); text-decoration: line-through; }
+  .settled-error { color: var(--red); }
+
+  .settled-action {
+    flex: 1 1 auto;
+    min-height: 44px;
+    margin-top: 8px;
+    padding: 0 14px;
+    border: 1px solid var(--line);
+    border-radius: 13px;
+    background: var(--surface);
+    color: var(--sub);
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: -0.03em;
+    cursor: pointer;
+  }
+  .settled-action.danger { color: var(--red); }
+  .settled-action:disabled { opacity: 0.5; cursor: wait; }
+  .settled-action.confirming { border-color: var(--red); background: var(--red); color: #fff; }
+
   .front-cart-section { margin-top: 20px; }
   .front-cart-section[hidden] { display: none; }
 
@@ -1252,6 +1302,17 @@
             </div>
           </div>
           <div class="list" id="front-cart-list"></div>
+        </section>
+
+        <!-- 오늘 결제된 전산 주문과 결제 취소. 비어 있으면 숨긴다(settledCarts.js). -->
+        <section class="erp-cart-section front-cart-section" id="settled-cart-section" aria-labelledby="settled-cart-heading" hidden>
+          <div class="section-heading">
+            <div>
+              <h2 id="settled-cart-heading">오늘 결제</h2>
+              <p>결제한 곳에서 취소합니다. POS 결제는 여기서, 프론트 결제는 손님 카드로 프론트에서 취소됩니다.</p>
+            </div>
+          </div>
+          <div class="list" id="settled-cart-list"></div>
         </section>
 
           </section>

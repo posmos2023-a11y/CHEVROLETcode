@@ -73,6 +73,16 @@ const {
   sendErpCartToFront,
   returnErpCartToPos,
   listFrontErpCartsForPos,
+  recordTossPayment,
+  linkErpCartsToTossPayment,
+  linkFrontCartToRecordedTossPayment,
+  markErpCartsRefundedByToss,
+  requestErpCartRefund,
+  withdrawErpCartRefund,
+  markErpCartRefunding,
+  releaseErpCartRefunding,
+  markErpCartRefunded,
+  listSettledErpCartsForPos,
   listErpCarts,
   getPosDailySummary,
   findRepairHistoryByCarNumber,
@@ -991,11 +1001,17 @@ app.get('/api/pos/queue', posIpFloodLimiter, posQueueReadLimiter, requireStoreTo
   // 대기열과 전산 장바구니를 한 응답에 함께 담는다. 예전에는 탭앱이 두 경로를 각각 폴링해서
   // 매장당 요청이 두 배였다 -- 400개 매장 기준 초당 160건 중 절반이 이 때문이었다.
   // 두 조회는 서로 무관하므로 병렬로 던진다.
-  const [reservations, erpCarts, frontCartRows] = await Promise.all([
+  const [reservations, erpCarts, frontCartRows, settledRows] = await Promise.all([
     listActiveQueueForStore(req.store.id, serviceDate),
     loadPendingErpCartsForResponse(req.store.id),
     listFrontErpCartsForPos(req.store.id, 20),
+    listSettledErpCartsForPos(req.store.id, kstDateRangeUtc(serviceDate).start, 30),
   ])
+  // 같은 POS 결제로 함께 결제된 주문 수. 그 결제를 취소하면 전부 취소되므로 탭앱이 미리 알려야 한다.
+  const sharedCount = new Map()
+  for (const row of settledRows) {
+    if (row.tossPaymentId) sharedCount.set(row.tossPaymentId, (sharedCount.get(row.tossPaymentId) || 0) + 1)
+  }
   return res.json({
     ok: true,
     serviceDate,
@@ -1016,6 +1032,34 @@ app.get('/api/pos/queue', posIpFloodLimiter, posQueueReadLimiter, requireStoreTo
         totalAmount: row.totalAmount,
         status: row.status,
         createdAt: row.createdAt,
+      }
+    }),
+    // 오늘 결제된 전산 주문(결제 완료·취소 진행·취소됨). 정비 대기열의 결제 취소는 여기서 한다.
+    // 구버전 탭앱은 이 필드를 무시한다.
+    settledCarts: settledRows.map((row) => {
+      let items = []
+      try { items = JSON.parse(row.itemsJson) } catch { /* 손상된 건은 품목만 빈 배열로 */ }
+      const front = row.payTarget === 'front' ? parseFrontPayment(row) : null
+      return {
+        id: row.id,
+        referenceId: row.referenceId,
+        carNumber: row.carNumber,
+        memo: row.memo,
+        items,
+        totalAmount: row.totalAmount,
+        status: row.status,
+        payTarget: row.payTarget,
+        paidAt: row.paidAt,
+        refundedAt: row.refundedAt,
+        refundNote: row.refundNote,
+        errorMessage: row.errorMessage,
+        // POS 결제 취소(posPluginSdk.payment.cancel)에 필요한 토스 주문/결제 ID
+        tossPaymentId: row.tossPaymentId,
+        tossOrderId: row.tossOrderId,
+        tossVerified: Boolean(row.tossVerifiedAt),
+        sharedPaymentCount: row.tossPaymentId ? sharedCount.get(row.tossPaymentId) || 1 : 1,
+        paymentMethod: front?.paymentMethod || null,
+        cashWithoutReceipt: row.payTarget === 'front' ? isUncancellableCash(row) : false,
       }
     }),
     reservations: reservations.map((r) => ({
@@ -1527,6 +1571,9 @@ app.get('/api/admin/erp-carts', requireAuth, asyncHandler(async (req, res) => {
         erpStoreCode: r.store?.erpStoreCode || null,
         status: r.status,
         payTarget: r.payTarget,
+        tossVerified: Boolean(r.tossVerifiedAt),
+        refundedAt: r.refundedAt,
+        refundNote: r.refundNote,
         totalAmount: r.totalAmount,
         memo: r.memo,
         carNumber: r.carNumber,
@@ -1604,6 +1651,27 @@ async function processWebhookPayment(body, webhookId) {
   const eventType = body?.type
   const payment = body?.data?.payment || {}
   const merchantId = payment.merchantId ?? body?.merchantId
+
+  // 토스 결제내역 매핑. 결제 ID가 있는 결제 웹훅은 전부 TossPayment에 남기고 전산 주문과 잇는다.
+  // 전산 주문과 이어진 결제는 아래 Payment 백업 기록을 만들지 않는다 -- 그 테이블은 프론트 영수증
+  // (동의 받은 손님) 흐름용이라, 전산 결제를 섞으면 영수증·프로모션 대상 판정이 흐려진다.
+  // 문서상 payment.orderId는 토스 주문 ID라 우리 paymentKey와 같다는 아래(기존) 전제는 맞지 않을 수
+  // 있다 -- 전산 주문은 승인번호+금액으로 잇는다(linkErpCartsToTossPayment).
+  const isPaymentEvent = eventType === 'payment.payment.approved.v1' || eventType === 'payment.payment.cancelled.v1'
+  if (isPaymentEvent && payment.id) {
+    const mappedStore = await findStoreByMerchantId(merchantId)
+    const tossPayment = await recordTossPayment({ ...payment, merchantId }, mappedStore?.id)
+    const carts = await linkErpCartsToTossPayment(tossPayment)
+    if (carts.length) {
+      if (eventType === 'payment.payment.cancelled.v1') {
+        const refunded = await markErpCartsRefundedByToss(carts.map((c) => c.id))
+        logger.info('[webhook] 전산 주문 결제 취소 확인', { webhookId, tossPaymentId: tossPayment.id, refunded })
+      } else {
+        logger.info('[webhook] 전산 주문과 토스 결제를 이었습니다', { webhookId, tossPaymentId: tossPayment.id, carts: carts.length })
+      }
+      return
+    }
+  }
 
   if (eventType === 'payment.payment.approved.v1') {
     const paymentKey = String(payment.orderId ?? '').trim() || null
@@ -2207,6 +2275,19 @@ app.post('/api/pos/erp-carts/:id/paid', posIpFloodLimiter, posLimiter, requireSt
     return res.json({ ok: true, alreadyProcessed: true, status: latest?.status })
   }
 
+  // 토스 웹훅이 이 보고보다 먼저 와 있었다면 지금 잇는다(매핑 실패는 결제 기록을 막지 않는다).
+  if (req.body?.paymentId) {
+    try {
+      const tossPayment = await prisma.tossPayment.findUnique({ where: { id: String(req.body.paymentId) } })
+      if (tossPayment) {
+        const linked = await linkErpCartsToTossPayment(tossPayment)
+        if (tossPayment.state === 'CANCELLED') await markErpCartsRefundedByToss(linked.map((c) => c.id))
+      }
+    } catch (e) {
+      logger.error('[pos] 토스 결제 매핑 실패', { cartId: cart.id, error: e.message })
+    }
+  }
+
   // 예약이 이어져 있으면 정비완료까지 자동으로 처리한다 — 결제가 끝났다는 건 정비가 끝났다는
   // 뜻이라, 직원이 [완료]를 또 누르게 할 이유가 없다. 이미 완료/취소된 예약이면 아무 일도
   // 일어나지 않는다(completeReservationAfterPayment가 상태를 확인한다).
@@ -2271,9 +2352,43 @@ function sanitizeFrontPayment(raw) {
     timestamp: Number.isSafeInteger(timestamp) && timestamp > 0 ? timestamp : null,
     installment: Number.isSafeInteger(installment) && installment >= 0 && installment <= 99 ? installment : null,
     vanTransactionKey: trimmedString(p.vanTransactionKey, 64),
+    van: trimmedString(p.van, 20),
     tid: trimmedString(p.tid, 64),
     isCashReceipt: typeof p.isCashReceipt === 'boolean' ? p.isCashReceipt : null,
+    isSelfIssuance: typeof p.isSelfIssuance === 'boolean' ? p.isSelfIssuance : null,
     easyPayProvider: trimmedString(p.easyPayProvider, 40),
+  }
+}
+
+function parseFrontPayment(cart) {
+  try {
+    return cart.frontPaymentJson ? JSON.parse(cart.frontPaymentJson) : {}
+  } catch {
+    return {}
+  }
+}
+
+// 현금영수증 없이 받은 현금은 토스 쪽에 취소할 대상이 없다(프론트 SDK 문서). 이 건은 현금을 돌려주고
+// 기록만 "환불"로 남긴다.
+function isUncancellableCash(cart) {
+  const p = parseFrontPayment(cart)
+  return p.paymentMethod === 'CASH' && p.isCashReceipt !== true
+}
+
+// 프론트가 sdk.payment.requestPaymentCancel에 넘길 값. 원거래와 같은 금액·세금으로 취소해야 한다.
+function frontRefundParams(cart) {
+  const p = parseFrontPayment(cart)
+  return {
+    paymentKey: cart.frontPaymentKey,
+    paymentMethod: p.paymentMethod,
+    approvalNumber: p.approvalNumber,
+    timestamp: p.timestamp,
+    installment: p.installment ?? 0,
+    vanTransactionKey: p.vanTransactionKey,
+    van: p.van,
+    isSelfIssuance: p.isSelfIssuance === true,
+    totalAmount: cart.totalAmount,
+    ...splitVat(cart.totalAmount),
   }
 }
 
@@ -2318,10 +2433,167 @@ app.post('/api/pos/erp-carts/:id/return-to-pos', posIpFloodLimiter, posLimiter, 
   return res.json({ ok: true, alreadyProcessed: false, status: 'pending', payTarget: 'pos' })
 }))
 
+// --- 정비 대기열(POS 탭앱)에서 결제 취소 ---
+//
+// 결제한 곳에서만 취소할 수 있다:
+//   - POS 결제 건: 탭앱이 POS SDK(posPluginSdk.payment.cancel)로 직접 취소한 뒤 /refunded로 기록한다.
+//   - 프론트 결제 건: POS는 프론트와 페어링되지 않으므로 직접 취소할 수 없다. /refund-request로 요청을
+//     남기면 프론트 플러그인이 가져가 sdk.payment.requestPaymentCancel로 취소한다(손님 카드 필요).
+//   - 현금영수증 없는 현금: 토스 쪽에 취소할 대상이 없다. 현금을 돌려주고 /refunded(method:'cash')로 기록만 한다.
+// 어느 경우든 토스 취소 웹훅이 오면 그쪽이 최종 근거로 refunded를 확정한다(markErpCartsRefundedByToss).
+
+app.post('/api/pos/erp-carts/:id/refund-request', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  const cart = await prisma.erpCart.findUnique({ where: { id: req.params.id } })
+  if (!cart || cart.storeId !== req.store.id) {
+    return res.status(404).json({ ok: false, error: '주문을 찾을 수 없습니다.' })
+  }
+  if (cart.payTarget !== 'front') {
+    return res.status(409).json({ ok: false, error: 'POS에서 결제한 주문은 POS에서 바로 취소합니다.', payTarget: cart.payTarget })
+  }
+  if (isUncancellableCash(cart)) {
+    return res.status(409).json({ ok: false, error: '현금영수증 없이 받은 현금은 프론트에서 취소할 수 없습니다. 현금을 돌려주고 [현금 환불 처리]를 눌러주세요.', code: 'CASH_NO_RECEIPT' })
+  }
+  if (cart.status === 'refund_requested' || cart.status === 'refunding') {
+    return res.json({ ok: true, alreadyProcessed: true, status: cart.status })
+  }
+  const changed = await requestErpCartRefund(cart.id, req.store.id)
+  if (!changed) {
+    const latest = await prisma.erpCart.findUnique({ where: { id: cart.id } })
+    return res.status(409).json({ ok: false, error: '결제 완료된 주문만 취소를 요청할 수 있습니다.', status: latest?.status })
+  }
+  return res.json({ ok: true, alreadyProcessed: false, status: 'refund_requested' })
+}))
+
+app.post('/api/pos/erp-carts/:id/refund-withdraw', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  const cart = await prisma.erpCart.findUnique({ where: { id: req.params.id } })
+  if (!cart || cart.storeId !== req.store.id) {
+    return res.status(404).json({ ok: false, error: '주문을 찾을 수 없습니다.' })
+  }
+  if (cart.status === 'paid') return res.json({ ok: true, alreadyProcessed: true, status: 'paid' })
+  const changed = await withdrawErpCartRefund(cart.id, req.store.id)
+  if (!changed) {
+    const latest = await prisma.erpCart.findUnique({ where: { id: cart.id } })
+    const error = latest?.status === 'refunding'
+      ? '프론트에서 취소가 진행 중입니다. 끝난 뒤에 확인해주세요.'
+      : '철회할 수 있는 취소 요청이 없습니다.'
+    return res.status(409).json({ ok: false, error, status: latest?.status })
+  }
+  return res.json({ ok: true, alreadyProcessed: false, status: 'paid' })
+}))
+
+// 취소 완료 기록. method: 'pos'(탭앱이 POS SDK로 취소함) | 'cash'(현금영수증 없는 현금을 돌려줌)
+app.post('/api/pos/erp-carts/:id/refunded', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  const method = req.body?.method
+  if (method !== 'pos' && method !== 'cash') {
+    return res.status(400).json({ ok: false, error: "method는 'pos' 또는 'cash'여야 합니다." })
+  }
+  const cart = await prisma.erpCart.findUnique({ where: { id: req.params.id } })
+  if (!cart || cart.storeId !== req.store.id) {
+    return res.status(404).json({ ok: false, error: '주문을 찾을 수 없습니다.' })
+  }
+  if (cart.status === 'refunded') return res.json({ ok: true, alreadyProcessed: true, status: 'refunded', refundedCartIds: [cart.id] })
+
+  if (method === 'pos') {
+    if (cart.payTarget !== 'pos') {
+      return res.status(409).json({ ok: false, error: '프론트에서 결제한 주문은 프론트에서 취소해야 합니다.', payTarget: cart.payTarget })
+    }
+    // POS 결제 하나로 여러 주문을 함께 결제했으면 그 결제를 취소하는 순간 전부 취소된 것이다.
+    const siblings = cart.tossPaymentId
+      ? await prisma.erpCart.findMany({ where: { storeId: req.store.id, tossPaymentId: cart.tossPaymentId }, select: { id: true } })
+      : [{ id: cart.id }]
+    const ids = siblings.map((s) => s.id)
+    const result = await prisma.erpCart.updateMany({
+      where: { id: { in: ids }, status: 'paid' },
+      data: { status: 'refunded', refundedAt: new Date(), refundNote: 'POS에서 결제 취소' },
+    })
+    if (!result.count) {
+      const latest = await prisma.erpCart.findUnique({ where: { id: cart.id } })
+      return res.status(409).json({ ok: false, error: '결제 완료된 주문만 취소로 기록할 수 있습니다.', status: latest?.status })
+    }
+    return res.json({ ok: true, alreadyProcessed: false, status: 'refunded', refundedCartIds: ids })
+  }
+
+  // method === 'cash'
+  if (cart.payTarget !== 'front' || !isUncancellableCash(cart)) {
+    return res.status(409).json({ ok: false, error: '현금영수증 없는 현금 결제만 기록으로 환불 처리할 수 있습니다.' })
+  }
+  const changed = await markErpCartRefunded(cart.id, req.store.id, ['paid', 'refund_requested'], '현금 환불(기록만)')
+  if (!changed) {
+    const latest = await prisma.erpCart.findUnique({ where: { id: cart.id } })
+    return res.status(409).json({ ok: false, error: '결제 완료된 주문만 환불 처리할 수 있습니다.', status: latest?.status })
+  }
+  return res.json({ ok: true, alreadyProcessed: false, status: 'refunded', refundedCartIds: [cart.id] })
+}))
+
 // 프론트 대기화면이 몇 초마다 부른다. POS 폴링과 같은 한도(매장 토큰 기준)를 쓴다.
 app.get('/api/front/erp-carts', posIpFloodLimiter, posQueueReadLimiter, requireStoreToken, asyncHandler(async (req, res) => {
-  const carts = await loadPendingErpCartsForResponse(req.store.id, 'front')
-  return res.json({ ok: true, storeName: req.store.name, carts })
+  const [carts, refundRows] = await Promise.all([
+    loadPendingErpCartsForResponse(req.store.id, 'front'),
+    // 정비 대기열에서 [프론트에서 취소]를 누른 결제. 프론트가 가져가 취소창을 띄운다.
+    prisma.erpCart.findMany({
+      where: { storeId: req.store.id, payTarget: 'front', status: 'refund_requested' },
+      orderBy: { refundRequestedAt: 'asc' },
+      take: 10,
+    }),
+  ])
+  const refunds = refundRows.map((row) => ({
+    id: row.id,
+    referenceId: row.referenceId,
+    carNumber: row.carNumber,
+    memo: row.memo,
+    totalAmount: row.totalAmount,
+    refund: frontRefundParams(row),
+  }))
+  return res.json({ ok: true, storeName: req.store.name, carts, refunds })
+}))
+
+// 프론트가 결제 취소창을 띄우기 직전에 부른다(두 대가 같은 건을 동시에 취소하지 않게 잡는다).
+app.post('/api/front/erp-carts/:id/refund-start', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  const cart = await prisma.erpCart.findUnique({ where: { id: req.params.id } })
+  if (!cart || cart.storeId !== req.store.id || cart.payTarget !== 'front') {
+    return res.status(404).json({ ok: false, error: '주문을 찾을 수 없습니다.' })
+  }
+  if (cart.status === 'refunding') {
+    // 같은 프론트가 재시도했다. 취소 정보를 다시 돌려준다.
+    return res.json({ ok: true, alreadyProcessed: true, id: cart.id, refund: frontRefundParams(cart) })
+  }
+  const claimed = await markErpCartRefunding(cart.id, req.store.id)
+  if (!claimed) {
+    const latest = await prisma.erpCart.findUnique({ where: { id: cart.id } })
+    return res.status(409).json({ ok: false, error: '취소할 수 없는 주문입니다.', status: latest?.status })
+  }
+  return res.json({ ok: true, alreadyProcessed: false, id: cart.id, refund: frontRefundParams(cart) })
+}))
+
+// 프론트 결제 취소 결과. result: 'refunded' | 'failed' | 'cancelled'(손님이 취소창을 닫음)
+app.post('/api/front/erp-carts/:id/refund-result', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  const result = req.body?.result
+  if (result !== 'refunded' && result !== 'failed' && result !== 'cancelled') {
+    return res.status(400).json({ ok: false, error: "result는 'refunded', 'failed', 'cancelled' 중 하나여야 합니다." })
+  }
+  const cart = await prisma.erpCart.findUnique({ where: { id: req.params.id } })
+  if (!cart || cart.storeId !== req.store.id || cart.payTarget !== 'front') {
+    return res.status(404).json({ ok: false, error: '주문을 찾을 수 없습니다.' })
+  }
+
+  if (result === 'refunded') {
+    if (cart.status === 'refunded') return res.json({ ok: true, alreadyProcessed: true, status: 'refunded' })
+    const changed = await markErpCartRefunded(cart.id, req.store.id, ['refunding'], '프론트에서 결제 취소')
+    if (!changed) {
+      // 손님 돈은 돌려줬는데 상태가 맞지 않는다 -- 대사가 필요하므로 크게 남긴다.
+      logger.error('[front] 결제 취소 완료 보고를 반영하지 못했습니다. 확인이 필요합니다.', { cartId: cart.id, status: cart.status })
+      return res.status(409).json({ ok: false, error: '주문 상태가 맞지 않아 취소를 기록하지 못했습니다.', status: cart.status })
+    }
+    return res.json({ ok: true, alreadyProcessed: false, status: 'refunded' })
+  }
+
+  const note = result === 'failed' ? (trimmedString(req.body?.errorMessage, 500) || '프론트 결제 취소 실패') : null
+  const released = await releaseErpCartRefunding(cart.id, note)
+  if (!released) {
+    if (cart.status === 'refund_requested') return res.json({ ok: true, alreadyProcessed: true, status: 'refund_requested' })
+    return res.status(409).json({ ok: false, error: '주문 상태가 맞지 않습니다.', status: cart.status })
+  }
+  return res.json({ ok: true, alreadyProcessed: false, status: 'refund_requested' })
 }))
 
 // 결제창을 띄우기 직전에 부른다. 이 주문을 이 프론트가 잡았다는 표시(paying)와 paymentKey를 남기고,
@@ -2388,7 +2660,7 @@ app.post('/api/front/erp-carts/:id/result', posIpFloodLimiter, posLimiter, requi
       return res.json({ ok: true, alreadyProcessed: true, status: 'paid' })
     }
     const payment = sanitizeFrontPayment(req.body?.payment)
-    const changed = await markErpCartFrontPaid(cart.id, paymentKey, JSON.stringify(payment))
+    const changed = await markErpCartFrontPaid(cart.id, paymentKey, JSON.stringify(payment), payment.approvalNumber)
     if (!changed) {
       // 돈은 나갔는데 주문 상태가 맞지 않는다(다른 키로 잡혀 있거나 이미 다른 상태). 조용히 넘기면
       // 아무도 모르는 결제가 생기므로 오류로 크게 남긴다 -- 관리자가 승인번호로 대사해야 한다.
@@ -2396,6 +2668,13 @@ app.post('/api/front/erp-carts/:id/result', posIpFloodLimiter, posLimiter, requi
         cartId: cart.id, status: cart.status, approvalNumber: payment.approvalNumber,
       })
       return res.status(409).json({ ok: false, error: '주문 상태가 맞지 않아 결제 완료를 기록하지 못했습니다.', status: cart.status })
+    }
+
+    // 토스 웹훅이 이 보고보다 먼저 와 있었다면 지금 잇는다. 매핑 실패는 결제 기록을 막지 않는다.
+    try {
+      await linkFrontCartToRecordedTossPayment({ ...cart, frontApprovalNo: payment.approvalNumber })
+    } catch (e) {
+      logger.error('[front] 토스 결제 매핑 실패', { cartId: cart.id, error: e.message })
     }
 
     // POS 결제 경로와 같이, 예약이 이어져 있으면 정비완료까지 자동으로 처리한다.
@@ -2612,6 +2891,8 @@ app.get('/api/erp/carts/:referenceId', erpIpFloodLimiter, erpLimiter, requireErp
     createdAt: cart.createdAt,
     loadedAt: cart.loadedAt,
     paidAt: cart.paidAt,
+    refundedAt: cart.refundedAt,
+    tossVerified: Boolean(cart.tossVerifiedAt),
     errorMessage: cart.errorMessage,
   })
 }))

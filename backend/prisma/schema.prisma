@@ -172,7 +172,9 @@ model ErpCart {
   totalAmount  Int
   memo         String?
   autoPay      Boolean   @default(true)
-  status       String    @default("pending") // pending | loaded | failed | dismissed | expired | cancelled | paid | paying(프론트 결제 진행 중)
+  // pending | loaded | failed | dismissed | expired | cancelled | paid | paying(프론트 결제 진행 중)
+  // | refund_requested(프론트 결제 취소 요청됨) | refunding(프론트에서 취소 진행 중) | refunded(결제 취소됨)
+  status       String    @default("pending")
   errorMessage String?
   createdAt    DateTime  @default(now())
   loadedAt     DateTime?
@@ -202,10 +204,46 @@ model ErpCart {
   frontPayingAt    DateTime?
   // 승인 결과 중 나중에 취소·대사에 필요한 값만 추려 JSON으로 남긴다(승인번호, 승인시각, 결제수단 등).
   frontPaymentJson String?
+  // 프론트 결제의 승인번호. 토스 결제 웹훅과 맞춰보는 열쇠라 JSON과 별도로 둔다(인덱스).
+  frontApprovalNo  String?
+
+  // 토스 결제내역 매핑. 토스 웹훅(payment.payment.approved.v1)으로 같은 결제가 들어온 것을 확인한
+  // 시각. tossPaymentId(위)가 토스 결제 ID다. null이면 "우리는 결제됐다고 알지만 토스 쪽 기록은
+  // 아직 못 봤다"는 뜻이다 -- 위조된 결제 보고나 웹훅 누락을 잡는 데 쓴다.
+  tossVerifiedAt   DateTime?
+
+  // 결제 취소
+  refundRequestedAt DateTime?
+  refundedAt        DateTime?
+  refundNote        String?   // 누가 어떻게 취소했는지(POS 취소 / 프론트 취소 / 현금 환불 / 토스 취소 확인)
 
   @@index([storeId, status, createdAt])
   @@index([storeId, payTarget, status, createdAt])
   @@index([storeId, carNumber])
+  @@index([storeId, frontApprovalNo])
+  @@index([tossPaymentId])
+}
+
+// 토스 결제 웹훅으로 받은 결제 기록. 토스 Open API에는 "결제 목록 조회"가 없어서(단건·주문별 조회만
+// 있다) 나중에 한꺼번에 대사할 수 없다. 그래서 웹훅이 올 때마다 남겨두고, 전산 주문과 양방향으로
+// 맞춘다: 웹훅이 먼저 오면 나중에 프론트 결제 보고가 이걸 찾아 잇고, 보고가 먼저면 웹훅이 주문을 찾아 잇는다.
+// 카드번호 등 결제수단 세부 정보는 저장하지 않는다(매핑에 필요 없다).
+model TossPayment {
+  id          String    @id // 토스 결제 ID
+  merchantId  String
+  storeId     String?   // 등록되지 않은 merchantId면 null
+  orderId     String?   // 토스 주문 ID
+  state       String    // APPROVED | CANCELLED
+  sourceType  String?
+  amount      Int?
+  approvedNo  String?
+  approvedAt  DateTime?
+  cancelledAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([storeId, approvedNo])
+  @@index([createdAt])
 }
 
 // 매장 직원이 POS 이력 화면에서 손으로 보낸 홍보 메시지 기록.

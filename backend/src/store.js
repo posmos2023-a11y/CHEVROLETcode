@@ -974,6 +974,11 @@ function createErpCart({ storeId, referenceId, itemsJson, totalAmount, memo, aut
     frontPaymentKey: null,
     frontPayingAt: null,
     frontPaymentJson: null,
+    frontApprovalNo: null,
+    tossVerifiedAt: null,
+    refundRequestedAt: null,
+    refundedAt: null,
+    refundNote: null,
   }
   return prisma.erpCart.upsert({
     where: { referenceId },
@@ -1055,12 +1060,168 @@ async function releaseErpCartFrontPaying(id, paymentKey, errorMessage) {
 }
 
 // 프론트에서 승인이 끝났다는 보고. paying + 같은 paymentKey일 때만 paid로 넘긴다.
-async function markErpCartFrontPaid(id, paymentKey, paymentJson) {
+async function markErpCartFrontPaid(id, paymentKey, paymentJson, approvalNo) {
   const result = await prisma.erpCart.updateMany({
     where: { id, status: 'paying', frontPaymentKey: paymentKey },
-    data: { status: 'paid', paidAt: new Date(), frontPaymentJson: paymentJson ?? null },
+    data: { status: 'paid', paidAt: new Date(), frontPaymentJson: paymentJson ?? null, frontApprovalNo: approvalNo ?? null },
   })
   return result.count > 0
+}
+
+// --- 토스 결제내역 매핑 -------------------------------------------------------------
+//
+// 토스 웹훅의 결제(Payment)와 전산 주문(ErpCart)을 잇는다. 잇는 기준:
+//   - POS 결제 건: 탭앱이 결제 완료 때 보고한 토스 결제 ID(ErpCart.tossPaymentId) = 웹훅 payment.id
+//   - 프론트 결제 건: 같은 매장 + 승인번호 + 금액이 같고 아직 다른 결제와 이어지지 않은 건이 정확히 1건
+// 애매하면(후보가 2건 이상) 잇지 않는다 -- 잘못 이으면 남의 결제를 취소 확인으로 오인한다.
+
+const PAID_LIKE_STATUSES = ['paid', 'refund_requested', 'refunding']
+
+function toDateOrNull(value) {
+  if (!value) return null
+  const d = new Date(value)
+  return Number.isNaN(d.getTime()) ? null : d
+}
+
+async function recordTossPayment(payment, storeId) {
+  const amountRaw = Number(payment.amount)
+  const data = {
+    merchantId: String(payment.merchantId ?? ''),
+    storeId: storeId ?? null,
+    orderId: payment.orderId ? String(payment.orderId).slice(0, 100) : null,
+    state: String(payment.state || 'UNDEFINED').slice(0, 20),
+    sourceType: payment.sourceType ? String(payment.sourceType).slice(0, 30) : null,
+    amount: Number.isSafeInteger(amountRaw) ? amountRaw : null,
+    approvedNo: payment.approvedNo ? String(payment.approvedNo).slice(0, 64) : null,
+    approvedAt: toDateOrNull(payment.approvedAt),
+    cancelledAt: toDateOrNull(payment.cancelledAt),
+  }
+  return prisma.tossPayment.upsert({
+    where: { id: String(payment.id) },
+    create: { id: String(payment.id), ...data },
+    update: data,
+  })
+}
+
+// 토스 결제 하나에 이어질 전산 주문들을 찾아 잇는다. 이어진(또는 이미 이어져 있던) 주문 목록을 돌려준다.
+async function linkErpCartsToTossPayment(tossPayment) {
+  // POS 결제는 한 번의 결제로 전산 주문 여러 건을 함께 결제할 수 있다(탭앱이 여러 건을 담고 한 번에
+  // 결제) -- 그래서 같은 토스 결제 ID를 가진 주문이 여러 건일 수 있다.
+  const byId = await prisma.erpCart.findMany({ where: { tossPaymentId: tossPayment.id } })
+  if (byId.length) {
+    await prisma.erpCart.updateMany({
+      where: { tossPaymentId: tossPayment.id, tossVerifiedAt: null },
+      data: { tossVerifiedAt: new Date() },
+    })
+    return byId
+  }
+
+  if (!tossPayment.storeId || !tossPayment.approvedNo || tossPayment.amount === null) return []
+  const candidates = await prisma.erpCart.findMany({
+    where: {
+      storeId: tossPayment.storeId,
+      payTarget: 'front',
+      frontApprovalNo: tossPayment.approvedNo,
+      totalAmount: tossPayment.amount,
+      tossPaymentId: null,
+      status: { in: [...PAID_LIKE_STATUSES, 'refunded'] },
+    },
+    take: 2,
+  })
+  if (candidates.length !== 1) return []
+  const updated = await prisma.erpCart.updateMany({
+    where: { id: candidates[0].id, tossPaymentId: null },
+    data: { tossPaymentId: tossPayment.id, tossOrderId: tossPayment.orderId, tossVerifiedAt: new Date() },
+  })
+  return updated.count > 0 ? [candidates[0]] : []
+}
+
+// 프론트 결제 보고가 웹훅보다 늦게 온 경우: 이미 받아둔 토스 결제 중 이 주문과 맞는 것을 찾아 잇는다.
+async function linkFrontCartToRecordedTossPayment(cart) {
+  if (!cart.frontApprovalNo) return null
+  const candidates = await prisma.tossPayment.findMany({
+    where: { storeId: cart.storeId, approvedNo: cart.frontApprovalNo, amount: cart.totalAmount },
+    take: 2,
+  })
+  if (candidates.length !== 1) return null
+  const tp = candidates[0]
+  // 그 토스 결제가 이미 다른 주문에 이어져 있으면 잇지 않는다.
+  const taken = await prisma.erpCart.count({ where: { tossPaymentId: tp.id, NOT: { id: cart.id } } })
+  if (taken) return null
+  await prisma.erpCart.updateMany({
+    where: { id: cart.id, tossPaymentId: null },
+    data: { tossPaymentId: tp.id, tossOrderId: tp.orderId, tossVerifiedAt: new Date() },
+  })
+  // 웹훅으로 이미 취소까지 확인된 결제라면 주문도 취소로 맞춘다.
+  if (tp.state === 'CANCELLED') await markErpCartsRefundedByToss([cart.id])
+  return tp
+}
+
+// 토스에서 결제 취소가 확인된 주문들을 refunded로 맞춘다(POS·프론트·어디서 취소했든 토스 기록이 기준).
+async function markErpCartsRefundedByToss(cartIds) {
+  if (!cartIds.length) return 0
+  const result = await prisma.erpCart.updateMany({
+    where: { id: { in: cartIds }, status: { in: PAID_LIKE_STATUSES } },
+    data: { status: 'refunded', refundedAt: new Date(), refundNote: '토스 결제 취소 확인' },
+  })
+  return result.count
+}
+
+// --- 결제 취소 ---------------------------------------------------------------------
+
+// 프론트 결제 건 취소 요청(POS 탭앱). 프론트 플러그인이 가져가 sdk.payment.requestPaymentCancel로 취소한다.
+async function requestErpCartRefund(id, storeId) {
+  const result = await prisma.erpCart.updateMany({
+    where: { id, storeId, payTarget: 'front', status: 'paid' },
+    data: { status: 'refund_requested', refundRequestedAt: new Date(), errorMessage: null },
+  })
+  return result.count > 0
+}
+
+// 취소 요청 철회(POS 탭앱). 프론트가 아직 취소를 시작하지 않았을 때만.
+async function withdrawErpCartRefund(id, storeId) {
+  const result = await prisma.erpCart.updateMany({
+    where: { id, storeId, status: 'refund_requested' },
+    data: { status: 'paid', refundRequestedAt: null },
+  })
+  return result.count > 0
+}
+
+// 프론트가 취소창을 띄우기 직전에 잡는다(두 대가 동시에 취소하지 않게).
+async function markErpCartRefunding(id, storeId) {
+  const result = await prisma.erpCart.updateMany({
+    where: { id, storeId, payTarget: 'front', status: 'refund_requested' },
+    data: { status: 'refunding' },
+  })
+  return result.count > 0
+}
+
+// 프론트 취소가 안 됐다(손님이 취소창을 닫음/카드 오류) -- 다시 요청 상태로.
+async function releaseErpCartRefunding(id, errorMessage) {
+  const result = await prisma.erpCart.updateMany({
+    where: { id, status: 'refunding' },
+    data: { status: 'refund_requested', errorMessage: errorMessage ?? null },
+  })
+  return result.count > 0
+}
+
+// 취소 완료 기록. fromStatuses로 어느 상태에서 넘어올 수 있는지 호출부가 정한다
+// (프론트 취소 완료: refunding / POS 취소·현금 환불: paid·refund_requested).
+async function markErpCartRefunded(id, storeId, fromStatuses, note) {
+  const result = await prisma.erpCart.updateMany({
+    where: { id, storeId, status: { in: fromStatuses } },
+    data: { status: 'refunded', refundedAt: new Date(), refundNote: note ? String(note).slice(0, 200) : null },
+  })
+  return result.count > 0
+}
+
+// POS 탭앱 "오늘 결제" 목록: 결제 완료·취소 진행·취소된 전산 주문. 결제 취소 버튼을 여기서 누른다.
+function listSettledErpCartsForPos(storeId, since, limit) {
+  return prisma.erpCart.findMany({
+    where: { storeId, status: { in: [...PAID_LIKE_STATUSES, 'refunded'] }, paidAt: { gte: since } },
+    orderBy: { paidAt: 'desc' },
+    take: limit,
+  })
 }
 
 // POS가 addLineItem()까지 성공적으로 마쳤다는 통보(consume). updateMany + count로 pending ->
@@ -1544,9 +1705,11 @@ async function purgeExpiredPersonalData(retentionDays) {
   const promoSends = await purgeExpiredPromoSends(cutoff)
   // 웹훅 이벤트는 개인정보가 아니라 무한 증가가 문제라 별도로 지운다(보관기간은 같은 값을 재사용).
   const webhookEvents = await purgeExpiredWebhookEvents(cutoff)
+  // 토스 결제 매핑 기록도 웹훅마다(매장의 모든 결제) 쌓이므로 같은 기준으로 지운다. 개인정보는 없다.
+  const { count: tossPayments } = await prisma.tossPayment.deleteMany({ where: { createdAt: { lt: cutoff } } })
   // 만료 처리는 보관기간(3년)과 무관하게 매일 돌아야 하는 짧은 주기의 정리라 같은 잡에 얹는다.
   const expiredErpCarts = await expireStaleErpCarts()
-  return { reservations, payments, erpCarts, erpOrders, promoSends, webhookEvents, expiredErpCarts }
+  return { reservations, payments, erpCarts, erpOrders, promoSends, webhookEvents, tossPayments, expiredErpCarts }
 }
 
 // 일별 요약(계약 v3 §5.1). 예약은 serviceDate 기준(접수일), 결제는 createdAt의 KST 하루 범위
@@ -1700,6 +1863,16 @@ module.exports = {
   sendErpCartToFront,
   returnErpCartToPos,
   listFrontErpCartsForPos,
+  recordTossPayment,
+  linkErpCartsToTossPayment,
+  linkFrontCartToRecordedTossPayment,
+  markErpCartsRefundedByToss,
+  requestErpCartRefund,
+  withdrawErpCartRefund,
+  markErpCartRefunding,
+  releaseErpCartRefunding,
+  markErpCartRefunded,
+  listSettledErpCartsForPos,
   listErpCarts,
   getPosDailySummary,
   findRepairHistoryByCarNumber,
