@@ -108,12 +108,7 @@ function actionsFor(cart) {
 
   if (cart.payTarget === 'front' && cart.status === 'paid') {
     if (cart.cashWithoutReceipt) return button('cash-refund', cart, '현금 환불 처리', '현금을 돌려줬나요?', 'danger')
-    const parts = [button('front-request', cart, '프론트에서 취소', '프론트로 취소 요청할까요?', 'danger')]
-    // 실험: 페이스페이(간편결제) 건을 카드 취소 화면으로 띄워 얼굴 취소가 되는지 시험한다(서버 refundMode 참고).
-    if (cart.paymentMethod === 'BARCODE') {
-      parts.push(button('front-request-card', cart, '카드 취소 화면으로 시도(실험)', '실험으로 보낼까요?'))
-    }
-    return parts.join('')
+    return button('front-request', cart, '프론트에서 취소', '프론트로 취소 요청할까요?', 'danger')
   }
 
   if (cart.status === 'refund_requested') return button('front-withdraw', cart, '취소 요청 철회', '요청을 철회할까요?')
@@ -248,12 +243,6 @@ async function run(action, cartId) {
       if (res.body?.receipt) markLocal([cartId], { receiptStatus: res.body.receipt })
       if (!res.ok) return deps.notify('error', res.body.error || '영수증을 보내지 못했습니다.')
       return deps.notify('success', '손님께 영수증을 보냈습니다.')
-    }
-    if (action === 'front-request-card') {
-      const res = await post(`/api/pos/erp-carts/${cartId}/refund-request`, { mode: 'card' })
-      if (!res.ok) return deps.notify('error', res.body.error || '취소를 요청하지 못했습니다.')
-      markLocal([cartId], { status: 'refund_requested' })
-      return deps.notify('success', '실험: 프론트에 카드 취소 화면이 뜹니다. 얼굴 취소 버튼이 보이는지 확인하고, 성공해도 손님 토스 앱에서 실제 환불을 꼭 확인하세요.')
     }
     if (action === 'front-withdraw') {
       const res = await post(`/api/pos/erp-carts/${cartId}/refund-withdraw`)

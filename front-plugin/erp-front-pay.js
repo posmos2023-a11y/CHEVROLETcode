@@ -235,13 +235,6 @@
     if (refund.paymentMethod === 'CARD' && refund.van === 'NICE' && refund.vanTransactionKey && sdk.payment.requestCardlessPaymentCancel) {
       return sdk.payment.requestCardlessPaymentCancel({ ...base, paymentMethod: 'CARD', vanTransactionKey: refund.vanTransactionKey })
     }
-    // 실험(refund.mode === 'card'): 페이스페이 건은 SDK에 BARCODE로 잡혀 QR 취소 화면만 뜬다. 토스 웹훅은 같은 결제를
-    // CARD로 보내므로, 카드 취소 화면으로 띄우면 기본 모드처럼 '페이스페이로 결제했다면'(얼굴 취소)이 나오는지 시험한다.
-    // 문서에 없는 사용법이다 -- 성공 응답이 와도 실제 환불은 손님 토스 앱·카드 명세서로 확인해야 한다.
-    if (refund.mode === 'card') {
-      console.info('[erp-front-pay] 실험: 카드 취소 화면으로 결제 취소를 시도합니다', { original: refund.paymentMethod })
-      return sdk.payment.requestPaymentCancel({ ...base, paymentMethod: 'CARD' })
-    }
     const params = { ...base, paymentMethod: refund.paymentMethod }
     if (refund.paymentMethod === 'CASH') params.isSelfIssuance = Boolean(refund.isSelfIssuance)
     return sdk.payment.requestPaymentCancel(params)

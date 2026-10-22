@@ -2978,7 +2978,6 @@ function frontRefundParams(cart) {
     vanTransactionKey: p.vanTransactionKey,
     van: p.van,
     isSelfIssuance: p.isSelfIssuance === true,
-    mode: cart.refundMode || null,
     totalAmount: cart.totalAmount,
     ...splitVat(cart.totalAmount),
   }
@@ -3048,15 +3047,7 @@ app.post('/api/pos/erp-carts/:id/refund-request', posIpFloodLimiter, posLimiter,
   if (cart.status === 'refund_requested' || cart.status === 'refunding') {
     return res.json({ ok: true, alreadyProcessed: true, status: cart.status })
   }
-  // 실험: mode 'card' -- 페이스페이(SDK상 BARCODE) 건을 카드 취소 화면으로 띄워 본다(schema.prisma refundMode 참고).
-  let mode = null
-  if (req.body?.mode === 'card') {
-    if (parseFrontPayment(cart).paymentMethod !== 'BARCODE') {
-      return res.status(400).json({ ok: false, error: '카드 취소 화면 실험은 페이스페이(간편결제) 결제에만 쓸 수 있습니다.' })
-    }
-    mode = 'card'
-  }
-  const changed = await requestErpCartRefund(cart.id, req.store.id, mode)
+  const changed = await requestErpCartRefund(cart.id, req.store.id)
   if (!changed) {
     const latest = await prisma.erpCart.findUnique({ where: { id: cart.id } })
     return res.status(409).json({ ok: false, error: '결제 완료된 주문만 취소를 요청할 수 있습니다.', status: latest?.status })
@@ -3178,7 +3169,7 @@ app.post('/api/front/erp-carts/:id/refund-result', posIpFloodLimiter, posLimiter
 
   if (result === 'refunded') {
     if (cart.status === 'refunded') return res.json({ ok: true, alreadyProcessed: true, status: 'refunded' })
-    const changed = await markErpCartRefunded(cart.id, req.store.id, ['refunding'], cart.refundMode === 'card' ? '프론트에서 결제 취소(카드 취소 화면 실험)' : '프론트에서 결제 취소')
+    const changed = await markErpCartRefunded(cart.id, req.store.id, ['refunding'], '프론트에서 결제 취소')
     if (!changed) {
       // 손님 돈은 돌려줬는데 상태가 맞지 않는다 -- 대사가 필요하므로 크게 남긴다.
       logger.error('[front] 결제 취소 완료 보고를 반영하지 못했습니다. 확인이 필요합니다.', { cartId: cart.id, status: cart.status })
