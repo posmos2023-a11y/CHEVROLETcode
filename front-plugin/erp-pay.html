@@ -52,9 +52,15 @@
           return
         }
         // 정비 대기열에서 요청한 결제 취소가 있으면 먼저 처리한다(손님이 환불받으러 프론트 앞에 와 있다).
+        // 직원이 탭앱에서 [프론트에서 취소]를 두 번 눌러 이미 확정했으므로 여기서 다시 묻지 않고 바로 취소창을 띄운다.
         const refunds = (body.refunds || []).filter((r) => !pay.isSnoozed(`refund:${r.id}`))
         if (refunds.length) {
-          showRefund(token, refunds[0])
+          const isCard = ['CARD', 'BARCODE'].includes(refunds[0].refund?.paymentMethod)
+          sdk.template.openToast?.({
+            message: `${cartTitle(refunds[0])} ${pay.formatWon(refunds[0].totalAmount)} 결제를 취소합니다.${isCard ? ' 결제했던 카드를 꽂아주세요.' : ''}`,
+            icon: 'info',
+          })
+          runRefund(token, refunds[0])
           return
         }
         const carts = (body.carts || []).filter((c) => !pay.isSnoozed(c.id))
@@ -187,34 +193,14 @@
       }
 
       // --- 결제 취소 ---------------------------------------------------------------
-      // 정비 대기열(POS 탭앱)에서 [프론트에서 취소]를 누르면 여기로 온다. 카드 결제는 결제했던 카드를
-      // 다시 꽂아야 한다(NICE VAN 카드는 카드 없이 취소된다 -- erp-front-pay.js requestRefund).
-      function showRefund(token, item) {
-        const isCard = item.refund.paymentMethod === 'CARD' || item.refund.paymentMethod === 'BARCODE'
-        sdk.template.renderSelectPage({
-          title: '결제를 취소합니다',
-          subtitle: `${cartTitle(item)} · ${pay.formatWon(item.totalAmount)}` +
-            (isCard ? '\n결제했던 카드(또는 간편결제)를 준비해주세요.' : ''),
-          options: [
-            { title: '취소 진행하기', onClick: () => runRefund(token, item) },
-            {
-              title: '나중에 하기',
-              onClick: () => {
-                pay.snooze(`refund:${item.id}`)
-                goHome()
-              },
-            },
-          ],
-          onBack: () => {
-            pay.snooze(`refund:${item.id}`)
-            goHome()
-          },
-        })
-      }
-
+      // 정비 대기열(POS 탭앱)에서 [프론트에서 취소]를 누르면 여기로 와서 확인 화면 없이 바로 취소창(카드 꽂기)이
+      // 뜬다. 카드 결제는 결제했던 카드를 다시 꽂아야 한다(NICE VAN 카드는 카드 없이 취소된다 -- erp-front-pay.js
+      // requestRefund). 손님이 자리에 없어 취소창이 시간 초과로 닫히면 대기화면이 3초마다 취소창을 다시 띄워 다른
+      // 손님이 프론트를 못 쓰게 된다. 그래서 취소가 끝나지 않으면 2분 동안 다시 띄우지 않는다(snooze).
       async function runRefund(token, item) {
         const started = await pay.startRefund(token, item.id)
         if (!started.ok) {
+          pay.snooze(`refund:${item.id}`)
           showMessage('error', '취소를 시작하지 못했습니다', started.body.error || '정비 대기열에서 상태를 확인해주세요.')
           return
         }
@@ -243,6 +229,7 @@
         }
 
         const failed = result.type !== 'CANCELED' && result.type !== 'TIMEOUT'
+        pay.snooze(`refund:${item.id}`)
         const res = await pay.reportRefund(token, item.id, {
           result: failed ? 'failed' : 'cancelled',
           errorMessage: failed ? `프론트 결제 취소 실패(${result.type})` : undefined,
