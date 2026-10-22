@@ -223,6 +223,9 @@ model ErpCart {
   refundRequestedAt DateTime?
   refundedAt        DateTime?
   refundNote        String?   // 누가 어떻게 취소했는지(POS 취소 / 프론트 취소 / 현금 환불 / 토스 취소 확인)
+  // 실험: 'card'면 프론트가 원래 결제수단 대신 카드 취소 화면으로 취소를 띄운다(페이스페이 건이 SDK에는 BARCODE로
+  // 잡혀 QR 취소 화면만 뜨는 문제 시험용 -- 문서에 없는 사용법이다). null이면 원래 결제수단대로.
+  refundMode        String?
 
   // 결제 후 전자영수증 알림톡 결과. sent | failed | no_reservation(예약과 이어지지 않아 번호를 모름) |
   // no_phone. 관리자 웹 전산 주문 이력에 보여 "영수증이 안 왔어요"의 원인을 바로 알 수 있게 한다.

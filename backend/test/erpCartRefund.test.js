@@ -499,3 +499,31 @@ testSerial('오늘 결제 목록: 결제·취소된 주문이 품목, 결제 위
   assert.equal(cashRow.cashWithoutReceipt, true)
   assert.equal(cashRow.paymentMethod, 'CASH')
 })
+
+// --- 실험: 페이스페이 건을 카드 취소 화면으로 ------------------------------------------------
+
+testSerial('실험(카드 취소 화면): 페이스페이(BARCODE) 건만 mode=card로 요청되고, 프론트 취소 정보에 mode가 실린다', async () => {
+  const store = await prisma.store.create({ data: { merchantId: `m-exp-${Date.now()}`, name: '실험 매장', posToken: require('node:crypto').randomBytes(32).toString('hex'), erpStoreCode: `EXP-${Date.now()}` } })
+  const make = (method) => prisma.erpCart.create({
+    data: {
+      storeId: store.id, referenceId: `EXP-${method}-${Date.now()}-${Math.random()}`, itemsJson: '[]', totalAmount: 1000,
+      status: 'paid', paidAt: new Date(), payTarget: 'front', frontPaymentKey: `pk-${method}-${Date.now()}-${Math.random()}`,
+      frontPaymentJson: JSON.stringify({ paymentMethod: method, approvalNumber: '123', timestamp: Date.now() }),
+    },
+  })
+  const face = await make('BARCODE')
+  const card = await make('CARD')
+  const post = (id, body) => request(app).post(`/api/pos/erp-carts/${id}/refund-request`).set('X-Store-Token', store.posToken).send(body)
+
+  assert.equal((await post(card.id, { mode: 'card' })).status, 400)
+  assert.equal((await post(face.id, { mode: 'card' })).status, 200)
+  assert.equal((await prisma.erpCart.findUnique({ where: { id: face.id } })).refundMode, 'card')
+  const start = await request(app).post(`/api/front/erp-carts/${face.id}/refund-start`).set('X-Store-Token', store.posToken).send({})
+  assert.equal(start.status, 200, JSON.stringify(start.body))
+  assert.equal(start.body.refund.mode, 'card')
+  assert.equal(start.body.refund.paymentMethod, 'BARCODE')
+
+  // 보통 요청에는 mode가 없다
+  assert.equal((await post(card.id, {})).status, 200)
+  assert.equal((await prisma.erpCart.findUnique({ where: { id: card.id } })).refundMode, null)
+})

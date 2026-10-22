@@ -1245,10 +1245,10 @@ async function markErpCartsRefundedByToss(cartIds) {
 // --- 결제 취소 ---------------------------------------------------------------------
 
 // 프론트 결제 건 취소 요청(POS 탭앱). 프론트 플러그인이 가져가 sdk.payment.requestPaymentCancel로 취소한다.
-async function requestErpCartRefund(id, storeId) {
+async function requestErpCartRefund(id, storeId, mode = null) {
   const result = await prisma.erpCart.updateMany({
     where: { id, storeId, payTarget: 'front', status: 'paid' },
-    data: { status: 'refund_requested', refundRequestedAt: new Date(), errorMessage: null },
+    data: { status: 'refund_requested', refundRequestedAt: new Date(), errorMessage: null, refundMode: mode },
   })
   return result.count > 0
 }
@@ -1257,7 +1257,7 @@ async function requestErpCartRefund(id, storeId) {
 async function withdrawErpCartRefund(id, storeId) {
   const result = await prisma.erpCart.updateMany({
     where: { id, storeId, status: 'refund_requested' },
-    data: { status: 'paid', refundRequestedAt: null },
+    data: { status: 'paid', refundRequestedAt: null, refundMode: null },
   })
   return result.count > 0
 }
