@@ -896,3 +896,45 @@ testSerial('탭앱 미리보기도 rows를 주고, 다른 매장 방문자는 �
   assert.equal(res.body.hasMore, true)
   assert.equal(res.body.sample.length, 2) // 가린 번호 sample은 그대로
 })
+
+// --- 홍보 목록 [삭제]와 정비 이력 삭제 반영 -------------------------------------------------
+
+testSerial('홍보 목록 삭제: 지운 번호는 목록·방문 수에서 빠지고 차량별 발송도 막힌다', async () => {
+  const store = await createStore('promo-exclude')
+  await visit(store, { phone: '01031310001', carNumber: '31가3131', daysAgo: 2 })
+  await visit(store, { phone: '01031310002', carNumber: '32가3232', daysAgo: 3 })
+  const before = await posPreview(store, { from: kstDate(-7), to: kstDate(0) })
+  assert.equal(before.body.filterCounts.all, 2)
+
+  const del = await request(app).post('/api/pos/promo/exclude').set('X-Store-Token', store.posToken).send({ phone: '010-3131-0001' })
+  assert.equal(del.status, 200, JSON.stringify(del.body))
+  const after = await posPreview(store, { from: kstDate(-7), to: kstDate(0) })
+  assert.equal(after.body.filterCounts.all, 1)
+  assert.equal(after.body.visitors, 1)
+  assert.equal(after.body.rows.some((r) => r.phone === '010-3131-0001'), false)
+
+  const el = await request(app).get('/api/pos/promo/eligibility?carNumber=' + encodeURIComponent('31가3131')).set('X-Store-Token', store.posToken)
+  assert.equal(el.body.canSend, false)
+  assert.equal(el.body.reason, 'staff_excluded')
+  assert.equal((await request(app).post('/api/pos/promo/exclude').set('X-Store-Token', store.posToken).send({ phone: '12' })).status, 400)
+  assert.equal((await request(app).post('/api/pos/promo/exclude').send({ phone: '01031310001' })).status, 401)
+})
+
+testSerial('정비 이력에서 삭제한 방문은 홍보 목록의 방문으로 세지 않는다', async () => {
+  const store = await createStore('promo-hist-deleted')
+  const r = await visit(store, { phone: '01032320001', carNumber: '33가3333', daysAgo: 2 })
+  assert.equal((await posPreview(store, { from: kstDate(-7), to: kstDate(0) })).body.filterCounts.all, 1)
+  const del = await request(app).post('/api/pos/history/delete').set('X-Store-Token', store.posToken).send({ reservationId: r.id })
+  assert.equal(del.status, 200, JSON.stringify(del.body))
+  assert.equal((await posPreview(store, { from: kstDate(-7), to: kstDate(0) })).body.filterCounts.all, 0)
+})
+
+testSerial('정비 이력 삭제: 지운 마지막 방문이 광고 거부였다면 옛 동의가 되살아나지 않는다', async () => {
+  const store = await createStore('promo-hist-consent')
+  await visit(store, { phone: '01033330001', carNumber: '34가3434', daysAgo: 5, marketing: true })
+  const latest = await visit(store, { phone: '01033330001', carNumber: '34가3434', daysAgo: 1, marketing: false })
+  await request(app).post('/api/pos/history/delete').set('X-Store-Token', store.posToken).send({ reservationId: latest.id })
+  const res = await posPreview(store, { from: kstDate(-7), to: kstDate(0) })
+  assert.equal(res.body.filterCounts.eligible, 0)
+  assert.equal(res.body.rows[0].status, 'no_consent')
+})

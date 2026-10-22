@@ -21,6 +21,9 @@ let dateTimer = null
 let confirmTimer = null
 let sending = false
 let optOutConfirmTimer = null
+// 목록 행 [삭제] 두 번 누르기. phone -> timeoutId
+const rowDeleteConfirm = new Map()
+const rowDeleting = new Set()
 
 // 이어 보내기 상한. 탭앱은 한 번에 60건씩이라 넉넉히 둔다(남으면 화면에 남은 수를 알린다).
 const MAX_ROUNDS = 100
@@ -152,7 +155,12 @@ export function initPromoCampaign(injected) {
       handleFilterClick(tab.dataset.promoFilter)
       return
     }
-    if (e.target.closest('#promo-campaign-more')) startLoad({ append: true })
+    if (e.target.closest('#promo-campaign-more')) {
+      startLoad({ append: true })
+      return
+    }
+    const del = e.target.closest('[data-promo-delete]')
+    if (del && !del.disabled) handleRowDelete(del.dataset.promoDelete)
   })
 
   el('promo-optout-form')?.addEventListener('submit', (e) => {
@@ -418,6 +426,8 @@ function renderList() {
         <span class="promo-campaign-car">${e(r.carNumber || '-')}</span>
         <span class="promo-campaign-visit">${e(formatVisit(r.lastVisitAt))}</span>
         ${renderBadge(r)}
+        <button type="button" class="promo-campaign-row-delete${rowDeleteConfirm.has(r.phone) ? ' confirming' : ''}"
+                data-promo-delete="${e(r.phone || '')}" ${rowDeleting.has(r.phone) || sending ? 'disabled' : ''}>${rowDeleteConfirm.has(r.phone) ? '정말 삭제?' : '삭제'}</button>
       </li>`)
     .join('')
   const shown = listState.rowsTotal === null ? '' : ` (${num(rows.length)}/${num(listState.rowsTotal)})`
@@ -438,6 +448,43 @@ function renderList() {
     ${items ? `<ul class="promo-campaign-list">${items}</ul>` : `<div class="promo-campaign-note blocked">${e(EMPTY_TEXT[filter] || EMPTY_TEXT.all)}</div>`}
     ${more}
   `
+}
+
+// 목록에서 번호 삭제. 지운 번호는 홍보 목록에서 사라지고 차량별·자동 발송도 막힌다(서버 PromoExclusion).
+// 두 번 눌러야 지워진다(되돌리는 화면은 없다).
+function handleRowDelete(phone) {
+  if (!phone || sending) return
+  if (!rowDeleteConfirm.has(phone)) {
+    for (const t of rowDeleteConfirm.values()) clearTimeout(t)
+    rowDeleteConfirm.clear()
+    rowDeleteConfirm.set(phone, setTimeout(() => { rowDeleteConfirm.delete(phone); if (listState) renderList() }, 3000))
+    if (listState) renderList()
+    return
+  }
+  clearTimeout(rowDeleteConfirm.get(phone))
+  rowDeleteConfirm.delete(phone)
+  deleteRow(phone).catch((err) => deps.notify('error', err?.message || String(err)))
+}
+
+async function deleteRow(phone) {
+  rowDeleting.add(phone)
+  if (listState) renderList()
+  try {
+    let res
+    try {
+      res = await deps.apiPost('/api/pos/promo/exclude', { phone })
+    } catch {
+      res = { ok: false, status: 0, body: { error: '서버에 연결하지 못했습니다.' } }
+    }
+    if (!res.ok) {
+      if (res.status === 401) return deps.onUnauthorized(res.body.error)
+      return deps.notify('error', res.body.error || '삭제하지 못했습니다.')
+    }
+    deps.notify('success', `${phone} 번호를 홍보 목록에서 삭제했습니다.`)
+    startLoad({ append: false })
+  } finally {
+    rowDeleting.delete(phone)
+  }
 }
 
 function handleSendClick(btn) {

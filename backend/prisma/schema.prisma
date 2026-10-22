@@ -30,6 +30,7 @@ model Store {
   erpCarts      ErpCart[]
   promoSends    PromoSend[]
   marketingOptOuts MarketingOptOut[]
+  promoExclusions  PromoExclusion[]
 }
 
 // Design Ref: docs/02-design/features/multi-store-support.design.md Phase 3
@@ -313,6 +314,19 @@ model MarketingOptOut {
   optedOutAt DateTime @default(now())
   recordedBy String? // 등록한 관리자 id. POS 탭앱에서 등록한 건 매장 단위라 null이다.
   via        String? // pos | admin
+
+  @@unique([storeId, phone])
+}
+
+// 홍보 문자 목록에서 직원이 [삭제]한 번호. 리허설·테스트 번호나 홍보를 보내지 않기로 한 번호를 목록에서 치운다.
+// 수신거부(MarketingOptOut -- 손님이 거부한 기록)와 따로 둔다: 이건 매장이 정한 제외라 새로 동의해도 다시 넣지 않는다.
+// 등록된 번호는 기간 발송 목록에 나오지 않고, 차량별·자동 발송도 막힌다(store.assessPromoPhones).
+model PromoExclusion {
+  id        String   @id @default(uuid())
+  storeId   String
+  store     Store    @relation(fields: [storeId], references: [id])
+  phone     String
+  createdAt DateTime @default(now())
 
   @@unique([storeId, phone])
 }

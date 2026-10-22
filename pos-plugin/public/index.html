@@ -1106,6 +1106,21 @@
   .promo-campaign-tab:disabled { opacity: 0.5; cursor: default; }
   .promo-campaign-tab-count { margin-left: 4px; font-weight: 600; opacity: 0.85; }
   .promo-campaign-list li { align-items: center; }
+  /* 목록 행 [삭제] -- 작게, 두 번 눌러야 지워진다 */
+  .promo-campaign-row-delete {
+    flex: 0 0 auto;
+    min-height: 32px;
+    padding: 0 10px;
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    background: var(--surface);
+    color: var(--sub);
+    font-size: 12px;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  .promo-campaign-row-delete.confirming { border-color: var(--red); background: var(--red); color: #fff; }
+  .promo-campaign-row-delete:disabled { opacity: 0.5; cursor: default; }
   .promo-campaign-list .promo-campaign-phone { flex: 0 0 112px; }
   .promo-campaign-list .promo-campaign-car { min-width: 0; overflow-wrap: anywhere; }
   .promo-campaign-list li.is-muted .promo-campaign-phone,

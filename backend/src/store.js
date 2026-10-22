@@ -1572,6 +1572,10 @@ async function assessPromoPhones(storeId, phones, db = prisma) {
       where: { storeId, phone: { in: list } },
       select: { phone: true, optedOutAt: true },
     }),
+    () => db.promoExclusion.findMany({
+      where: { storeId, phone: { in: list } },
+      select: { phone: true },
+    }),
     () => db.promoSend.findMany({
       where: { storeId, phone: { in: list }, sentAt: { gte: sendsSince } },
       select: { phone: true, sentAt: true, status: true },
@@ -1588,7 +1592,8 @@ async function assessPromoPhones(storeId, phones, db = prisma) {
     results = []
     for (const q of queries) results.push(await q())
   }
-  const [latestRes, latestPay, optOuts, sends, autoSends] = results
+  const [latestRes, latestPay, optOuts, exclusions, sends, autoSends] = results
+  const staffExcluded = new Set(exclusions.map((e) => e.phone))
 
   const latest = new Map()
   for (const r of [...latestRes, ...latestPay]) {
@@ -1616,7 +1621,8 @@ async function assessPromoPhones(storeId, phones, db = prisma) {
     const consentAt = rec?.marketingConsentAt || null
     const optOut = optedOutAt.get(phone)
     let status = 'ok'
-    if (optOut && !(consentAt && new Date(consentAt) > new Date(optOut))) status = 'opted_out'
+    if (staffExcluded.has(phone)) status = 'staff_excluded'
+    else if (optOut && !(consentAt && new Date(consentAt) > new Date(optOut))) status = 'opted_out'
     else if (!consentAt) status = 'no_consent'
     else if (new Date(consentAt) < consentCutoff) status = 'consent_expired'
     else if (lastSent.has(phone)) status = 'recently_sent'
@@ -1678,6 +1684,15 @@ function registerMarketingOptOut({ storeId, phone, recordedBy, via }) {
   })
 }
 
+// 홍보 문자 목록에서 번호 삭제(직원). 이미 있으면 그대로 둔다.
+function registerPromoExclusion(storeId, phone) {
+  return prisma.promoExclusion.upsert({
+    where: { storeId_phone: { storeId, phone } },
+    create: { storeId, phone },
+    update: {},
+  })
+}
+
 // --- 기간 지정 홍보 문자(관리자 웹·POS 탭앱) -------------------------------------------
 //
 // "이 기간에 방문한 손님"에게 홍보 문자를 한 번에 보내기 위한 대상 계산. 받는 사람은 전화번호라
@@ -1695,8 +1710,10 @@ const PROMO_CAMPAIGN_MAX_VISITORS = 5000
 async function listPromoCampaignCandidates(storeId, start, end, { skipRecentFailures = false } = {}) {
   const inRange = { storeId, anonymizedAt: null, createdAt: { gte: start, lt: end } }
   const [resPhones, payPhones] = await Promise.all([
+    // 정비 이력에서 삭제한 방문은 "방문"으로 세지 않는다(리허설 기록 정리). 동의 판단(assessPromoPhones)에는
+    // 지운 기록도 그대로 쓴다 -- 마지막 방문에서 거부한 기록을 지웠다고 옛 동의가 되살아나면 안 된다.
     prisma.reservation.findMany({
-      where: { ...inRange, phone: { not: '' } },
+      where: { ...inRange, phone: { not: '' }, historyHiddenAt: null },
       select: { phone: true },
       distinct: ['phone'],
       take: PROMO_CAMPAIGN_MAX_VISITORS,
@@ -1708,8 +1725,13 @@ async function listPromoCampaignCandidates(storeId, start, end, { skipRecentFail
       take: PROMO_CAMPAIGN_MAX_VISITORS,
     }),
   ])
-  const phones = [...new Set([...resPhones, ...payPhones].map((r) => r.phone).filter(Boolean))]
-  const truncated = phones.length >= PROMO_CAMPAIGN_MAX_VISITORS
+  const visited = [...new Set([...resPhones, ...payPhones].map((r) => r.phone).filter(Boolean))]
+  // 홍보 문자 목록에서 직원이 [삭제]한 번호는 아예 목록에 넣지 않는다(PromoExclusion).
+  const removed = visited.length
+    ? new Set((await prisma.promoExclusion.findMany({ where: { storeId, phone: { in: visited } }, select: { phone: true } })).map((e) => e.phone))
+    : new Set()
+  const phones = visited.filter((p) => !removed.has(p))
+  const truncated = visited.length >= PROMO_CAMPAIGN_MAX_VISITORS
   const excluded = { optedOut: 0, noConsent: 0, consentExpired: 0, recentlySent: 0, recentlyFailed: 0 }
   if (!phones.length) return { visitors: 0, recipients: [], excluded, truncated: false, all: [] }
 
@@ -1718,6 +1740,7 @@ async function listPromoCampaignCandidates(storeId, start, end, { skipRecentFail
   const all = []
   for (const phone of phones) {
     const a = assessed.get(phone)
+    if (a.status === 'staff_excluded') continue // 위에서 뺐지만 그 사이 삭제된 경우
     all.push({ phone, carNumber: a.carNumber, lastVisitAt: a.lastVisitAt, status: a.status, lastSentAt: a.lastSentAt })
     if (a.status === 'opted_out') excluded.optedOut += 1
     else if (a.status === 'no_consent') excluded.noConsent += 1
@@ -2335,6 +2358,7 @@ module.exports = {
   claimPromoSend,
   finishPromoSend,
   registerMarketingOptOut,
+  registerPromoExclusion,
   skipDuePromotion,
   postponeDuePromotion,
   listPromoCampaignCandidates,

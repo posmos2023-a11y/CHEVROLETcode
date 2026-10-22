@@ -101,6 +101,7 @@ const {
   claimPromoSend,
   finishPromoSend,
   registerMarketingOptOut,
+  registerPromoExclusion,
   skipDuePromotion,
   postponeDuePromotion,
   listPromoCampaignCandidates,
@@ -2137,6 +2138,7 @@ function kstHour(now) {
 // 판단 결과(store.assessPromoPhones의 status)를 직원에게 보여줄 문구로.
 const PROMO_BLOCK_MESSAGES = {
   opted_out: '광고 수신을 거부한 손님입니다. 보낼 수 없습니다.',
+  staff_excluded: '홍보 문자 목록에서 삭제한 번호입니다. 보낼 수 없습니다.',
   no_consent: '광고 수신에 동의하지 않은 손님입니다. 보낼 수 없습니다.',
   consent_expired: `광고 수신 동의를 받은 지 ${Math.round(PROMO_CONSENT_MAX_AGE_DAYS / 365)}년이 지났습니다. 다시 동의를 받아야 보낼 수 있습니다.`,
 }
@@ -2270,6 +2272,16 @@ app.post('/api/pos/promo/opt-out', posIpFloodLimiter, posLimiter, requireStoreTo
   const row = await registerMarketingOptOut({ storeId: req.store.id, phone, recordedBy: null, via: 'pos' })
   logger.info('[promo] 수신거부 등록', { storeId: req.store.id, via: 'pos' })
   return res.json({ ok: true, phoneMasked: maskPhone(phone), optedOutAt: row.optedOutAt })
+}))
+
+// 홍보 문자 목록에서 번호 삭제(탭앱). 리허설·테스트 번호를 치우거나 홍보를 보내지 않기로 한 번호용이다.
+// 지운 번호는 목록에서 사라지고 차량별·자동 발송에서도 막힌다. 손님의 수신거부와는 따로 기록한다.
+app.post('/api/pos/promo/exclude', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  const phone = parseOptOutPhone(req.body?.phone)
+  if (!phone) return res.status(400).json({ ok: false, error: '전화번호가 올바르지 않습니다.' })
+  await registerPromoExclusion(req.store.id, phone)
+  logger.info('[promo] 홍보 목록에서 번호 삭제', { storeId: req.store.id })
+  return res.json({ ok: true })
 }))
 
 app.post('/api/admin/promo-opt-out', requireAuth, asyncHandler(async (req, res) => {
