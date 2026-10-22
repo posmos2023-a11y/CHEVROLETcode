@@ -1102,6 +1102,7 @@ app.get('/api/pos/queue', posIpFloodLimiter, posQueueReadLimiter, requireStoreTo
         status: row.status,
         payTarget: row.payTarget,
         paidAt: row.paidAt,
+        loadedAt: row.loadedAt,
         refundedAt: row.refundedAt,
         refundNote: row.refundNote,
         errorMessage: row.errorMessage,

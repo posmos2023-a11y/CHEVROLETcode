@@ -171,24 +171,32 @@
         })
       }
 
-      function showRetryChoice(token, cart, title) {
-        sdk.template.renderSelectPage({
+      // 결제·취소가 중단됐을 때의 화면. 예전엔 선택 화면(다시 시도/처음 화면으로)이라 아무도 안 누르면 그대로 멈춰
+      // 있었고, 그동안 대기화면이 아니라 새 결제·취소를 받아 가지 못했다(손님이 그냥 떠나면 프론트가 먹통이 된다).
+      // 그래서 결과 화면 + [다시 시도] 버튼으로 바꾸고 10초 뒤 저절로 대기화면으로 돌아가게 한다. 돌아간 뒤 같은 건이
+      // 바로 다시 뜨지 않게 2분 쉬게 한다(snooze). 버튼을 눌러 다음 화면으로 갔으면 타이머가 대기화면으로 끌고 가지 않는다.
+      function showStoppedWithRetry({ title, description, retryLabel, onRetry, snoozeKey }) {
+        pay.snooze(snoozeKey)
+        let left = false
+        sdk.template.renderResultPage({
+          type: 'image',
+          status: 'error',
           title,
-          subtitle: `${cartTitle(cart)} · ${pay.formatWon(cart.totalAmount)}`,
-          options: [
-            { title: '다시 결제하기', onClick: () => startPayment(token, cart) },
-            {
-              title: '처음 화면으로',
-              onClick: () => {
-                pay.snooze(cart.id)
-                goHome()
-              },
-            },
-          ],
-          onBack: () => {
-            pay.snooze(cart.id)
-            goHome()
-          },
+          description,
+          buttons: [{ label: retryLabel, onClick: () => { left = true; onRetry() } }],
+          timerMs: 10000,
+          onTimeout: () => { if (!left) goHome() },
+          localeCode: 'ko',
+        })
+      }
+
+      function showRetryChoice(token, cart, title) {
+        showStoppedWithRetry({
+          title,
+          description: `${cartTitle(cart)} · ${pay.formatWon(cart.totalAmount)}`,
+          retryLabel: '다시 결제하기',
+          onRetry: () => startPayment(token, cart),
+          snoozeKey: cart.id,
         })
       }
 
@@ -235,23 +243,12 @@
           errorMessage: failed ? `프론트 결제 취소 실패(${result.type})` : undefined,
         })
         if (res.ok || (res.status >= 400 && res.status < 500)) await pay.clearRefundInflight()
-        sdk.template.renderSelectPage({
+        showStoppedWithRetry({
           title: failed ? '결제 취소에 실패했습니다' : '결제 취소를 중단했습니다',
-          subtitle: `${cartTitle(item)} · ${pay.formatWon(item.totalAmount)}`,
-          options: [
-            { title: '다시 시도하기', onClick: () => runRefund(token, item) },
-            {
-              title: '처음 화면으로',
-              onClick: () => {
-                pay.snooze(`refund:${item.id}`)
-                goHome()
-              },
-            },
-          ],
-          onBack: () => {
-            pay.snooze(`refund:${item.id}`)
-            goHome()
-          },
+          description: `${cartTitle(item)} · ${pay.formatWon(item.totalAmount)}`,
+          retryLabel: '다시 시도하기',
+          onRetry: () => runRefund(token, item),
+          snoozeKey: `refund:${item.id}`,
         })
       }
 

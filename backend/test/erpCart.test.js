@@ -2317,3 +2317,17 @@ testSerial('정비 이력 삭제: 결제 취소가 진행 중인 주문이 있�
   assert.equal((await request(app).post('/api/pos/history/delete').set('X-Store-Token', store.posToken).send({ cartId: lone.id })).status, 200)
   assert.equal((await getHistory(store, '27가2727')).body.visits.length, 0)
 })
+
+testSerial('최근 결제: POS에 담았지만 결제 전인 주문도 맨 위에 loaded로 보이고, 결제하면 paid로 바뀐다', async () => {
+  const store = await createStore('settled-loaded')
+  assert.equal((await postCart(validBody(store, { carNumber: '28가2828' }))).status, 201)
+  const cartId = (await getPosCarts(store)).body.carts[0].id
+  await consumeCart(store, cartId, { result: 'loaded' })
+  const queue = () => request(app).get('/api/pos/queue').set('X-Store-Token', store.posToken)
+  const loaded = (await queue()).body.settledCarts
+  assert.equal(loaded[0].id, cartId)
+  assert.equal(loaded[0].status, 'loaded')
+  assert.ok(loaded[0].loadedAt)
+  await request(app).post(`/api/pos/erp-carts/${cartId}/paid`).set('X-Store-Token', store.posToken).send({})
+  assert.equal((await queue()).body.settledCarts.find((c) => c.id === cartId).status, 'paid')
+})

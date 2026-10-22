@@ -59,6 +59,7 @@ const METHOD_LABEL = { CARD: '카드', CASH: '현금', BARCODE: '간편결제' }
 
 function statusLabel(cart) {
   switch (cart.status) {
+    case 'loaded': return { text: 'POS에 담김 · 결제 전', cls: 'pending' }
     case 'paid': return { text: '결제 완료', cls: 'paid' }
     case 'refund_requested': return { text: '프론트 취소 대기', cls: 'pending' }
     case 'refunding': return { text: '프론트에서 취소 중', cls: 'paying' }
@@ -79,6 +80,8 @@ function button(action, cart, label, confirmLabel, extraClass = '') {
 const RECEIPT_LABEL = { sent: '영수증 보냄', failed: '영수증 발송 실패', no_reservation: '예약 없음 · 영수증 못 보냄', no_phone: '연락처 없음' }
 
 function toolsFor(cart) {
+  // 결제 전(POS에 담김) 건은 POS에서 결제하거나 비우면 된다 -- 여기서 숨기거나 지울 대상이 아니다.
+  if (cart.status === 'loaded') return ''
   const parts = []
   if (cart.status === 'paid') {
     parts.push(button('receipt', cart, cart.receiptStatus === 'sent' ? '영수증 다시 보내기' : '영수증 보내기', '손님께 영수증 보낼까요?'))
@@ -91,7 +94,7 @@ function toolsFor(cart) {
 }
 
 function actionsFor(cart) {
-  if (cart.status === 'refunded' || cart.status === 'refunding') return ''
+  if (cart.status === 'refunded' || cart.status === 'refunding' || cart.status === 'loaded') return ''
 
   if (cart.payTarget === 'pos' && cart.status === 'paid') {
     const shared = cart.sharedPaymentCount > 1
@@ -147,7 +150,7 @@ function render() {
       const receipt = cart.receiptStatus ? RECEIPT_LABEL[cart.receiptStatus] || '' : ''
       return `
         <article class="erp-cart-item settled-cart-item${cart.status === 'refunded' ? ' is-refunded' : ''}${cart.hidden ? ' is-hidden' : ''}">
-          <div class="erp-cart-ref">${deps.escapeHtml(cart.referenceId || '')} · ${formatTime(cart.paidAt)} 결제</div>
+          <div class="erp-cart-ref">${deps.escapeHtml(cart.referenceId || '')} · ${cart.paidAt ? `${formatTime(cart.paidAt)} 결제` : `${formatTime(cart.loadedAt)} POS에 담음`}</div>
           <div class="erp-cart-head">
             <strong class="erp-cart-car">${deps.escapeHtml(cart.carNumber || cart.memo || '-')}</strong>
             <span class="settled-status ${s.cls}">${s.text}</span>

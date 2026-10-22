@@ -1291,10 +1291,19 @@ async function markErpCartRefunded(id, storeId, fromStatuses, note) {
 }
 
 // POS 탭앱 "오늘 결제" 목록: 결제 완료·취소 진행·취소된 전산 주문. 결제 취소 버튼을 여기서 누른다.
+// POS에 담았지만 아직 결제 전(loaded)인 주문도 함께 준다. 담는 순간 [전산 주문] 목록에서 빠지는데 결제 전까지
+// 탭앱 어디에도 안 보이면 직원이 "방금 담은 주문이 어디 갔지?" 하게 된다. 결제 전 건이 맨 위에 온다.
 function listSettledErpCartsForPos(storeId, since, limit) {
   return prisma.erpCart.findMany({
-    where: { storeId, status: { in: [...PAID_LIKE_STATUSES, 'refunded'] }, paidAt: { gte: since }, deletedAt: null },
-    orderBy: { paidAt: 'desc' },
+    where: {
+      storeId,
+      deletedAt: null,
+      OR: [
+        { status: { in: [...PAID_LIKE_STATUSES, 'refunded'] }, paidAt: { gte: since } },
+        { status: 'loaded', loadedAt: { gte: since } },
+      ],
+    },
+    orderBy: [{ paidAt: { sort: 'desc', nulls: 'first' } }, { loadedAt: 'desc' }],
     take: limit,
   })
 }
