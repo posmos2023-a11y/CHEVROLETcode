@@ -66,7 +66,13 @@
 
   // 서버 호출. 네트워크 오류는 throw하지 않고 { ok:false, status:0 }으로 돌려준다 -- 호출부가
   // 결제 흐름 한가운데서 예외 처리를 빠뜨려도 화면이 멈추지 않게 하기 위해서다.
+  // 시간 제한(API_TIMEOUT_MS)을 둔다: 응답이 안 오면 결제 화면이 아무것도 못 그린 흰 화면으로 계속 기다리게 된다.
+  // 시간 초과도 status 0이다 -- 서버는 처리했을 수 있으므로 호출부가 그 경우를 따로 다룬다(startPayment 참고).
+  const API_TIMEOUT_MS = 12000
+
   async function api(method, path, token, body) {
+    const controller = typeof AbortController === 'function' ? new AbortController() : null
+    const timer = controller ? setTimeout(() => controller.abort(), API_TIMEOUT_MS) : null
     try {
       const res = await fetch(`${window.CHEVROLET_API_BASE_URL}${path}`, {
         method,
@@ -75,11 +81,14 @@
           'X-Store-Token': token || '',
         },
         body: body === undefined ? undefined : JSON.stringify(body),
+        signal: controller ? controller.signal : undefined,
       })
       const json = await res.json().catch(() => ({}))
       return { ok: res.ok && json.ok !== false, status: res.status, body: json }
     } catch (e) {
       return { ok: false, status: 0, body: { error: '서버에 연결할 수 없습니다.' } }
+    } finally {
+      if (timer) clearTimeout(timer)
     }
   }
 
