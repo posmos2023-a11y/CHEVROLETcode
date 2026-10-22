@@ -702,3 +702,83 @@ testSerial('영수증: 같은 차가 오늘 두 번 왔으면(끝난 예약 2건
   assert.equal(res.body.receipt, 'no_reservation')
   assert.equal(global.__notifications.filter((n) => n.method === 'sendReceiptAlimtalk').length, 0)
 })
+
+// --- 탭앱 정리: 최근 결제 숨기기·삭제, 프론트 대기 지우기, 영수증 다시 보내기 -----------------------
+
+async function paidFrontCart(label) {
+  const { store, reservation, cartId } = await linkedFrontCart(label)
+  const paymentKey = newPaymentKey()
+  await startFront(store, cartId, paymentKey)
+  await reportFront(store, cartId, { result: 'paid', paymentKey, payment: SAMPLE_CARD_PAYMENT })
+  return { store, reservation, cartId }
+}
+
+const posPost = (store, path, body = {}) => request(app).post(path).set('X-Store-Token', store.posToken).send(body)
+const settledOf = async (store) => (await posQueue(store)).body.settledCarts
+
+testSerial('정리: 숨기면 최근 결제에 hidden으로 오고 정비 이력에서 빠지며, 다시 보이게 할 수 있다', async () => {
+  const { store, cartId } = await paidFrontCart('cleanup-hide')
+  assert.equal((await posPost(store, `/api/pos/erp-carts/${cartId}/hide`, { hidden: true })).status, 200)
+  const settled = await settledOf(store)
+  assert.equal(settled.find((c) => c.id === cartId).hidden, true)
+  const hist = await request(app).get('/api/pos/history?carNumber=12가3456').set('X-Store-Token', store.posToken)
+  assert.equal(hist.body.visits.every((v) => (v.orders || []).every((o) => o.id !== cartId)), true)
+
+  assert.equal((await posPost(store, `/api/pos/erp-carts/${cartId}/hide`, { hidden: false })).status, 200)
+  assert.equal((await settledOf(store)).find((c) => c.id === cartId).hidden, false)
+  assert.equal((await posPost(store, `/api/pos/erp-carts/${cartId}/hide`, {})).status, 400)
+})
+
+testSerial('정리: 삭제하면 최근 결제·오늘 현황·관리자 목록에서 빠지지만 행은 남고 전산 조회는 그대로다', async () => {
+  const { store, cartId } = await paidFrontCart('cleanup-delete')
+  const before = await request(app).get('/api/pos/summary').set('X-Store-Token', store.posToken)
+  assert.equal(before.body.erpCartsPaid, 1)
+
+  assert.equal((await posPost(store, `/api/pos/erp-carts/${cartId}/delete`)).status, 200)
+  assert.equal((await settledOf(store)).some((c) => c.id === cartId), false)
+  const after = await request(app).get('/api/pos/summary').set('X-Store-Token', store.posToken)
+  assert.equal(after.body.erpCartsPaid, 0)
+  assert.equal(after.body.paidAmount, 0)
+  const row = await prisma.erpCart.findUnique({ where: { id: cartId } })
+  assert.ok(row.deletedAt)
+  assert.equal(row.status, 'paid')
+  const erp = await getCart(row.referenceId)
+  assert.equal(erp.body.status, 'paid')
+  // 두 번 삭제하면 404(이미 없는 것으로 본다)
+  assert.equal((await posPost(store, `/api/pos/erp-carts/${cartId}/delete`)).status, 404)
+})
+
+testSerial('정리: 결제 취소가 진행 중인 건은 삭제할 수 없고, 다른 매장 건은 건드릴 수 없다', async () => {
+  const { store, cartId } = await paidFrontCart('cleanup-guard')
+  await prisma.erpCart.update({ where: { id: cartId }, data: { status: 'refund_requested', refundRequestedAt: new Date() } })
+  assert.equal((await posPost(store, `/api/pos/erp-carts/${cartId}/delete`)).status, 409)
+  const other = await createStore('cleanup-guard-other')
+  assert.equal((await posPost(other, `/api/pos/erp-carts/${cartId}/hide`, { hidden: true })).status, 404)
+})
+
+testSerial('정리: 프론트 결제 대기 주문을 탭앱에서 바로 지우면 프론트 목록에서 빠진다(결제 중이면 409)', async () => {
+  const { store, cartId } = await frontCart('dismiss-front')
+  assert.equal((await posPost(store, `/api/pos/erp-carts/${cartId}/dismiss-front`)).status, 200)
+  assert.equal((await getFrontCarts(store)).body.carts.length, 0)
+  assert.equal((await prisma.erpCart.findUnique({ where: { id: cartId } })).status, 'dismissed')
+
+  const second = await frontCart('dismiss-front-paying')
+  await startFront(second.store, second.cartId, newPaymentKey())
+  assert.equal((await posPost(second.store, `/api/pos/erp-carts/${second.cartId}/dismiss-front`)).status, 409)
+})
+
+testSerial('영수증 다시 보내기: 탭앱에서 다시 보내면 또 한 번 간다, 예약이 없으면 이유를 알려준다', async () => {
+  global.__notifications.length = 0
+  const { store, cartId } = await paidFrontCart('resend-receipt')
+  const res = await posPost(store, `/api/pos/erp-carts/${cartId}/resend-receipt`)
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal(global.__notifications.filter((n) => n.method === 'sendReceiptAlimtalk').length, 2)
+
+  const none = await frontCart('resend-receipt-none')
+  const pk = newPaymentKey()
+  await startFront(none.store, none.cartId, pk)
+  await reportFront(none.store, none.cartId, { result: 'paid', paymentKey: pk, payment: SAMPLE_CARD_PAYMENT })
+  const miss = await posPost(none.store, `/api/pos/erp-carts/${none.cartId}/resend-receipt`)
+  assert.equal(miss.status, 409)
+  assert.equal(miss.body.receipt, 'no_reservation')
+})

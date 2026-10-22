@@ -308,6 +308,8 @@ async function sendCartToFront(cartId) {
 const frontListEl = document.getElementById('front-cart-list')
 const frontSectionEl = document.getElementById('front-cart-section')
 const returnConfirm = new Map()
+// [지우기] 2단계 확인. 리허설·테스트 주문이 프론트 결제 목록(손님 화면)에 남지 않게 바로 지운다.
+const frontDismissConfirm = new Map()
 let lastFrontCarts = []
 
 // 넘긴 직후에는 서버의 frontCarts에 아직 안 실린 응답이 올 수 있어 잠깐은 기억해 둔다.
@@ -320,6 +322,7 @@ function renderFrontCarts() {
     .map((cart) => {
       const paying = cart.status === 'paying'
       const confirming = returnConfirm.has(cart.id)
+      const dismissing = frontDismissConfirm.has(cart.id)
       return `
         <article class="erp-cart-item front-cart-item" data-cart-id="${deps.escapeHtml(cart.id)}">
           <div class="erp-cart-ref">${deps.escapeHtml(cart.referenceId || '')}</div>
@@ -333,6 +336,8 @@ function renderFrontCarts() {
           <div class="erp-cart-actions">
             <button class="erp-cart-return${confirming ? ' confirming' : ''}" type="button"
                     data-cart-id="${deps.escapeHtml(cart.id)}">${confirming ? '정말 되돌릴까요?' : 'POS로 되돌리기'}</button>
+            <button class="erp-cart-dismiss erp-cart-front-dismiss${dismissing ? ' confirming' : ''}" type="button"
+                    data-cart-id="${deps.escapeHtml(cart.id)}">${dismissing ? '정말 지울까요?' : '지우기'}</button>
           </div>`}
         </article>
       `
@@ -393,9 +398,52 @@ async function returnCartToPos(cartId) {
 }
 
 function handleFrontListClick(e) {
+  const dismissBtn = e.target.closest('button.erp-cart-front-dismiss')
+  if (dismissBtn && !dismissBtn.disabled) {
+    handleFrontDismissClick(dismissBtn.dataset.cartId)
+    return
+  }
   const btn = e.target.closest('button.erp-cart-return')
   if (!btn || btn.disabled) return
   handleReturnClick(btn.dataset.cartId)
+}
+
+function handleFrontDismissClick(cartId) {
+  if (frontDismissConfirm.has(cartId)) {
+    clearTimeout(frontDismissConfirm.get(cartId))
+    frontDismissConfirm.delete(cartId)
+    dismissFrontCart(cartId)
+    return
+  }
+  Array.from(frontDismissConfirm.values()).forEach(clearTimeout)
+  frontDismissConfirm.clear()
+  frontDismissConfirm.set(cartId, setTimeout(() => {
+    frontDismissConfirm.delete(cartId)
+    renderFrontCarts()
+  }, 3000))
+  renderFrontCarts()
+}
+
+async function dismissFrontCart(cartId) {
+  let ok, status, body
+  try {
+    ;({ ok, status, body } = await deps.apiPost(`/api/pos/erp-carts/${cartId}/dismiss-front`))
+  } catch {
+    deps.notify('error', '서버에 연결하지 못해 지우지 못했습니다. 잠시 후 다시 시도해주세요.')
+    return
+  }
+  if (!ok) {
+    if (status === 401) {
+      deps.onUnauthorized(body.error)
+      return
+    }
+    deps.notify('error', body.error || '지우지 못했습니다.')
+    return
+  }
+  sentToFront.delete(cartId)
+  lastFrontCarts = lastFrontCarts.filter((c) => c.id !== cartId)
+  renderFrontCarts()
+  deps.notify('success', '프론트 결제 대기에서 지웠습니다.')
 }
 
 function handleListClick(e) {

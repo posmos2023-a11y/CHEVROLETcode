@@ -107,6 +107,9 @@ const {
   completeReservationAfterPayment,
   findOpenReservationByCarNumber,
   findReservationForPaymentByCarNumber,
+  setErpCartHidden,
+  softDeleteErpCart,
+  hideHistoryVisit,
   cancelErpCart,
 } = require('./src/store')
 const { createTossDraftOrder } = require('./src/tossOrderClient')
@@ -1107,6 +1110,9 @@ app.get('/api/pos/queue', posIpFloodLimiter, posQueueReadLimiter, requireStoreTo
         sharedPaymentCount: row.tossPaymentId ? sharedCount.get(row.tossPaymentId) || 1 : 1,
         paymentMethod: front?.paymentMethod || null,
         cashWithoutReceipt: row.payTarget === 'front' ? isUncancellableCash(row) : false,
+        // 탭앱 정리·영수증 다시 보내기용
+        hidden: Boolean(row.hiddenAt),
+        receiptStatus: row.receiptStatus || null,
       }
     }),
     reservations: reservations.map((r) => ({
@@ -2643,6 +2649,7 @@ app.get('/api/pos/history', posIpFloodLimiter, posQueueReadLimiter, requireStore
 
   const visits = reservations.map((r) => ({
     kind: 'reservation',
+    reservationId: r.id,
     date: r.serviceDate,
     serviceType: r.serviceType,
     status: r.status,
@@ -2729,6 +2736,105 @@ app.post('/api/pos/erp-carts/:id/paid', posIpFloodLimiter, posLimiter, requireSt
   const receipt = await sendErpCartReceipt({ ...cart, reservationId }, req.store.name)
 
   return res.json({ ok: true, alreadyProcessed: false, status: 'paid', reservationCompleted, receipt })
+}))
+
+// --- 탭앱 정리: 최근 결제 숨기기·삭제, 프론트 대기 주문 지우기, 정비 이력 숨기기 ---------------------
+//
+// 리허설·테스트 기록이 실제 화면에 남지 않게 하는 용도다. 결제 기록은 행을 지우지 않는다(store.softDeleteErpCart
+// 주석) -- 삭제해도 전산의 상태 조회와 토스 대사에는 그대로 남는다.
+
+async function findOwnCart(req, res) {
+  const cart = await prisma.erpCart.findUnique({ where: { id: req.params.id } })
+  if (!cart || cart.storeId !== req.store.id || cart.deletedAt) {
+    res.status(404).json({ ok: false, error: '주문을 찾을 수 없습니다.' })
+    return null
+  }
+  return cart
+}
+
+// [최근 결제] 숨기기/다시 보이기. body: { hidden: true|false }
+app.post('/api/pos/erp-carts/:id/hide', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  if (typeof req.body?.hidden !== 'boolean') return res.status(400).json({ ok: false, error: 'hidden(true/false)이 필요합니다.' })
+  const cart = await findOwnCart(req, res)
+  if (!cart) return
+  const changed = await setErpCartHidden(req.store.id, cart.id, req.body.hidden)
+  if (!changed) return res.status(409).json({ ok: false, error: '결제가 끝난 주문만 숨길 수 있습니다.' })
+  return res.json({ ok: true, hidden: req.body.hidden })
+}))
+
+// [최근 결제] 삭제. 결제 완료·취소된 건만(취소 진행 중이면 409).
+app.post('/api/pos/erp-carts/:id/delete', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  const cart = await findOwnCart(req, res)
+  if (!cart) return
+  const changed = await softDeleteErpCart(req.store.id, cart.id)
+  if (!changed) {
+    return res.status(409).json({ ok: false, error: '결제 완료 또는 취소된 주문만 삭제할 수 있습니다(결제 취소가 진행 중이면 끝난 뒤 삭제하세요).' })
+  }
+  logger.info('[pos] 결제 기록 삭제(숨김 처리)', { storeId: req.store.id, cartId: cart.id, status: cart.status })
+  return res.json({ ok: true })
+}))
+
+// 프론트 결제 대기 주문 지우기. 손님이 아직 결제를 시작하지 않은(pending) 건만 -- 결제 중(paying)이면 409.
+app.post('/api/pos/erp-carts/:id/dismiss-front', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  const cart = await findOwnCart(req, res)
+  if (!cart) return
+  if (cart.payTarget !== 'front') return res.status(409).json({ ok: false, error: '프론트 결제 대기 주문이 아닙니다.' })
+  if (cart.status === 'dismissed') return res.json({ ok: true, alreadyProcessed: true })
+  const changed = cart.status === 'pending' ? await markErpCartDismissed(cart.id, '매장이 프론트 대기에서 지움') : false
+  if (!changed) return res.status(409).json({ ok: false, error: '손님이 결제 중이거나 이미 처리된 주문이라 지울 수 없습니다.', status: cart.status })
+  return res.json({ ok: true, alreadyProcessed: false })
+}))
+
+// 정비 이력에서 한 방문 숨기기. body: { reservationId } 또는 { cartId }
+app.post('/api/pos/history/hide', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  const reservationId = req.body?.reservationId ? String(req.body.reservationId) : null
+  const cartId = req.body?.cartId ? String(req.body.cartId) : null
+  if (!reservationId && !cartId) return res.status(400).json({ ok: false, error: '숨길 방문이 없습니다.' })
+  const changed = await hideHistoryVisit(req.store.id, { reservationId, cartId })
+  if (!changed) return res.status(404).json({ ok: false, error: '방문 기록을 찾을 수 없습니다.' })
+  return res.json({ ok: true })
+}))
+
+// 전자영수증 다시 보내기(탭앱·관리자 웹). 결제 완료 건만. 예약과 이어져 있지 않으면 지금 다시 찾아 잇는다.
+async function resendErpCartReceipt(cart, storeName) {
+  if (cart.status !== 'paid') return { status: 409, body: { ok: false, error: '결제 완료된 주문만 영수증을 보낼 수 있습니다.' } }
+  const reservationId = await linkPaidCartToReservation(cart)
+  const receipt = await sendErpCartReceipt({ ...cart, reservationId }, storeName)
+  const messages = {
+    sent: '영수증을 보냈습니다.',
+    failed: '영수증 발송에 실패했습니다. 잠시 후 다시 시도해주세요.',
+    no_reservation: '예약과 이어지지 않아 손님 번호를 모릅니다(같은 차량번호로 오늘 예약이 1건이어야 합니다).',
+    no_phone: '예약에 연락처가 없습니다.',
+  }
+  return { status: receipt === 'sent' ? 200 : 409, body: { ok: receipt === 'sent', receipt, error: receipt === 'sent' ? undefined : messages[receipt], message: messages[receipt] } }
+}
+
+app.post('/api/pos/erp-carts/:id/resend-receipt', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  const cart = await findOwnCart(req, res)
+  if (!cart) return
+  const { status, body } = await resendErpCartReceipt(cart, req.store.name)
+  return res.status(status).json(body)
+}))
+
+app.post('/api/admin/erp-carts/:id/resend-receipt', requireAuth, asyncHandler(async (req, res) => {
+  const cart = await prisma.erpCart.findUnique({ where: { id: req.params.id }, include: { store: true } })
+  if (!cart || cart.deletedAt || (req.admin.role === 'store_admin' && cart.storeId !== req.admin.storeId)) {
+    return res.status(404).json({ ok: false, error: '주문을 찾을 수 없습니다.' })
+  }
+  const { status, body } = await resendErpCartReceipt(cart, cart.store?.name)
+  return res.status(status).json(body)
+}))
+
+// 정비 완료 안내 다시 보내기(탭앱 정비 이력). 정비완료된 예약만.
+app.post('/api/pos/queue/:id/resend-done', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  const reservation = await prisma.reservation.findUnique({ where: { id: req.params.id }, include: { store: true } })
+  if (!reservation || reservation.storeId !== req.store.id || reservation.anonymizedAt) {
+    return res.status(404).json({ ok: false, error: '예약을 찾을 수 없습니다.' })
+  }
+  if (reservation.status !== 'completed') return res.status(409).json({ ok: false, error: '정비완료된 예약만 완료 문자를 보낼 수 있습니다.' })
+  const notified = await notifyRepairDone(reservation)
+  if (!notified) return res.status(502).json({ ok: false, notified, error: '완료 문자를 보내지 못했습니다. 잠시 후 다시 시도해주세요.' })
+  return res.json({ ok: true, notified })
 }))
 
 // --- 전산 주문을 프론트 플러그인에서 직접 결제 (payTarget: 'front') ---

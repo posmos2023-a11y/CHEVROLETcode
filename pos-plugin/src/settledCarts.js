@@ -10,6 +10,10 @@
 // 어느 경우든 토스 결제 취소 웹훅이 오면 서버가 refunded로 확정한다.
 //
 // 돈이 나가는 동작이라 모든 버튼은 대기열 호출·완료와 같은 2단계 확인(3초 안에 한 번 더)을 쓴다.
+//
+// 정리 기능(리허설·테스트 기록용): [숨기기]는 이 목록과 정비 이력에서만 감춘다(맨 위 '숨긴 N건 보기'로 다시
+// 꺼낼 수 있다). [삭제]는 탭앱·오늘 현황·관리자 웹 어디에도 안 보이게 한다(서버는 행을 지우지 않는다 --
+// 실제 결제라 분쟁·대사 근거가 남아야 한다). [영수증 보내기]는 예약 손님 번호로 전자영수증을 (다시) 보낸다.
 import { posPluginSdk } from '@tossplace/pos-plugin-sdk'
 
 const listEl = document.getElementById('settled-cart-list')
@@ -18,6 +22,9 @@ let deps = null
 let lastCarts = []
 const confirming = new Map() // `${action}:${cartId}` -> timeoutId
 const busy = new Set()
+let showHidden = false
+// 한 번 눌러 바로 실행해도 되는 동작(되돌릴 수 있고 손님에게 아무것도 안 간다).
+const ONE_TAP = new Set(['hide', 'unhide'])
 // SDK로 취소를 시도했다가 실패한 POS 결제. 이 카드에는 [POS에서 취소했어요] 버튼을 보여준다.
 const sdkCancelFailed = new Set()
 
@@ -68,6 +75,21 @@ function button(action, cart, label, confirmLabel, extraClass = '') {
             ${busy.has(cart.id) ? 'disabled' : ''}>${isConfirming ? confirmLabel : label}</button>`
 }
 
+// 정리·영수증 버튼(결제 취소 버튼과 줄을 나눠 실수로 누르지 않게 한다).
+const RECEIPT_LABEL = { sent: '영수증 보냄', failed: '영수증 발송 실패', no_reservation: '예약 없음 · 영수증 못 보냄', no_phone: '연락처 없음' }
+
+function toolsFor(cart) {
+  const parts = []
+  if (cart.status === 'paid') {
+    parts.push(button('receipt', cart, cart.receiptStatus === 'sent' ? '영수증 다시 보내기' : '영수증 보내기', '손님께 영수증 보낼까요?'))
+  }
+  parts.push(cart.hidden ? button('unhide', cart, '다시 보이기', '') : button('hide', cart, '숨기기', ''))
+  if (cart.status === 'paid' || cart.status === 'refunded') {
+    parts.push(button('delete', cart, '삭제', '정말 삭제할까요?', 'danger'))
+  }
+  return parts.join('')
+}
+
 function actionsFor(cart) {
   if (cart.status === 'refunded' || cart.status === 'refunding') return ''
 
@@ -95,18 +117,23 @@ function actionsFor(cart) {
 
 function render() {
   if (!listEl) return
+  const hiddenCount = lastCarts.filter((c) => c.hidden).length
+  const visible = showHidden ? lastCarts : lastCarts.filter((c) => !c.hidden)
+  const hiddenBar = hiddenCount
+    ? `<button class="settled-hidden-toggle" type="button" data-toggle-hidden="1">${showHidden ? '숨긴 결제 감추기' : `숨긴 결제 ${hiddenCount}건 보기`}</button>`
+    : ''
   // 비어 있어도 칸은 남긴다 -- 숨기면 결제 취소를 어디서 하는지 찾을 수 없다.
-  if (!lastCarts.length) {
+  if (!visible.length) {
     listEl.innerHTML = `
       <div class="empty">
         <div class="empty-mark" aria-hidden="true">✓</div>
         <div class="empty-title">최근 결제한 전산 주문이 없습니다</div>
         <div class="empty-copy">전산 주문을 결제하면 이곳에 표시되고, 여기서 취소할 수 있습니다.</div>
       </div>
-    `
+    ` + hiddenBar
     return
   }
-  listEl.innerHTML = lastCarts
+  listEl.innerHTML = hiddenBar + visible
     .map((cart) => {
       const s = statusLabel(cart)
       const where = cart.payTarget === 'front'
@@ -116,8 +143,10 @@ function render() {
         .map((i) => `${deps.escapeHtml(i.name)} ×${Number(i.quantity) || 0}`)
         .join(', ')
       const actions = actionsFor(cart)
+      const tools = toolsFor(cart)
+      const receipt = cart.receiptStatus ? RECEIPT_LABEL[cart.receiptStatus] || '' : ''
       return `
-        <article class="erp-cart-item settled-cart-item${cart.status === 'refunded' ? ' is-refunded' : ''}">
+        <article class="erp-cart-item settled-cart-item${cart.status === 'refunded' ? ' is-refunded' : ''}${cart.hidden ? ' is-hidden' : ''}">
           <div class="erp-cart-ref">${deps.escapeHtml(cart.referenceId || '')} · ${formatTime(cart.paidAt)} 결제</div>
           <div class="erp-cart-head">
             <strong class="erp-cart-car">${deps.escapeHtml(cart.carNumber || cart.memo || '-')}</strong>
@@ -128,7 +157,9 @@ function render() {
           <div class="erp-cart-total">${formatWon(cart.totalAmount)}</div>
           ${cart.status === 'refunded' && cart.refundNote ? `<div class="erp-cart-memo">${deps.escapeHtml(cart.refundNote)} · ${formatTime(cart.refundedAt)}</div>` : ''}
           ${cart.errorMessage && cart.status !== 'refunded' ? `<div class="erp-cart-memo settled-error">${deps.escapeHtml(cart.errorMessage)}</div>` : ''}
+          ${receipt ? `<div class="erp-cart-memo">${deps.escapeHtml(receipt)}</div>` : ''}
           ${actions ? `<div class="erp-cart-actions">${actions}</div>` : ''}
+          ${tools ? `<div class="erp-cart-actions settled-tools">${tools}</div>` : ''}
         </article>
       `
     })
@@ -136,9 +167,18 @@ function render() {
 }
 
 function handleClick(e) {
+  if (e.target.closest('[data-toggle-hidden]')) {
+    showHidden = !showHidden
+    render()
+    return
+  }
   const btn = e.target.closest('button.settled-action')
   if (!btn || btn.disabled) return
   const { action, cartId } = btn.dataset
+  if (ONE_TAP.has(action)) {
+    run(action, cartId)
+    return
+  }
   const key = `${action}:${cartId}`
   if (confirming.has(key)) {
     clearTimeout(confirming.get(key))
@@ -185,6 +225,24 @@ async function run(action, cartId) {
       if (!res.ok) return deps.notify('error', res.body.error || '취소를 요청하지 못했습니다.')
       markLocal([cartId], { status: 'refund_requested' })
       return deps.notify('success', '프론트로 취소를 요청했습니다. 손님이 프론트에서 결제한 카드를 꽂으면 취소됩니다.')
+    }
+    if (action === 'hide' || action === 'unhide') {
+      const res = await post(`/api/pos/erp-carts/${cartId}/hide`, { hidden: action === 'hide' })
+      if (!res.ok) return deps.notify('error', res.body.error || '처리하지 못했습니다.')
+      markLocal([cartId], { hidden: action === 'hide' })
+      return deps.notify('success', action === 'hide' ? '숨겼습니다. 맨 위 [숨긴 결제 보기]로 다시 볼 수 있습니다.' : '다시 보이게 했습니다.')
+    }
+    if (action === 'delete') {
+      const res = await post(`/api/pos/erp-carts/${cartId}/delete`)
+      if (!res.ok) return deps.notify('error', res.body.error || '삭제하지 못했습니다.')
+      lastCarts = lastCarts.filter((c) => c.id !== cartId)
+      return deps.notify('success', '삭제했습니다.')
+    }
+    if (action === 'receipt') {
+      const res = await post(`/api/pos/erp-carts/${cartId}/resend-receipt`)
+      if (res.body?.receipt) markLocal([cartId], { receiptStatus: res.body.receipt })
+      if (!res.ok) return deps.notify('error', res.body.error || '영수증을 보내지 못했습니다.')
+      return deps.notify('success', '손님께 영수증을 보냈습니다.')
     }
     if (action === 'front-withdraw') {
       const res = await post(`/api/pos/erp-carts/${cartId}/refund-withdraw`)

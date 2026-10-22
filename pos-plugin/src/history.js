@@ -28,6 +28,11 @@ export function initHistory(injected) {
   const bodyHost = document.getElementById('history-body')
   if (bodyHost) {
     bodyHost.addEventListener('click', (e) => {
+      const tool = e.target.closest('.history-visit-tool')
+      if (tool) {
+        if (!tool.disabled) handleVisitTool(tool)
+        return
+      }
       const row = e.target.closest('.history-recent-row')
       if (!row) return
       const car = row.dataset.car
@@ -99,6 +104,7 @@ function ownerLine(info) {
 function renderVisits(carNumber, visits, info = {}) {
   const body = bodyEl()
   if (!body) return
+  lastRendered = { carNumber, visits, info }
   const owner = ownerLine(info)
   const head = `
     <div class="history-owner">
@@ -143,9 +149,81 @@ function renderVisits(carNumber, visits, info = {}) {
           <li>${deps.escapeHtml(i.name)} <span class="history-qty">×${i.quantity}</span></li>
         `).join('')}</ul>` : ''}
         ${total ? `<div class="history-total">${formatWon(total)}</div>` : ''}
+        ${visitTools(v)}
       </article>
     `
   }).join('')
+}
+
+// ── 방문 카드 도구: 이력에서 숨기기(리허설·테스트 기록 정리), 완료 문자 다시 보내기 ─────────────
+// 둘 다 두 번 눌러야 실행된다(숨기면 이 화면에서는 되돌릴 수 없고, 완료 문자는 손님에게 간다).
+const toolConfirm = new Map() // key -> timeoutId
+const toolBusy = new Set()
+
+function toolButton(key, label, confirmLabel, data) {
+  const attrs = Object.entries(data).map(([k, val]) => `data-${k}="${deps.escapeHtml(val)}"`).join(' ')
+  return `<button class="history-visit-tool${toolConfirm.has(key) ? ' confirming' : ''}" type="button" data-key="${deps.escapeHtml(key)}" ${attrs}
+            ${toolBusy.has(key) ? 'disabled' : ''}>${toolConfirm.has(key) ? confirmLabel : label}</button>`
+}
+
+function visitTools(v) {
+  const parts = []
+  if (v.reservationId && v.status === 'completed') {
+    parts.push(toolButton(`done:${v.reservationId}`, '완료 문자 보내기', '손님께 보낼까요?', { tool: 'done', id: v.reservationId }))
+  }
+  if (v.reservationId) {
+    parts.push(toolButton(`hide-res:${v.reservationId}`, '이력에서 숨기기', '정말 숨길까요?', { tool: 'hide-res', id: v.reservationId }))
+  } else if (v.orders && v.orders[0]?.id) {
+    parts.push(toolButton(`hide-cart:${v.orders[0].id}`, '이력에서 숨기기', '정말 숨길까요?', { tool: 'hide-cart', id: v.orders[0].id }))
+  }
+  return parts.length ? `<div class="history-visit-tools">${parts.join('')}</div>` : ''
+}
+
+let lastRendered = null // { carNumber, visits, info } -- 확인 상태만 바뀔 때 다시 그리는 용도
+
+function rerender() {
+  // 그 사이 최근 목록 등 다른 화면으로 바뀌었으면 건드리지 않는다.
+  if (!lastRendered || !bodyEl()?.querySelector('.history-owner')) return
+  renderVisits(lastRendered.carNumber, lastRendered.visits, lastRendered.info)
+}
+
+function handleVisitTool(btn) {
+  const { key, tool, id } = btn.dataset
+  if (!toolConfirm.has(key)) {
+    for (const t of toolConfirm.values()) clearTimeout(t)
+    toolConfirm.clear()
+    toolConfirm.set(key, setTimeout(() => { toolConfirm.delete(key); rerender() }, 3000))
+    rerender()
+    return
+  }
+  clearTimeout(toolConfirm.get(key))
+  toolConfirm.delete(key)
+  runVisitTool(key, tool, id)
+}
+
+async function runVisitTool(key, tool, id) {
+  toolBusy.add(key)
+  rerender()
+  try {
+    let res
+    if (tool === 'done') {
+      res = await deps.apiPost(`/api/pos/queue/${encodeURIComponent(id)}/resend-done`)
+    } else {
+      res = await deps.apiPost('/api/pos/history/hide', tool === 'hide-res' ? { reservationId: id } : { cartId: id })
+    }
+    if (!res.ok) {
+      if (res.status === 401) return deps.onUnauthorized(res.body.error)
+      return deps.notify('error', res.body.error || '처리하지 못했습니다.')
+    }
+    if (tool === 'done') return deps.notify('success', '손님께 정비 완료 문자를 보냈습니다.')
+    deps.notify('success', '정비 이력에서 숨겼습니다.')
+    if (shownCarNumber) await search(shownCarNumber)
+  } catch {
+    deps.notify('error', '서버에 연결하지 못했습니다. 잠시 후 다시 시도해주세요.')
+  } finally {
+    toolBusy.delete(key)
+    rerender()
+  }
 }
 
 // 화면에 들어올 때 부른다. 차량번호를 모르는 상태에서도 뭔가 보여야 이력 화면이다.
@@ -183,6 +261,7 @@ export async function loadRecentHistory() {
 function renderRecent(visits) {
   const body = bodyEl()
   if (!body) return
+  lastRendered = null
   if (!visits.length) {
     body.innerHTML = `
       <div class="empty">

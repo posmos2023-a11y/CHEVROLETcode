@@ -1293,7 +1293,7 @@ async function markErpCartRefunded(id, storeId, fromStatuses, note) {
 // POS 탭앱 "오늘 결제" 목록: 결제 완료·취소 진행·취소된 전산 주문. 결제 취소 버튼을 여기서 누른다.
 function listSettledErpCartsForPos(storeId, since, limit) {
   return prisma.erpCart.findMany({
-    where: { storeId, status: { in: [...PAID_LIKE_STATUSES, 'refunded'] }, paidAt: { gte: since } },
+    where: { storeId, status: { in: [...PAID_LIKE_STATUSES, 'refunded'] }, paidAt: { gte: since }, deletedAt: null },
     orderBy: { paidAt: 'desc' },
     take: limit,
   })
@@ -1345,6 +1345,42 @@ async function findOpenReservationByCarNumber(storeId, carNumber, serviceDate) {
     take: 2, // 2건만 가져오면 "정확히 1건인가"를 판정하기에 충분하다
   })
   return matches.length === 1 ? matches[0] : null
+}
+
+// --- 탭앱 정리(숨기기·삭제) ---------------------------------------------------------------
+// 결제가 끝난(또는 취소된) 전산 주문만 대상이다. 결제 취소가 진행 중(refund_requested/refunding)인 건은
+// 삭제하면 프론트가 취소를 끝내도 화면에서 확인할 곳이 없어지므로 막는다(숨기기는 된다).
+const CLEANUP_STATUSES = ['paid', 'refunded']
+
+async function setErpCartHidden(storeId, id, hidden) {
+  const result = await prisma.erpCart.updateMany({
+    where: { id, storeId, deletedAt: null, status: { in: [...CLEANUP_STATUSES, 'refund_requested', 'refunding'] } },
+    data: { hiddenAt: hidden ? new Date() : null },
+  })
+  return result.count > 0
+}
+
+async function softDeleteErpCart(storeId, id) {
+  const result = await prisma.erpCart.updateMany({
+    where: { id, storeId, deletedAt: null, status: { in: CLEANUP_STATUSES } },
+    data: { deletedAt: new Date() },
+  })
+  return result.count > 0
+}
+
+// 정비 이력에서 한 방문을 숨긴다. 예약 방문이면 그 예약과 거기 이어진 전산 주문을 함께 숨긴다.
+async function hideHistoryVisit(storeId, { reservationId, cartId }) {
+  let count = 0
+  if (reservationId) {
+    const r = await prisma.reservation.updateMany({ where: { id: reservationId, storeId }, data: { historyHiddenAt: new Date() } })
+    count += r.count
+    if (r.count) await prisma.erpCart.updateMany({ where: { storeId, reservationId, hiddenAt: null }, data: { hiddenAt: new Date() } })
+  }
+  if (cartId) {
+    const c = await prisma.erpCart.updateMany({ where: { id: cartId, storeId }, data: { hiddenAt: new Date() } })
+    count += c.count
+  }
+  return count > 0
 }
 
 // 결제가 끝났을 때 이을 예약을 찾는다(영수증 번호·정비 이력 묶음용). 접수 때(findOpenReservationByCarNumber)와
@@ -1668,7 +1704,7 @@ async function listPromoCampaignCandidates(storeId, start, end, { skipRecentFail
 // 원래 다르다(getDailySummary도 같은 이유로 인자를 나눠 받는다).
 async function getPosDailySummary(storeId, serviceDate, dateStart, dateEnd) {
   const reservationWhere = { storeId, serviceDate }
-  const cartWhere = { storeId, createdAt: { gte: dateStart, lt: dateEnd } }
+  const cartWhere = { storeId, createdAt: { gte: dateStart, lt: dateEnd }, deletedAt: null }
 
   const [received, completed, cartTotal, cartPaid, paidAmount] = await Promise.all([
     prisma.reservation.count({ where: reservationWhere }),
@@ -1714,6 +1750,8 @@ async function listRecentRepairHistory(storeId, limit = 20) {
       status: { in: ['loaded', 'paid'] },
       carNumber: { not: null },
       createdAt: { gte: since },
+      hiddenAt: null,
+      deletedAt: null,
     },
     orderBy: { createdAt: 'desc' },
     take,
@@ -1729,6 +1767,7 @@ async function listRecentRepairHistory(storeId, limit = 20) {
       storeId,
       status: 'completed',
       anonymizedAt: null,
+      historyHiddenAt: null,
       completedAt: { gte: since },
       id: { notIn: carts.map((c) => c.reservationId).filter(Boolean) },
     },
@@ -1745,7 +1784,7 @@ async function findRepairHistoryByCarNumber(storeId, carNumber, limit = 10) {
   if (!value) return []
 
   const reservations = await prisma.reservation.findMany({
-    where: { storeId, carNumber: value, anonymizedAt: null },
+    where: { storeId, carNumber: value, anonymizedAt: null, historyHiddenAt: null },
     orderBy: { createdAt: 'desc' },
     take: Math.min(Math.max(Number(limit) || 10, 1), 50),
     select: {
@@ -1756,7 +1795,7 @@ async function findRepairHistoryByCarNumber(storeId, carNumber, limit = 10) {
 
   // 같은 차의 전산 주문도 함께 본다(예약 없이 방문한 건도 잡힌다).
   const carts = await prisma.erpCart.findMany({
-    where: { storeId, carNumber: value, status: { in: ['loaded', 'paid'] } },
+    where: { storeId, carNumber: value, status: { in: ['loaded', 'paid'] }, hiddenAt: null, deletedAt: null },
     orderBy: { createdAt: 'desc' },
     take: 50,
     select: {
@@ -1839,6 +1878,7 @@ async function listErpCarts({ storeId, status, limit = 50, offset = 0 }) {
   const where = {
     ...(storeId ? { storeId } : {}),
     ...(status ? { status } : {}),
+    deletedAt: null,
   }
   const take = Math.min(Math.max(Number(limit) || 50, 1), 200)
   const skip = Math.max(Number(offset) || 0, 0)
@@ -2091,6 +2131,7 @@ async function getDailySummary({ storeId, date, dateStart, dateEnd }) {
   const erpCartWhere = {
     ...(storeId ? { storeId } : {}),
     ...(dateStart && dateEnd ? { createdAt: { gte: dateStart, lt: dateEnd } } : {}),
+    deletedAt: null,
   }
 
   const [
@@ -2259,6 +2300,9 @@ module.exports = {
   completeReservationAfterPayment,
   findOpenReservationByCarNumber,
   findReservationForPaymentByCarNumber,
+  setErpCartHidden,
+  softDeleteErpCart,
+  hideHistoryVisit,
   expireStaleErpCarts,
   cancelErpCart,
 }

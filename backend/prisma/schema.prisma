@@ -65,6 +65,7 @@ model Reservation {
   privacyConsentAt   DateTime? // 개인정보 수집·이용 동의 시각
   marketingConsentAt DateTime? // 광고성 정보 수신 동의 시각(선택) — null이면 프로모션 발송 대상에서 제외
   anonymizedAt       DateTime? // 보관기간(DATA_RETENTION_DAYS) 경과 후 파기(익명화) 시각
+  historyHiddenAt    DateTime? // 탭앱 [정비 이력]에서 숨긴 시각(리허설·테스트 기록 정리용). 대기열·관리자 웹에는 영향 없음
 
   erpCarts ErpCart[]
 
@@ -226,6 +227,12 @@ model ErpCart {
   // 결제 후 전자영수증 알림톡 결과. sent | failed | no_reservation(예약과 이어지지 않아 번호를 모름) |
   // no_phone. 관리자 웹 전산 주문 이력에 보여 "영수증이 안 왔어요"의 원인을 바로 알 수 있게 한다.
   receiptStatus     String?
+
+  // 탭앱 정리용. hiddenAt: [최근 결제]·[정비 이력]에서 숨김(다시 보이게 할 수 있다, 관리자 웹·합계에는 남는다).
+  // deletedAt: 삭제 -- 탭앱·오늘 현황 합계·관리자 웹 목록 어디에도 안 나온다. 행은 지우지 않는다: 실제 돈이
+  // 오간 결제라 카드사·토스 분쟁이나 대사 때 근거가 있어야 한다(전산의 상태 조회도 그대로 답한다).
+  hiddenAt          DateTime?
+  deletedAt         DateTime?
 
   @@index([storeId, status, createdAt])
   @@index([storeId, payTarget, status, createdAt])

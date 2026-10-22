@@ -487,6 +487,38 @@
   .settled-action.danger { color: var(--red); }
   .settled-action:disabled { opacity: 0.5; cursor: wait; }
   .settled-action.confirming { border-color: var(--red); background: var(--red); color: #fff; }
+  /* 정리 버튼 줄(영수증·숨기기·삭제). 결제 취소 줄보다 작게 해 실수로 누르지 않게 한다. */
+  .settled-tools .settled-action { min-height: 40px; font-size: 12px; color: var(--sub); }
+  .settled-tools .settled-action.danger { color: var(--red); }
+  .settled-tools .settled-action.confirming { color: #fff; }
+  .settled-cart-item.is-hidden { opacity: 0.6; }
+  .settled-hidden-toggle {
+    display: block;
+    width: 100%;
+    min-height: 40px;
+    margin-bottom: 8px;
+    border: 1px dashed var(--line);
+    border-radius: 12px;
+    background: transparent;
+    color: var(--sub);
+    font-size: 13px;
+    cursor: pointer;
+  }
+  /* 정비 이력 방문 카드의 숨기기·완료 문자 버튼 */
+  .history-visit-tools { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+  .history-visit-tool {
+    min-height: 38px;
+    padding: 0 12px;
+    border: 1px solid var(--line);
+    border-radius: 11px;
+    background: var(--surface);
+    color: var(--sub);
+    font-size: 12px;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  .history-visit-tool.confirming { border-color: var(--red); background: var(--red); color: #fff; }
+  .history-visit-tool:disabled { opacity: 0.5; cursor: wait; }
 
   .front-cart-section { margin-top: 20px; }
   .front-cart-section[hidden] { display: none; }

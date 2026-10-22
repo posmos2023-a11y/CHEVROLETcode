@@ -828,6 +828,7 @@ function renderErpCarts() {
             ${['paid', 'refund_requested', 'refunding', 'refunded'].includes(c.status)
               ? `<br><span class="muted">${c.tossVerified ? '✓ 토스 결제내역 확인' : '토스 결제내역 미확인'}</span>` : ''}
             ${c.receiptStatus ? `<br><span class="muted">영수증: ${escapeHtml(RECEIPT_STATUS_LABEL[c.receiptStatus] || c.receiptStatus)}</span>` : ''}
+            ${c.status === 'paid' ? `<br><button class="row-btn" type="button" data-resend-receipt="${escapeHtml(c.id)}">${c.receiptStatus === 'sent' ? '영수증 다시 보내기' : '영수증 보내기'}</button>` : ''}
             ${c.refundNote ? `<br><span class="muted">${escapeHtml(c.refundNote)}</span>` : ''}
             ${c.errorMessage ? `<br><span class="muted">${escapeHtml(c.errorMessage)}</span>` : ''}</td>
         <td>${escapeHtml(formatWhen(c.loadedAt))}<br>
@@ -870,8 +871,26 @@ async function loadErpCarts({ mode = 'reset' } = {}) {
   }
 }
 
-erpCartBody.addEventListener('click', (e) => {
+erpCartBody.addEventListener('click', async (e) => {
   if (e.target.id === 'erp-cart-load-more') loadErpCarts({ mode: 'append' })
+  const id = e.target.dataset?.resendReceipt
+  if (!id) return
+  if (!window.confirm('예약 손님 번호로 전자영수증을 보냅니다. 보낼까요?')) return
+  e.target.disabled = true
+  try {
+    const { body } = await apiPost(`/api/admin/erp-carts/${id}/resend-receipt`)
+    alert(body.message || body.error || '처리했습니다.')
+    loadErpCarts()
+  } catch (err) {
+    if (err.message === 'UNAUTHORIZED') {
+      clearSession()
+      showLogin('세션이 만료되었습니다. 다시 로그인해주세요.')
+      return
+    }
+    alert('요청 중 오류가 발생했습니다.')
+  } finally {
+    e.target.disabled = false
+  }
 })
 
 if (erpCartPanel) {

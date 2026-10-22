@@ -2255,3 +2255,32 @@ testSerial('영수증: POS에서 결제한 전산 주문도 예약과 이어져 
   assert.equal(again.body.alreadyProcessed, true)
   assert.equal(global.__notifications.filter((n) => n.method === 'sendReceiptAlimtalk').length, 1)
 })
+
+testSerial('정비 이력 숨기기: 예약 방문을 숨기면 그 예약과 이어진 주문이 이력에서 빠진다', async () => {
+  const store = await createStore('hist-hide')
+  const { reservation } = await visitWithOrder(store, '24가2424', '엔진오일 교환')
+  const before = await getHistory(store, '24가2424')
+  assert.equal(before.body.visits.length, 1)
+  const res = await request(app).post('/api/pos/history/hide').set('X-Store-Token', store.posToken).send({ reservationId: reservation.id })
+  assert.equal(res.status, 200)
+  const after = await getHistory(store, '24가2424')
+  assert.equal(after.body.visits.length, 0)
+  const recent = await getRecent(store)
+  assert.equal(recent.body.visits.length, 0)
+  // 다른 매장 토큰으로는 숨길 수 없다
+  const other = await createStore('hist-hide-other')
+  assert.equal((await request(app).post('/api/pos/history/hide').set('X-Store-Token', other.posToken).send({ reservationId: reservation.id })).status, 404)
+})
+
+testSerial('완료 문자 다시 보내기: 정비완료된 예약만, 다른 매장은 404', async () => {
+  global.__notifications.length = 0
+  const store = await createStore('resend-done')
+  const r = await calledReservation(store)
+  assert.equal((await request(app).post(`/api/pos/queue/${r.id}/resend-done`).set('X-Store-Token', store.posToken)).status, 409)
+  await posComplete(store, r.id)
+  const res = await request(app).post(`/api/pos/queue/${r.id}/resend-done`).set('X-Store-Token', store.posToken)
+  assert.equal(res.status, 200)
+  assert.equal(global.__notifications.filter((n) => n.method === 'sendRepairDoneAlimtalk').length, 2)
+  const other = await createStore('resend-done-other')
+  assert.equal((await request(app).post(`/api/pos/queue/${r.id}/resend-done`).set('X-Store-Token', other.posToken)).status, 404)
+})
