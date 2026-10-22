@@ -52,6 +52,11 @@ export function initHistory(injected) {
     search(inputEl().value)
   })
 
+  // 검색어를 다 지우면 바로 전체 최근 목록으로 돌아간다(직원이 [조회]를 다시 누르지 않아도 되게).
+  inputEl()?.addEventListener('input', () => {
+    if (!inputEl().value.trim()) showRecentList()
+  })
+
 }
 
 // 대기 고객 카드의 [이력] 버튼에서 부른다 — 직원이 차량번호를 다시 칠 이유가 없다.
@@ -229,6 +234,14 @@ async function runVisitTool(key, tool, id) {
   }
 }
 
+// 검색을 풀고 최근 목록으로 돌아간다. 차량 화면에 띄워 둔 홍보 발송 칸도 함께 닫는다.
+function showRecentList() {
+  shownCarNumber = ''
+  const promo = promoEl()
+  if (promo) promo.hidden = true
+  loadRecentHistory()
+}
+
 // 화면에 들어올 때 부른다. 차량번호를 모르는 상태에서도 뭔가 보여야 이력 화면이다.
 export async function loadRecentHistory() {
   const isLatest = claimRender()
@@ -332,7 +345,8 @@ async function search(rawCarNumber) {
   const carNumber = String(rawCarNumber || '').trim()
   const body = bodyEl()
   if (!carNumber) {
-    body.innerHTML = '<div class="empty"><div class="empty-copy">차량번호나 전화번호를 입력해주세요.</div></div>'
+    // 빈 검색은 "전체 보기"로 본다.
+    showRecentList()
     return
   }
   const phone = asPhone(carNumber)
