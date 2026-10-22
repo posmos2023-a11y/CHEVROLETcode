@@ -2284,3 +2284,36 @@ testSerial('완료 문자 다시 보내기: 정비완료된 예약만, 다른 �
   const other = await createStore('resend-done-other')
   assert.equal((await request(app).post(`/api/pos/queue/${r.id}/resend-done`).set('X-Store-Token', other.posToken)).status, 404)
 })
+
+testSerial('정비 이력 삭제: 예약 방문을 삭제하면 이력·최근 결제·오늘 현황에서 이어진 결제까지 빠진다', async () => {
+  const store = await createStore('hist-delete')
+  const { reservation, cartId } = await visitWithOrder(store, '25가2525', '엔진오일 교환')
+  const del = (body) => request(app).post('/api/pos/history/delete').set('X-Store-Token', store.posToken).send(body)
+
+  assert.equal((await del({ reservationId: reservation.id })).status, 200)
+  assert.equal((await getHistory(store, '25가2525')).body.visits.length, 0)
+  const queue = await request(app).get('/api/pos/queue').set('X-Store-Token', store.posToken)
+  assert.equal(queue.body.settledCarts.some((c) => c.id === cartId), false)
+  const summary = await request(app).get('/api/pos/summary').set('X-Store-Token', store.posToken)
+  assert.equal(summary.body.erpCartsPaid, 0)
+  const row = await prisma.erpCart.findUnique({ where: { id: cartId } })
+  assert.ok(row.deletedAt)
+  assert.equal(row.status, 'paid') // 행과 결제 상태는 그대로 남는다
+  assert.equal((await del({})).status, 400)
+  const other = await createStore('hist-delete-other')
+  assert.equal((await request(app).post('/api/pos/history/delete').set('X-Store-Token', other.posToken).send({ reservationId: reservation.id })).status, 404)
+})
+
+testSerial('정비 이력 삭제: 결제 취소가 진행 중인 주문이 있으면 409, 주문만 있는 방문은 그 주문을 지운다', async () => {
+  const store = await createStore('hist-delete-guard')
+  const { reservation, cartId } = await visitWithOrder(store, '26가2626', '점검')
+  await prisma.erpCart.update({ where: { id: cartId }, data: { status: 'refund_requested', refundRequestedAt: new Date() } })
+  assert.equal((await request(app).post('/api/pos/history/delete').set('X-Store-Token', store.posToken).send({ reservationId: reservation.id })).status, 409)
+  assert.equal((await prisma.reservation.findUnique({ where: { id: reservation.id } })).historyHiddenAt, null)
+
+  assert.equal((await postCart(validBody(store, { carNumber: '27가2727' }))).status, 201)
+  const lone = (await getPosCarts(store)).body.carts.find((c) => c.carNumber === '27가2727')
+  await consumeCart(store, lone.id, { result: 'loaded' })
+  assert.equal((await request(app).post('/api/pos/history/delete').set('X-Store-Token', store.posToken).send({ cartId: lone.id })).status, 200)
+  assert.equal((await getHistory(store, '27가2727')).body.visits.length, 0)
+})

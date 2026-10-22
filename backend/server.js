@@ -110,6 +110,7 @@ const {
   setErpCartHidden,
   softDeleteErpCart,
   hideHistoryVisit,
+  deleteHistoryVisit,
   cancelErpCart,
 } = require('./src/store')
 const { createTossDraftOrder } = require('./src/tossOrderClient')
@@ -2792,6 +2793,20 @@ app.post('/api/pos/history/hide', posIpFloodLimiter, posLimiter, requireStoreTok
   if (!reservationId && !cartId) return res.status(400).json({ ok: false, error: '숨길 방문이 없습니다.' })
   const changed = await hideHistoryVisit(req.store.id, { reservationId, cartId })
   if (!changed) return res.status(404).json({ ok: false, error: '방문 기록을 찾을 수 없습니다.' })
+  return res.json({ ok: true })
+}))
+
+// 정비 이력에서 한 방문 삭제(이어진 결제 기록도 함께). body: { reservationId } 또는 { cartId }
+app.post('/api/pos/history/delete', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  const reservationId = req.body?.reservationId ? String(req.body.reservationId) : null
+  const cartId = req.body?.cartId ? String(req.body.cartId) : null
+  if (!reservationId && !cartId) return res.status(400).json({ ok: false, error: '삭제할 방문이 없습니다.' })
+  const result = await deleteHistoryVisit(req.store.id, { reservationId, cartId })
+  if (result === 'not_found') return res.status(404).json({ ok: false, error: '방문 기록을 찾을 수 없습니다.' })
+  if (result === 'refund_in_progress') {
+    return res.status(409).json({ ok: false, error: '결제 중이거나 결제 취소가 진행 중인 주문이 있어 지금은 삭제할 수 없습니다.' })
+  }
+  logger.info('[pos] 정비 이력 삭제(숨김 처리)', { storeId: req.store.id, reservationId, cartId })
   return res.json({ ok: true })
 }))
 

@@ -1383,6 +1383,32 @@ async function hideHistoryVisit(storeId, { reservationId, cartId }) {
   return count > 0
 }
 
+// 정비 이력에서 한 방문을 삭제한다. 예약 방문이면 그 예약을 이력에서 빼고, 거기 이어진 전산 주문(담김·결제·취소됨)도
+// 함께 삭제한다(최근 결제·오늘 현황·관리자 목록에서도 빠진다). 주문만 있는 방문이면 그 주문을 삭제한다.
+// 결제 취소가 진행 중인 주문이 섞여 있으면 아무것도 바꾸지 않는다(취소 결과를 확인할 곳이 없어진다).
+// 행은 지우지 않는다(softDeleteErpCart와 같은 이유). 반환: 'ok' | 'not_found' | 'refund_in_progress'
+const HISTORY_DELETABLE_CART_STATUSES = ['loaded', 'paid', 'refunded']
+
+async function deleteHistoryVisit(storeId, { reservationId, cartId }) {
+  return prisma.$transaction(async (tx) => {
+    const now = new Date()
+    if (reservationId) {
+      const reservation = await tx.reservation.findFirst({ where: { id: reservationId, storeId } })
+      if (!reservation) return 'not_found'
+      const busy = await tx.erpCart.count({ where: { storeId, reservationId, status: { in: ['refund_requested', 'refunding', 'paying'] }, deletedAt: null } })
+      if (busy) return 'refund_in_progress'
+      await tx.reservation.update({ where: { id: reservationId }, data: { historyHiddenAt: now } })
+      await tx.erpCart.updateMany({ where: { storeId, reservationId, deletedAt: null, status: { in: HISTORY_DELETABLE_CART_STATUSES } }, data: { deletedAt: now } })
+      return 'ok'
+    }
+    const cart = await tx.erpCart.findFirst({ where: { id: cartId, storeId, deletedAt: null } })
+    if (!cart) return 'not_found'
+    if (!HISTORY_DELETABLE_CART_STATUSES.includes(cart.status)) return 'refund_in_progress'
+    await tx.erpCart.update({ where: { id: cart.id }, data: { deletedAt: now } })
+    return 'ok'
+  })
+}
+
 // 결제가 끝났을 때 이을 예약을 찾는다(영수증 번호·정비 이력 묶음용). 접수 때(findOpenReservationByCarNumber)와
 // 달리 **오늘 이미 끝난 예약도** 본다 -- 정비가 끝나 직원이 [완료]를 누른 뒤에 전산 주문을 넣고 결제하는
 // 흐름이 가장 흔한데, 그때는 안 끝난 예약이 없어서 영수증 번호를 못 찾았다.
@@ -2303,6 +2329,7 @@ module.exports = {
   setErpCartHidden,
   softDeleteErpCart,
   hideHistoryVisit,
+  deleteHistoryVisit,
   expireStaleErpCarts,
   cancelErpCart,
 }
