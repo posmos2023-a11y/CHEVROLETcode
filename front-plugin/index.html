@@ -55,25 +55,18 @@
         window.addEventListener('pagehide', () => { stopped = true })
       }
 
+      // [결제하기](금액을 직접 넣는 payment.html)는 뺐다. 정비 결제는 전산 주문이 들어오면 아래 watchErpCarts가
+      // 결제 화면(erp-pay.html)으로 자동으로 넘기므로, 손님이 누를 버튼은 예약 하나면 된다.
       sdk.template.renderIdlePage({
-        type: 'twoButton',
-        title: {
-          text1: '쉐보레',
-          text2: '예약 · 결제',
-        },
+        type: 'oneButton',
         description: {
-          text: '차량번호로 예약하거나, 결제 후 전자영수증을 받아보세요.',
+          text: '쉐보레 정비 예약',
+          subText: '차량번호로 예약하면 순서를 알림톡으로 알려드려요',
         },
-        primaryButton: {
+        button: {
           text: '예약하기',
           onClick: () => {
             location.href = './reservation.html'
-          },
-        },
-        secondaryButton: {
-          text: '결제하기',
-          onClick: () => {
-            location.href = './payment.html'
           },
         },
       })
