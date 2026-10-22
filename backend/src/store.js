@@ -1347,6 +1347,25 @@ async function findOpenReservationByCarNumber(storeId, carNumber, serviceDate) {
   return matches.length === 1 ? matches[0] : null
 }
 
+// 결제가 끝났을 때 이을 예약을 찾는다(영수증 번호·정비 이력 묶음용). 접수 때(findOpenReservationByCarNumber)와
+// 달리 **오늘 이미 끝난 예약도** 본다 -- 정비가 끝나 직원이 [완료]를 누른 뒤에 전산 주문을 넣고 결제하는
+// 흐름이 가장 흔한데, 그때는 안 끝난 예약이 없어서 영수증 번호를 못 찾았다.
+// 애매하면 잇지 않는 원칙은 같다: 안 끝난 예약이 정확히 1건이면 그것, 안 끝난 예약이 없고 오늘 끝난 예약이
+// 정확히 1건이면 그것, 그 밖(같은 차가 오늘 두 번 온 경우 등)은 null. 취소된 예약은 보지 않는다.
+async function findReservationForPaymentByCarNumber(storeId, carNumber, serviceDate) {
+  if (!carNumber) return null
+  const rows = await prisma.reservation.findMany({
+    where: { storeId, carNumber, serviceDate, status: { not: 'cancelled' } },
+    orderBy: { createdAt: 'desc' },
+    take: 5,
+  })
+  const open = rows.filter((r) => r.status !== 'completed')
+  if (open.length === 1) return open[0]
+  if (open.length > 1) return null
+  const done = rows.filter((r) => r.status === 'completed')
+  return done.length === 1 ? done[0] : null
+}
+
 // 결제가 끝났을 때의 예약 완료 처리.
 //
 // 직원이 누르는 [완료](markReservationCompleted)는 called/notify_failed에서만 동작한다 —
@@ -2239,6 +2258,7 @@ module.exports = {
   listPromoCampaignCandidates,
   completeReservationAfterPayment,
   findOpenReservationByCarNumber,
+  findReservationForPaymentByCarNumber,
   expireStaleErpCarts,
   cancelErpCart,
 }

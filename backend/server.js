@@ -106,6 +106,7 @@ const {
   listPromoCampaignCandidates,
   completeReservationAfterPayment,
   findOpenReservationByCarNumber,
+  findReservationForPaymentByCarNumber,
   cancelErpCart,
 } = require('./src/store')
 const { createTossDraftOrder } = require('./src/tossOrderClient')
@@ -3101,15 +3102,16 @@ async function sendErpCartReceiptInner(cart, storeName) {
 }
 
 // 결제가 끝났는데 주문이 예약과 이어져 있지 않으면 지금 다시 찾아 잇는다. 전산 주문을 먼저 넣고 손님이
-// 나중에 프론트에서 예약한 경우다(접수 때는 이을 예약이 없었다). 잇는 규칙은 접수 때와 같다 -- 같은 매장,
-// 오늘, 아직 안 끝난 예약이 그 차량번호로 정확히 1건일 때만. 이어지면 정비완료 자동 처리와 영수증이 따라온다.
+// 나중에 예약했거나, 직원이 [완료]를 누른 뒤에 전산 주문을 넣은 경우다(접수 때는 이을 안 끝난 예약이 없었다).
+// 같은 매장·오늘·그 차량번호로 애매하지 않게 1건일 때만 잇는다(store.findReservationForPaymentByCarNumber).
+// 이어지면 정비완료 자동 처리(안 끝난 예약일 때)와 영수증이 따라온다.
 // 반환: 이어진(또는 원래 이어져 있던) reservationId 또는 null
 async function linkPaidCartToReservation(cart) {
   if (cart.reservationId) return cart.reservationId
   const carNumber = normalizeCarNumber(cart.carNumber)
   if (!carNumber) return null
   try {
-    const reservation = await findOpenReservationByCarNumber(cart.storeId, carNumber, kstDateString())
+    const reservation = await findReservationForPaymentByCarNumber(cart.storeId, carNumber, kstDateString())
     if (!reservation) return null
     const result = await prisma.erpCart.updateMany({ where: { id: cart.id, reservationId: null }, data: { reservationId: reservation.id } })
     return result.count ? reservation.id : null

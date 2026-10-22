@@ -665,3 +665,40 @@ testSerial('영수증: 예약이 없으면 receiptStatus=no_reservation으로 �
   const row = await prisma.erpCart.findUnique({ where: { id: cartId } })
   assert.equal(row.receiptStatus, 'no_reservation')
 })
+
+testSerial('영수증: 직원이 [완료]를 누른 뒤에 전산 주문을 넣고 결제해도 그 예약 번호로 영수증이 간다', async () => {
+  global.__notifications.length = 0
+  const store = await createStore('receipt-after-done')
+  const reservation = await prisma.reservation.create({
+    data: {
+      storeId: store.id, carNumber: '12가3456', phone: '01066667777', serviceType: '엔진오일',
+      queueNumber: 4, serviceDate: new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10),
+      status: 'completed', completedAt: new Date(),
+    },
+  })
+  const created = await postCart(validBody(store, { payTarget: 'front', carNumber: '12가3456' }))
+  assert.equal(created.body.linkedReservation, false) // 끝난 예약에는 접수 때 잇지 않는다
+  const paymentKey = newPaymentKey()
+  await startFront(store, created.body.cartId, paymentKey)
+  const res = await reportFront(store, created.body.cartId, { result: 'paid', paymentKey, payment: SAMPLE_CARD_PAYMENT })
+  assert.equal(res.body.receipt, 'sent', JSON.stringify(res.body))
+  assert.equal(global.__notifications.find((n) => n.method === 'sendReceiptAlimtalk').payload.phone, '01066667777')
+  assert.equal((await prisma.erpCart.findUnique({ where: { id: created.body.cartId } })).reservationId, reservation.id)
+})
+
+testSerial('영수증: 같은 차가 오늘 두 번 왔으면(끝난 예약 2건) 누구 번호인지 몰라 보내지 않는다', async () => {
+  global.__notifications.length = 0
+  const store = await createStore('receipt-ambiguous')
+  const today = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10)
+  for (const [i, phone] of [['5', '01011112222'], ['6', '01033334444']]) {
+    await prisma.reservation.create({
+      data: { storeId: store.id, carNumber: '12가3456', phone, serviceType: '점검', queueNumber: Number(i), serviceDate: today, status: 'completed', completedAt: new Date() },
+    })
+  }
+  const created = await postCart(validBody(store, { payTarget: 'front', carNumber: '12가3456' }))
+  const paymentKey = newPaymentKey()
+  await startFront(store, created.body.cartId, paymentKey)
+  const res = await reportFront(store, created.body.cartId, { result: 'paid', paymentKey, payment: SAMPLE_CARD_PAYMENT })
+  assert.equal(res.body.receipt, 'no_reservation')
+  assert.equal(global.__notifications.filter((n) => n.method === 'sendReceiptAlimtalk').length, 0)
+})
