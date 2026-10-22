@@ -784,6 +784,10 @@ const ERP_STATUS_LABEL = {
   refund_requested: '취소 요청됨', refunding: '프론트 취소 중', refunded: '결제 취소됨',
   failed: '담기 실패', dismissed: '매장이 지움', expired: '만료됨', cancelled: '전산이 취소',
 }
+// 결제 후 전자영수증 결과(ErpCart.receiptStatus). 예약과 이어져야 손님 번호를 안다.
+const RECEIPT_STATUS_LABEL = {
+  sent: '보냄', failed: '발송 실패', no_reservation: '예약과 이어지지 않아 못 보냄', no_phone: '연락처 없음',
+}
 
 function formatWhen(v) {
   if (!v) return '-'
@@ -823,6 +827,7 @@ function renderErpCarts() {
             <br><span class="muted">${c.payTarget === 'front' ? '프론트 결제' : 'POS 결제'}</span>
             ${['paid', 'refund_requested', 'refunding', 'refunded'].includes(c.status)
               ? `<br><span class="muted">${c.tossVerified ? '✓ 토스 결제내역 확인' : '토스 결제내역 미확인'}</span>` : ''}
+            ${c.receiptStatus ? `<br><span class="muted">영수증: ${escapeHtml(RECEIPT_STATUS_LABEL[c.receiptStatus] || c.receiptStatus)}</span>` : ''}
             ${c.refundNote ? `<br><span class="muted">${escapeHtml(c.refundNote)}</span>` : ''}
             ${c.errorMessage ? `<br><span class="muted">${escapeHtml(c.errorMessage)}</span>` : ''}</td>
         <td>${escapeHtml(formatWhen(c.loadedAt))}<br>

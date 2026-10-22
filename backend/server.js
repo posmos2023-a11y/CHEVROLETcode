@@ -1625,6 +1625,7 @@ app.get('/api/admin/erp-carts', requireAuth, asyncHandler(async (req, res) => {
         memo: r.memo,
         carNumber: r.carNumber,
         linkedReservation: Boolean(r.reservationId),
+        receiptStatus: r.receiptStatus || null,
         itemCount: items.length,
         errorMessage: r.errorMessage,
         createdAt: r.createdAt,
@@ -2712,18 +2713,21 @@ app.post('/api/pos/erp-carts/:id/paid', posIpFloodLimiter, posLimiter, requireSt
   // 예약이 이어져 있으면 정비완료까지 자동으로 처리한다 — 결제가 끝났다는 건 정비가 끝났다는
   // 뜻이라, 직원이 [완료]를 또 누르게 할 이유가 없다. 이미 완료/취소된 예약이면 아무 일도
   // 일어나지 않는다(completeReservationAfterPayment가 상태를 확인한다).
+  const reservationId = await linkPaidCartToReservation(cart)
   let reservationCompleted = false
-  if (cart.reservationId) {
+  if (reservationId) {
     try {
-      reservationCompleted = await completeReservationAfterPayment(cart.reservationId)
+      reservationCompleted = await completeReservationAfterPayment(reservationId)
     } catch (e) {
       // 자동완료는 부가 기능이다. 여기서 실패해도 결제 기록 자체는 이미 남았으므로 500을
       // 내지 않는다 — 직원이 대기열에서 직접 완료 처리하면 된다.
       logger.error('[pos] 결제 후 예약 자동완료 실패', { cartId: cart.id, error: e.message })
     }
   }
+  // 프론트 결제와 같이 예약 번호로 전자영수증(품목·금액)을 보낸다. 이 요청이 paid로 바꾼 한 번만.
+  const receipt = await sendErpCartReceipt({ ...cart, reservationId }, req.store.name)
 
-  return res.json({ ok: true, alreadyProcessed: false, status: 'paid', reservationCompleted })
+  return res.json({ ok: true, alreadyProcessed: false, status: 'paid', reservationCompleted, receipt })
 }))
 
 // --- 전산 주문을 프론트 플러그인에서 직접 결제 (payTarget: 'front') ---
@@ -3062,8 +3066,14 @@ app.post('/api/front/erp-carts/:id/start', posIpFloodLimiter, posLimiter, requir
 // 프론트에서 결제가 끝난 전산 주문의 전자영수증 알림톡. 예약과 이어진 주문만 보낸다 -- 손님이 그 예약에서
 // 직접 넣은 번호라 확실하다. 차량번호로 연락처를 짐작해 보내면 차를 판 이전 주인처럼 엉뚱한 사람에게 갈 수
 // 있다. 실패해도 결제 기록에는 영향이 없다(로그만 남긴다).
-// 반환: sent | failed | no_reservation | no_phone
+// 반환: sent | failed | no_reservation | no_phone (ErpCart.receiptStatus에도 남겨 관리자 웹에 보인다)
 async function sendErpCartReceipt(cart, storeName) {
+  const status = await sendErpCartReceiptInner(cart, storeName)
+  await prisma.erpCart.update({ where: { id: cart.id }, data: { receiptStatus: status } }).catch(() => {})
+  return status
+}
+
+async function sendErpCartReceiptInner(cart, storeName) {
   if (!cart.reservationId) return 'no_reservation'
   const reservation = await prisma.reservation.findUnique({
     where: { id: cart.reservationId },
@@ -3087,6 +3097,25 @@ async function sendErpCartReceipt(cart, storeName) {
   } catch (e) {
     logger.error('[front] 결제 영수증 발송 실패', { cartId: cart.id, storeId: cart.storeId, error: e.message })
     return 'failed'
+  }
+}
+
+// 결제가 끝났는데 주문이 예약과 이어져 있지 않으면 지금 다시 찾아 잇는다. 전산 주문을 먼저 넣고 손님이
+// 나중에 프론트에서 예약한 경우다(접수 때는 이을 예약이 없었다). 잇는 규칙은 접수 때와 같다 -- 같은 매장,
+// 오늘, 아직 안 끝난 예약이 그 차량번호로 정확히 1건일 때만. 이어지면 정비완료 자동 처리와 영수증이 따라온다.
+// 반환: 이어진(또는 원래 이어져 있던) reservationId 또는 null
+async function linkPaidCartToReservation(cart) {
+  if (cart.reservationId) return cart.reservationId
+  const carNumber = normalizeCarNumber(cart.carNumber)
+  if (!carNumber) return null
+  try {
+    const reservation = await findOpenReservationByCarNumber(cart.storeId, carNumber, kstDateString())
+    if (!reservation) return null
+    const result = await prisma.erpCart.updateMany({ where: { id: cart.id, reservationId: null }, data: { reservationId: reservation.id } })
+    return result.count ? reservation.id : null
+  } catch (e) {
+    logger.error('[erp-cart] 결제 후 예약 연결 실패', { cartId: cart.id, error: e.message })
+    return null
   }
 }
 
@@ -3137,16 +3166,17 @@ app.post('/api/front/erp-carts/:id/result', posIpFloodLimiter, posLimiter, requi
     }
 
     // POS 결제 경로와 같이, 예약이 이어져 있으면 정비완료까지 자동으로 처리한다.
+    const reservationId = await linkPaidCartToReservation(cart)
     let reservationCompleted = false
-    if (cart.reservationId) {
+    if (reservationId) {
       try {
-        reservationCompleted = await completeReservationAfterPayment(cart.reservationId)
+        reservationCompleted = await completeReservationAfterPayment(reservationId)
       } catch (e) {
         logger.error('[front] 결제 후 예약 자동완료 실패', { cartId: cart.id, error: e.message })
       }
     }
     // 결제 기록이 끝난 뒤에 보낸다(이 요청이 paid로 바꾼 한 번만 -- 재시도 보고는 위에서 이미 돌려보냈다).
-    const receipt = await sendErpCartReceipt(cart, req.store.name)
+    const receipt = await sendErpCartReceipt({ ...cart, reservationId }, req.store.name)
     return res.json({ ok: true, alreadyProcessed: false, status: 'paid', reservationCompleted, receipt })
   }
 

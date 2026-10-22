@@ -633,3 +633,35 @@ testSerial('영수증: 발송에 실패해도 결제 완료 기록은 그대로�
   const row = await prisma.erpCart.findUnique({ where: { id: cartId } })
   assert.equal(row.status, 'paid')
 })
+
+testSerial('영수증: 전산 주문을 먼저 넣고 나중에 예약해도 결제할 때 예약과 이어져 영수증이 간다', async () => {
+  global.__notifications.length = 0
+  const store = await createStore('receipt-late-link')
+  const created = await postCart(validBody(store, { payTarget: 'front', carNumber: '12가3456' }))
+  assert.equal(created.body.linkedReservation, false) // 접수 때는 이을 예약이 없었다
+  const reservation = await prisma.reservation.create({
+    data: {
+      storeId: store.id, carNumber: '12가3456', phone: '01077778888', serviceType: '엔진오일',
+      queueNumber: 3, serviceDate: new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10), status: 'waiting',
+    },
+  })
+  const paymentKey = newPaymentKey()
+  await startFront(store, created.body.cartId, paymentKey)
+  const res = await reportFront(store, created.body.cartId, { result: 'paid', paymentKey, payment: SAMPLE_CARD_PAYMENT })
+  assert.equal(res.body.receipt, 'sent', JSON.stringify(res.body))
+  assert.equal(res.body.reservationCompleted, true)
+  const receipts = global.__notifications.filter((n) => n.method === 'sendReceiptAlimtalk')
+  assert.equal(receipts[0].payload.phone, '01077778888')
+  const row = await prisma.erpCart.findUnique({ where: { id: created.body.cartId } })
+  assert.equal(row.reservationId, reservation.id)
+  assert.equal(row.receiptStatus, 'sent')
+})
+
+testSerial('영수증: 예약이 없으면 receiptStatus=no_reservation으로 남는다', async () => {
+  const { store, cartId } = await frontCart('receipt-status-none')
+  const paymentKey = newPaymentKey()
+  await startFront(store, cartId, paymentKey)
+  await reportFront(store, cartId, { result: 'paid', paymentKey, payment: SAMPLE_CARD_PAYMENT })
+  const row = await prisma.erpCart.findUnique({ where: { id: cartId } })
+  assert.equal(row.receiptStatus, 'no_reservation')
+})

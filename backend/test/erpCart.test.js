@@ -2234,3 +2234,24 @@ testSerial('완료 안내: 완료할 수 없는 상태(대기중)면 문자를 �
   assert.equal(res.status, 409)
   assert.equal(global.__notifications.filter((n) => n.method === 'sendRepairDoneAlimtalk').length, 0)
 })
+
+testSerial('영수증: POS에서 결제한 전산 주문도 예약과 이어져 있으면 영수증이 한 번 간다', async () => {
+  global.__notifications.length = 0
+  const store = await createStore('pos-receipt')
+  const r = await calledReservation(store, '12가3456')
+  assert.equal((await postCart(validBody(store, { carNumber: '12가3456' }))).status, 201)
+  const cartId = (await getPosCarts(store)).body.carts[0].id
+  await consumeCart(store, cartId, { result: 'loaded' })
+  const paid = await request(app).post(`/api/pos/erp-carts/${cartId}/paid`).set('X-Store-Token', store.posToken).send({})
+  assert.equal(paid.status, 200, JSON.stringify(paid.body))
+  assert.equal(paid.body.receipt, 'sent')
+  const receipts = global.__notifications.filter((n) => n.method === 'sendReceiptAlimtalk')
+  assert.equal(receipts.length, 1)
+  assert.equal(receipts[0].payload.phone, '01055556666')
+  assert.equal(receipts[0].payload.amount, 45000)
+  assert.equal((await prisma.reservation.findUnique({ where: { id: r.id } })).status, 'completed')
+
+  const again = await request(app).post(`/api/pos/erp-carts/${cartId}/paid`).set('X-Store-Token', store.posToken).send({})
+  assert.equal(again.body.alreadyProcessed, true)
+  assert.equal(global.__notifications.filter((n) => n.method === 'sendReceiptAlimtalk').length, 1)
+})
