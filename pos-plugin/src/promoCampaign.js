@@ -2,20 +2,46 @@
 //
 // 규칙은 전부 서버가 정한다(관리자 웹과 같은 로직): 가장 최근 방문에서 광고 수신에 동의한 번호만,
 // 같은 번호는 한 번만, 수신거부·동의 2년 경과·최근 30일 안에 받은 번호 제외, 야간(21~8시) 금지.
-// 이 화면은 [대상 확인]으로 몇 명에게 가는지 보여주고, 두 번 눌러 확정해야 보낸다.
+// 이 화면은 들어오자마자(기간을 바꿀 때마다) 그 기간에 방문한 손님 전체 목록을 상태와 함께 보여주고,
+// 보낼 수 있는 수를 [N명에게 보내기]로 두 번 눌러 확정해야 보낸다. 예전에는 [대상 확인]을 눌러야 숫자와
+// 샘플 몇 명만 보여서, 직원이 "누가 왜 빠졌는지"를 볼 수 없었다.
 // 아래쪽 [수신거부 등록]은 손님이 거부를 알려왔을 때 번호를 등록한다.
 //
 // 확인을 window.confirm 대신 두 번 누르기로 하는 이유: POS 탭 화면(iframe)에서는 브라우저 확인창이
 // 막히거나 POS 화면을 멈출 수 있다. 대기열의 호출·완료와 같은 방식이라 직원에게도 익숙하다.
 
 let deps = null
+// 발송 기준. eligible은 지금 보고 있는 필터와 상관없이 "보낼 수 있음" 전체 수다(필터가 '제외'여도
+// 발송 확인 인원은 그대로여야 서버의 confirmCount 검사와 맞는다).
 let previewState = null // { from, to, eligible }
+let listState = null // { from, to, filter, rows, hasMore, rowsTotal, counts, body } -- 화면에 그려진 목록
+let activeFilter = 'all' // 'all' | 'eligible' | 'excluded'. 기간을 바꿔도 직원이 고른 탭은 유지한다.
+let listSeq = 0 // 불러오기 요청 번호. 늦게 도착한 옛 응답이 새 기간/탭 위에 그려지지 않게 한다.
+let dateTimer = null
 let confirmTimer = null
 let sending = false
 let optOutConfirmTimer = null
 
 // 이어 보내기 상한. 탭앱은 한 번에 60건씩이라 넉넉히 둔다(남으면 화면에 남은 수를 알린다).
 const MAX_ROUNDS = 100
+const PAGE_SIZE = 100
+const DATE_DEBOUNCE_MS = 300
+const FILTERS = [
+  ['all', '전체'],
+  ['eligible', '보낼 수 있음'],
+  ['excluded', '제외'],
+]
+const EMPTY_TEXT = {
+  all: '이 기간에 방문한 손님이 없습니다.',
+  eligible: '보낼 수 있는 손님이 없습니다.',
+  excluded: '제외된 손님이 없습니다.',
+}
+const STATUS_LABEL = {
+  ok: '보낼 수 있음',
+  no_consent: '광고 미동의',
+  opted_out: '수신거부',
+  consent_expired: '동의 2년 경과',
+}
 
 const el = (id) => document.getElementById(id)
 
@@ -42,20 +68,50 @@ function formatVisit(value) {
   return new Intl.DateTimeFormat('ko-KR', { month: 'numeric', day: 'numeric' }).format(new Date(value))
 }
 
-function resetPreview() {
-  previewState = null
-  if (confirmTimer) clearTimeout(confirmTimer)
-  confirmTimer = null
-  const result = el('promo-campaign-result')
-  if (result) result.innerHTML = ''
+function formatMonthDay(value) {
+  if (!value) return ''
+  const d = new Date(value)
+  if (Number.isNaN(d.getTime())) return ''
+  const parts = new Intl.DateTimeFormat('ko-KR', { month: 'numeric', day: 'numeric', timeZone: 'Asia/Seoul' }).formatToParts(d)
+  const month = parts.find((p) => p.type === 'month')
+  const day = parts.find((p) => p.type === 'day')
+  return month && day ? `${month.value}/${day.value}` : ''
 }
 
-// 보내는 동안에는 기간·대상 확인을 잠근다(같은 매장에 발송이 겹치거나 화면이 바뀌지 않게).
+function clearConfirm() {
+  if (confirmTimer) clearTimeout(confirmTimer)
+  confirmTimer = null
+}
+
+// 목록을 비우는 건 "지금 화면의 기간과 목록이 맞지 않을 때"(날짜가 비었거나 불러오기 실패)뿐이다.
+// 예전 resetPreview는 시연 모드·수신거부 뒤에도 불렀는데, 이제는 그때 목록을 지우지 않고 다시
+// 불러와서 바꾼다 -- 지우면 응답이 올 때까지 빈 화면이 된다. 비울 때 previewState도 같이 지워
+// 옛 인원수가 붙은 [보내기] 버튼이 남지 않게 한다.
+function clearList() {
+  listSeq += 1
+  previewState = null
+  listState = null
+  clearConfirm()
+  const result = el('promo-campaign-result')
+  if (result) {
+    result.innerHTML = ''
+    result.classList.remove('is-loading')
+  }
+}
+
+// 불러오는 동안 옛 목록은 흐리게 두고 누를 수 없게 한다: 기간을 바꾼 직후 옛 기간의 [보내기]를 누르는 일을 막는다.
+function setLoading(on) {
+  el('promo-campaign-result')?.classList.toggle('is-loading', on)
+}
+
+// 보내는 동안에는 기간·새로고침·탭·더 보기를 잠근다(같은 매장에 발송이 겹치거나 화면이 바뀌지 않게).
 function lockForm(locked) {
   for (const id of ['promo-campaign-from', 'promo-campaign-to', 'promo-campaign-preview']) {
     const node = el(id)
     if (node) node.disabled = locked
   }
+  document.querySelectorAll('#promo-campaign-result .promo-campaign-tab, #promo-campaign-result .promo-campaign-more')
+    .forEach((node) => { node.disabled = locked })
 }
 
 export function initPromoCampaign(injected) {
@@ -69,23 +125,34 @@ export function initPromoCampaign(injected) {
   to.value = kstDate(0)
   from.max = to.max = kstDate(0)
 
+  // 폼 submit(버튼 라벨은 '새로고침')은 같은 기간을 처음부터 다시 불러온다.
   form.addEventListener('submit', (e) => {
     e.preventDefault()
     if (sending) return
-    preview().catch((err) => setMessage(err?.message || String(err), 'error'))
+    if (dateTimer) clearTimeout(dateTimer)
+    dateTimer = null
+    startLoad()
   })
   for (const input of [from, to]) {
     input.addEventListener('change', () => {
       if (sending) return
-      resetPreview()
-      setMessage('')
+      scheduleReload()
     })
   }
 
   el('promo-campaign-result')?.addEventListener('click', (e) => {
-    const btn = e.target.closest('#promo-campaign-send')
-    if (!btn || btn.disabled) return
-    handleSendClick(btn)
+    const send = e.target.closest('#promo-campaign-send')
+    if (send) {
+      if (!send.disabled) handleSendClick(send)
+      return
+    }
+    if (sending) return
+    const tab = e.target.closest('[data-promo-filter]')
+    if (tab) {
+      handleFilterClick(tab.dataset.promoFilter)
+      return
+    }
+    if (e.target.closest('#promo-campaign-more')) startLoad({ append: true })
   })
 
   el('promo-optout-form')?.addEventListener('submit', (e) => {
@@ -136,6 +203,15 @@ export async function loadPromoDemo() {
   renderDemo(body)
 }
 
+// [홍보 문자] 화면을 열 때 부른다(nav.registerViewLoader). 시연 모드 상태와 방문 손님 목록을 함께 불러온다.
+// 발송 중에 다시 들어오면 목록은 건드리지 않는다(발송이 끝나면 스스로 다시 불러온다).
+export async function loadPromoView() {
+  if (!deps) return
+  const demo = loadPromoDemo()
+  const list = sending ? Promise.resolve() : startLoad()
+  await Promise.all([demo, list])
+}
+
 async function handleDemoToggle() {
   const btn = el('promo-demo-toggle')
   if (!btn || btn.disabled) return
@@ -172,11 +248,8 @@ async function handleDemoToggle() {
   }
   renderDemo(res.body)
   deps.notify('success', res.body.demoMode ? '시연 모드를 켰습니다. 오늘 밤 12시에 저절로 꺼집니다.' : '시연 모드를 껐습니다.')
-  // 대상 수가 바뀌므로(30일 제외가 풀리거나 다시 걸림) 미리보기를 다시 하게 한다.
-  if (previewState && !sending) {
-    resetPreview()
-    setMessage('시연 모드가 바뀌어 대상이 달라졌습니다. [대상 확인]을 다시 눌러주세요.')
-  }
+  // 대상 수가 바뀌므로(30일 제외가 풀리거나 다시 걸림) 목록을 다시 불러온다.
+  if (listState && !sending) startLoad()
 }
 
 function excludedText(ex, days) {
@@ -188,62 +261,188 @@ function excludedText(ex, days) {
   ].filter(Boolean).join(' · ') + ' 제외' + (days > 0 ? '' : ' (시연 모드: 30일 제한 꺼짐)')
 }
 
-async function preview() {
-  resetPreview()
-  const from = el('promo-campaign-from').value
-  const to = el('promo-campaign-to').value
-  setMessage('대상을 확인하는 중...')
-  const params = new URLSearchParams({ from, to })
-  const { ok, status, body } = await deps.apiGet(`/api/pos/promo-campaign/preview?${params.toString()}`)
-  if (!ok) {
-    if (status === 401) {
+// 날짜 입력은 달력에서 연속으로 바뀌기도 하므로 300ms 모아서 한 번만 부른다.
+// 바꾸는 순간 옛 응답은 무효로 하고(listSeq) 옛 목록은 눌리지 않게 흐리게 둔다.
+function scheduleReload() {
+  if (dateTimer) clearTimeout(dateTimer)
+  dateTimer = null
+  listSeq += 1
+  if (!el('promo-campaign-from').value || !el('promo-campaign-to').value) {
+    // 날짜를 지우는 중간 상태: 기간이 없으니 옛 기간의 목록을 남겨두지 않는다.
+    clearList()
+    setMessage('')
+    return
+  }
+  setLoading(true)
+  dateTimer = setTimeout(() => {
+    dateTimer = null
+    if (sending) return
+    startLoad()
+  }, DATE_DEBOUNCE_MS)
+}
+
+function handleFilterClick(filter) {
+  if (!FILTERS.some(([key]) => key === filter) || filter === activeFilter) return
+  activeFilter = filter
+  // 응답이 오기 전에도 눌렀다는 게 보이도록 탭 표시를 먼저 바꾼다.
+  document.querySelectorAll('#promo-campaign-result [data-promo-filter]').forEach((tab) => {
+    const on = tab.dataset.promoFilter === filter
+    tab.classList.toggle('is-active', on)
+    tab.setAttribute('aria-pressed', String(on))
+  })
+  startLoad()
+}
+
+// loadList의 오류는 여기서 화면에 낸다(호출부 어디서든 같은 처리). 항상 resolve 한다.
+function startLoad(options) {
+  return loadList(options).catch((err) => {
+    setLoading(false)
+    setMessage(err?.message || String(err), 'error')
+  })
+}
+
+// append=true는 [더 보기]: 지금 목록의 기간으로, 받은 행 수 다음부터 이어 붙인다.
+// quiet=true는 발송 직후 다시 불러오기: 위에 떠 있는 발송 결과 문구를 지우거나 덮어쓰지 않는다.
+async function loadList({ append = false, quiet = false } = {}) {
+  const base = append && listState ? listState : null
+  const from = base ? base.from : el('promo-campaign-from')?.value
+  const to = base ? base.to : el('promo-campaign-to')?.value
+  if (!from || !to) return
+  const seq = (listSeq += 1)
+  const filter = activeFilter
+  if (!quiet) setMessage(append ? '' : '목록을 불러오는 중...')
+  setLoading(true)
+
+  const params = new URLSearchParams({
+    from, to, filter, offset: String(base ? base.rows.length : 0), limit: String(PAGE_SIZE),
+  })
+  let res
+  try {
+    res = await deps.apiGet(`/api/pos/promo-campaign/preview?${params.toString()}`)
+  } catch {
+    res = { ok: false, status: 0, body: { error: '서버에 연결하지 못했습니다.' } }
+  }
+  if (seq !== listSeq) return // 더 새로운 요청이 있다. 그쪽이 화면을 맡는다.
+
+  const body = res.body || {}
+  if (!res.ok) {
+    if (res.status === 401) {
+      setLoading(false)
       deps.onUnauthorized(body.error)
       return
     }
-    setMessage(body.error || '대상을 확인하지 못했습니다.', 'error')
+    const text = body.error || '목록을 불러오지 못했습니다.'
+    if (append) {
+      // 이미 받은 목록은 그대로 두고 더 보기만 다시 누르게 한다.
+      setLoading(false)
+      setMessage(text, 'error')
+      return
+    }
+    // 새 기간/탭의 목록을 못 받았으면 옛 목록을 남겨두지 않는다(기간 표시와 어긋난다).
+    clearList()
+    if (quiet) deps.notify('error', `${text} [새로고침]을 눌러 다시 불러오세요.`)
+    else setMessage(text, 'error')
     return
   }
-  setMessage('')
-  previewState = { from: body.from, to: body.to, eligible: body.eligible }
-  if (typeof body.demoMode === 'boolean') renderDemo(body)
-  const rows = (body.sample || [])
-    .map((r) => `
-      <li>
-        <span class="promo-campaign-phone">${deps.escapeHtml(r.phoneMasked)}</span>
-        <span class="promo-campaign-car">${deps.escapeHtml(r.carNumber || '-')}</span>
-        <span class="promo-campaign-visit">${deps.escapeHtml(formatVisit(r.lastVisitAt))}</span>
-      </li>`)
-    .join('')
-  const more = body.eligible > (body.sample || []).length ? `<div class="promo-campaign-note">외 ${body.eligible - body.sample.length}명</div>` : ''
-  const action = body.night
-    ? '<div class="promo-campaign-note blocked">지금은 야간이라 보낼 수 없습니다(21시~8시). 낮에 다시 보내주세요.</div>'
-    : body.eligible > 0
-      ? `<button class="history-promo-button" id="promo-campaign-send" type="button">${body.eligible}명에게 보내기</button>
-         <div class="promo-campaign-note">한 번 더 눌러야 보내집니다. 보낸 뒤에는 취소할 수 없습니다.</div>`
-      : '<div class="promo-campaign-note blocked">보낼 수 있는 손님이 없습니다.</div>'
+
+  const rows = Array.isArray(body.rows) ? body.rows : []
+  const counts = body.filterCounts || {}
+  listState = {
+    from: body.from || from,
+    to: body.to || to,
+    filter,
+    rows: base ? base.rows.concat(rows) : rows,
+    // 이어 붙였는데 한 줄도 안 왔으면 더 없다고 본다(서버 hasMore가 틀려도 [더 보기]가 무한히 남지 않게).
+    hasMore: Boolean(body.hasMore) && !(base && rows.length === 0),
+    rowsTotal: Number.isFinite(Number(body.rowsTotal)) ? Number(body.rowsTotal) : null,
+    counts,
+    body,
+  }
+  previewState = {
+    from: listState.from,
+    to: listState.to,
+    eligible: Number(counts.eligible ?? body.eligible) || 0,
+  }
+  if (!quiet) setMessage('')
+  // 시연 모드가 실제로 바뀐 때만 다시 그린다: renderDemo가 켜기 버튼의 "한 번 더 누르면 켜짐" 대기를 풀어버리는데
+  // 대기 타이머는 남아서, 그 뒤 첫 탭이 확인 없이 바로 켜짐으로 이어진다.
+  if (typeof body.demoMode === 'boolean' && body.demoMode !== demoMode) renderDemo(body)
+  setLoading(false)
+  renderList()
+}
+
+function renderBadge(row) {
+  const e = deps.escapeHtml
+  if (row.status === 'recently_sent') {
+    const day = formatMonthDay(row.lastSentAt)
+    return `<span class="promo-campaign-badge">${e(day ? `최근 받음 ${day}` : '최근 받음')}</span>`
+  }
+  const label = STATUS_LABEL[row.status] || row.status || '-'
+  return `<span class="promo-campaign-badge${row.status === 'ok' ? ' is-ok' : ''}">${e(label)}</span>`
+}
+
+function renderList() {
+  const result = el('promo-campaign-result')
+  if (!result || !listState) return
+  clearConfirm()
+  const e = deps.escapeHtml
+  const num = (v) => e(String(Number(v) || 0))
+  const { body, counts, rows, filter } = listState
+  const days = Number(body.minIntervalDays) || 0
+  const eligible = previewState ? previewState.eligible : 0
+  const visitors = counts.all ?? body.visitors
+
   const message = body.message
-    ? `<pre class="promo-campaign-message">${deps.escapeHtml(body.message)}</pre>`
+    ? `<pre class="promo-campaign-message">${e(body.message)}</pre>`
     : ''
   const optOutWarn = body.optOutConfigured
     ? ''
     : '<div class="promo-campaign-note blocked">수신거부 안내가 기본 문구("매장으로 연락")입니다. 080 무료수신거부처럼 손님에게 비용이 들지 않는 방법으로 바꾸도록 본사에 알려주세요.</div>'
+  const action = body.night
+    ? '<div class="promo-campaign-note blocked">지금은 야간이라 보낼 수 없습니다(21시~8시). 낮에 다시 보내주세요.</div>'
+    : eligible > 0
+      ? `<button class="history-promo-button" id="promo-campaign-send" type="button">${num(eligible)}명에게 보내기</button>
+         <div class="promo-campaign-note">한 번 더 눌러야 보내집니다. 보낸 뒤에는 취소할 수 없습니다.</div>`
+      : '<div class="promo-campaign-note blocked">보낼 수 있는 손님이 없습니다.</div>'
 
-  el('promo-campaign-result').innerHTML = `
+  const tabs = FILTERS.map(([key, label]) => {
+    const on = key === filter
+    const count = counts[key] === undefined || counts[key] === null ? '' : `<span class="promo-campaign-tab-count">${num(counts[key])}</span>`
+    return `<button type="button" class="promo-campaign-tab${on ? ' is-active' : ''}" data-promo-filter="${e(key)}" aria-pressed="${on}">${e(label)}${count}</button>`
+  }).join('')
+
+  const items = rows
+    .map((r) => `
+      <li class="${r.status === 'ok' ? '' : 'is-muted'}">
+        <span class="promo-campaign-phone">${e(r.phone || '-')}</span>
+        <span class="promo-campaign-car">${e(r.carNumber || '-')}</span>
+        <span class="promo-campaign-visit">${e(formatVisit(r.lastVisitAt))}</span>
+        ${renderBadge(r)}
+      </li>`)
+    .join('')
+  const shown = listState.rowsTotal === null ? '' : ` (${num(rows.length)}/${num(listState.rowsTotal)})`
+  const more = listState.hasMore
+    ? `<button type="button" class="promo-campaign-more" id="promo-campaign-more">더 보기${shown}</button>`
+    : ''
+
+  result.innerHTML = `
     <div class="promo-campaign-summary">
-      <strong>${deps.escapeHtml(body.from)} ~ ${deps.escapeHtml(body.to)}</strong> 방문 손님<br>
-      방문한 번호 <strong>${body.visitors}</strong>개 중 보낼 수 있는 번호 <strong class="promo-campaign-count">${body.eligible}</strong>개
-      <div class="promo-campaign-note">${deps.escapeHtml(excludedText(body.excluded, body.minIntervalDays))}</div>
+      <strong>${e(listState.from)} ~ ${e(listState.to)}</strong> · 방문 <strong>${num(visitors)}</strong>명 · 보낼 수 있음 <strong class="promo-campaign-count">${num(eligible)}</strong>명
+      ${body.excluded ? `<div class="promo-campaign-note">${e(excludedText(body.excluded, days))}</div>` : ''}
       ${body.truncated ? '<div class="promo-campaign-note blocked">방문 번호가 너무 많아 일부만 계산했습니다. 기간을 줄여주세요.</div>' : ''}
     </div>
     ${message}
     ${optOutWarn}
-    ${rows ? `<ul class="promo-campaign-list">${rows}</ul>${more}` : ''}
     ${action}
+    <div class="promo-campaign-tabs">${tabs}</div>
+    ${items ? `<ul class="promo-campaign-list">${items}</ul>` : `<div class="promo-campaign-note blocked">${e(EMPTY_TEXT[filter] || EMPTY_TEXT.all)}</div>`}
+    ${more}
   `
 }
 
 function handleSendClick(btn) {
   if (!previewState || sending) return
+  if (el('promo-campaign-result')?.classList.contains('is-loading')) return
   if (!confirmTimer) {
     btn.classList.add('confirming')
     btn.textContent = `정말 ${previewState.eligible}명에게 보낼까요?`
@@ -263,10 +462,10 @@ function handleSendClick(btn) {
 // (나갔을 수 있어 30일 동안 다시 보내지 않는다).
 function summary(t, remaining, reason) {
   const parts = [`보냄 ${t.sent}건`]
-  if (t.failed) parts.push(`실패 ${t.failed}건(30분 뒤 [대상 확인]으로 다시 보낼 수 있습니다)`)
+  if (t.failed) parts.push(`실패 ${t.failed}건(30분 뒤 [새로고침] 후 다시 보낼 수 있습니다)`)
   if (t.uncertain) parts.push(`결과 확인 안 됨 ${t.uncertain}건(이미 나갔을 수 있어 30일 동안 다시 보내지 않습니다)`)
   if (t.skipped) parts.push(`보내기 직전 제외 ${t.skipped}건`)
-  if (remaining) parts.push(`아직 ${remaining}명 남음 — ${reason || '[대상 확인]을 다시 눌러 이어서 보내세요.'}`)
+  if (remaining) parts.push(`아직 ${remaining}명 남음 — ${reason || '아래 [보내기]를 다시 눌러 이어서 보내세요.'}`)
   return parts.join(' · ')
 }
 
@@ -277,6 +476,11 @@ async function send(btn) {
   const state = previewState
   if (!state) return
   sending = true
+  // 날아가 있는 불러오기 응답이 발송 도중에 화면(= 지금 누른 버튼)을 갈아끼우지 못하게 무효로 한다.
+  listSeq += 1
+  if (dateTimer) clearTimeout(dateTimer)
+  dateTimer = null
+  let refresh = true
   lockForm(true)
   btn.disabled = true
   btn.classList.remove('confirming')
@@ -298,6 +502,7 @@ async function send(btn) {
       }
       if (!res.ok) {
         if (res.status === 401) {
+          refresh = false
           deps.onUnauthorized(res.body.error)
           return
         }
@@ -308,15 +513,15 @@ async function send(btn) {
       remaining = res.body.remaining
       const progressed = (res.body.sent || 0) + (res.body.failed || 0) + (res.body.uncertain || 0) + (res.body.skipped || 0)
       if (res.body.stopped === 'night') {
-        stopReason = '밤 9시가 가까워 멈췄습니다. 내일 아침 8시 이후 [대상 확인]으로 이어서 보내세요.'
+        stopReason = '밤 9시가 가까워 멈췄습니다. 내일 아침 8시 이후 이어서 보내세요.'
         break
       }
       if (!remaining || !progressed) break
     }
-    // 끝나면(중간에 멈췄어도) 미리보기를 지운다 -- 남은 건은 [대상 확인]으로 지금 기준을 다시 보고 보낸다.
-    resetPreview()
+    // 끝나면(중간에 멈췄어도) 아래 finally에서 목록을 다시 불러온다 -- 보낸 번호가 '최근 받음'으로 바뀌어 보이고,
+    // 남은 건은 지금 기준의 인원수로 다시 보낸다. 목록을 비우고 기다리면 그 사이 빈 화면이 되므로 비우지 않는다.
     if (errorText) {
-      const text = `${errorText} (${summary(t, 0)}) [대상 확인]으로 남은 대상을 다시 확인하세요.`
+      const text = `${errorText} (${summary(t, 0)}) 아래 목록에서 남은 대상을 다시 확인하세요.`
       setMessage(text, 'error')
       deps.notify('error', text)
       return
@@ -328,9 +533,13 @@ async function send(btn) {
   } finally {
     sending = false
     lockForm(false)
-    if (document.body.contains(btn)) {
+    if (refresh) {
+      // 새 목록이 올 때까지 버튼은 잠긴 채 둔다(옛 인원수로 다시 누르지 못하게).
+      if (document.body.contains(btn)) btn.textContent = '목록을 새로 불러오는 중...'
+      startLoad({ quiet: true })
+    } else if (document.body.contains(btn)) {
       btn.disabled = false
-      if (previewState) btn.textContent = `${previewState.eligible}명에게 보내기`
+      btn.textContent = `${previewState ? previewState.eligible : 0}명에게 보내기`
     }
   }
 }
@@ -376,11 +585,8 @@ async function handleOptOutSubmit() {
     }
     input.value = ''
     setOptOutMessage(`${res.body.phoneMasked} 수신거부를 등록했습니다. 이 번호에는 홍보 문자가 나가지 않습니다.`, 'ok')
-    // 미리보기를 보고 있었다면 대상 수가 바뀌었을 수 있다.
-    if (previewState && !sending) {
-      resetPreview()
-      setMessage('수신거부가 등록되어 대상이 바뀌었을 수 있습니다. [대상 확인]을 다시 눌러주세요.')
-    }
+    // 목록을 보고 있었다면 그 번호의 상태가 '수신거부'로 바뀌고 보낼 수 있는 수도 줄 수 있다.
+    if (listState && !sending) startLoad()
   } finally {
     btn.disabled = false
   }

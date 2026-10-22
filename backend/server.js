@@ -295,17 +295,17 @@ function parseKstDate(raw) {
   return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : null
 }
 
-// POS 화면은 순번 호출용이라 손님 전화번호 원본이 필요 없다 — 대기실 화면을 스치듯 보는 다른
-// 손님에게 노출될 수 있으므로 마스킹해서 내려준다(계약 §3.13). 표준(010 + 7~8자리)과 자리수가
-// 안 맞는 값은 부분적으로 어설프게 노출하느니 전부 가린다.
 // 정비 이력처럼 직원만 보는 화면에 전체 번호를 읽기 쉽게 보여줄 때 쓴다(01012345678 -> 010-1234-5678).
 function formatPhone(phone) {
-  const d = String(phone || '').replace(/D/g, '')
+  const d = String(phone || '').replace(/\D/g, '')
   if (d.length === 11) return `${d.slice(0, 3)}-${d.slice(3, 7)}-${d.slice(7)}`
   if (d.length === 10) return `${d.slice(0, 3)}-${d.slice(3, 6)}-${d.slice(6)}`
   return d || null
 }
 
+// POS 화면은 순번 호출용이라 손님 전화번호 원본이 필요 없다 — 대기실 화면을 스치듯 보는 다른
+// 손님에게 노출될 수 있으므로 마스킹해서 내려준다(계약 §3.13). 표준(010 + 7~8자리)과 자리수가
+// 안 맞는 값은 부분적으로 어설프게 노출하느니 전부 가린다.
 function maskPhone(phone) {
   const digits = String(phone || '').replace(/\D/g, '')
   if (digits.length < 9 || digits.length > 11) return '010-****-****'
@@ -2386,16 +2386,50 @@ function isPromoNightNow() {
   return night(now) || night(now + PROMO_NIGHT_MARGIN_MS)
 }
 
-// 대상 미리보기 응답(관리자 웹·POS 탭앱 공통). 전화번호는 가린다.
+// 대상 미리보기 응답(관리자 웹·POS 탭앱 공통). sample은 전화번호를 가린다.
+//
+// rows: 기간 안 방문자 **전체**를 상태(status)와 함께 filter·offset·limit로 쪼갠 한 쪽. sample(보낼 수 있는
+// 50명, 가린 번호)은 관리자 웹이 쓰고 있어 그대로 두고, 이쪽은 직원이 "누가 왜 빠졌는지"를 보고 손님께 연락할
+// 수 있도록 전체 번호(010-1234-5678)를 준다. 두 라우트 모두 로그인한 관리자·매장 토큰으로만 열린다.
+// filterCounts는 filter와 무관하게 항상 전체 기준이다(탭 숫자용). rowsTotal은 filter를 건 뒤의 수.
+// 쿼리스트링이 그대로 들어오므로 여기서 값을 바로잡는다: 알 수 없는 filter는 all, limit은 1~500(숫자가
+// 아니면 100), offset은 0 이상의 정수(아니면 0). 한 번에 다 내려주지 않는 이유는 방문자가 최대
+// PROMO_CAMPAIGN_MAX_VISITORS(5000)명이라 응답이 수 MB가 되고 POS 탭앱이 느린 망에서 응답을 포기하기 때문이다.
 // message: 문자로 나갈 때의 본문(알림톡으로 나가면 카카오에 승인된 템플릿 문구가 쓰인다).
 // optOutConfigured: 수신거부 안내 문구(PROMO_OPT_OUT_TEXT)를 운영에서 정했는지. 기본 문구("매장으로 연락")는
 // 손님에게 비용이 드는 방법이라, 080 무료수신거부처럼 무료 수단으로 바꾸라고 화면에서 알린다.
-async function buildPromoCampaignPreview(target) {
+const PROMO_PREVIEW_FILTERS = ['all', 'eligible', 'excluded']
+const PROMO_PREVIEW_DEFAULT_LIMIT = 100
+const PROMO_PREVIEW_MAX_LIMIT = 500
+
+function normalizePromoPreviewPaging({ filter, offset, limit } = {}) {
+  const toNumber = (v) => (v === undefined || v === null || v === '' ? NaN : Number(v))
+  const limitNum = toNumber(limit)
+  const offsetNum = toNumber(offset)
+  return {
+    filter: PROMO_PREVIEW_FILTERS.includes(filter) ? filter : 'all',
+    limit: Number.isFinite(limitNum)
+      ? Math.min(PROMO_PREVIEW_MAX_LIMIT, Math.max(1, Math.trunc(limitNum)))
+      : PROMO_PREVIEW_DEFAULT_LIMIT,
+    offset: Number.isSafeInteger(offsetNum) && offsetNum >= 0 ? offsetNum : 0,
+  }
+}
+
+async function buildPromoCampaignPreview(target, { filter = 'all', offset = 0, limit = PROMO_PREVIEW_DEFAULT_LIMIT } = {}) {
+  const paging = normalizePromoPreviewPaging({ filter, offset, limit })
   const [result, demo] = await Promise.all([
     listPromoCampaignCandidates(target.store.id, target.start, target.end),
     prisma.store.findUnique({ where: { id: target.store.id }, select: { promoDemoUntil: true } }),
   ])
   const { demoMode, demoUntil } = promoDemoBody(demo)
+  const isEligible = (r) => r.status === 'ok'
+  const eligibleCount = result.all.filter(isEligible).length
+  const matched = paging.filter === 'eligible'
+    ? result.all.filter(isEligible)
+    : paging.filter === 'excluded'
+      ? result.all.filter((r) => !isEligible(r))
+      : result.all
+  const pageRows = matched.slice(paging.offset, paging.offset + paging.limit)
   return {
     demoMode,
     demoUntil,
@@ -2416,6 +2450,16 @@ async function buildPromoCampaignPreview(target) {
       carNumber: r.carNumber,
       lastVisitAt: r.lastVisitAt,
     })),
+    filterCounts: { all: result.all.length, eligible: eligibleCount, excluded: result.all.length - eligibleCount },
+    rows: pageRows.map((r) => ({
+      phone: formatPhone(r.phone),
+      carNumber: r.carNumber,
+      lastVisitAt: r.lastVisitAt,
+      status: r.status,
+      lastSentAt: r.lastSentAt,
+    })),
+    rowsTotal: matched.length,
+    hasMore: paging.offset + pageRows.length < matched.length,
   }
 }
 
@@ -2509,7 +2553,7 @@ async function runPromoCampaignSend(target, confirmCountRaw, sentBy, via, limits
 app.get('/api/admin/promo-campaign/preview', requireAuth, asyncHandler(async (req, res) => {
   const target = await resolvePromoCampaignTarget(req, req.query)
   if (target.error) return res.status(target.error.status).json(target.error.body)
-  return res.json(await buildPromoCampaignPreview(target))
+  return res.json(await buildPromoCampaignPreview(target, { filter: req.query.filter, offset: req.query.offset, limit: req.query.limit }))
 }))
 
 app.post('/api/admin/promo-campaign/send', requireAuth, asyncHandler(async (req, res) => {
@@ -2523,7 +2567,7 @@ app.post('/api/admin/promo-campaign/send', requireAuth, asyncHandler(async (req,
 app.get('/api/pos/promo-campaign/preview', posIpFloodLimiter, posQueueReadLimiter, requireStoreToken, asyncHandler(async (req, res) => {
   const period = resolvePromoCampaignPeriod(req.query)
   if (period.error) return res.status(period.error.status).json(period.error.body)
-  return res.json(await buildPromoCampaignPreview({ store: req.store, ...period }))
+  return res.json(await buildPromoCampaignPreview({ store: req.store, ...period }, { filter: req.query.filter, offset: req.query.offset, limit: req.query.limit }))
 }))
 
 app.post('/api/pos/promo-campaign/send', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {

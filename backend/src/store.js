@@ -1684,6 +1684,12 @@ function registerMarketingOptOut({ storeId, phone, recordedBy, via }) {
 // 차량번호가 아니라 **전화번호 단위**로 묶는다(한 사람이 차 두 대면 한 번만 보낸다).
 // 보낼 수 있는지는 assessPromoPhones(위)로 판단한다.
 // skipRecentFailures: 발송할 때만 켠다. 방금 확실히 실패한 번호를 이어 보내기에서 다시 시도하지 않는다.
+//
+// all: 기간 안 방문 번호 **전부**를 판단 결과(status)와 함께. 미리보기 화면이 "보낼 수 있는 사람"만이 아니라
+// 빠진 사람과 그 이유까지 목록으로 보여주기 위한 것이다. recipients(보낼 사람)와 달리 skipRecentFailures의
+// 영향을 받지 않는다 -- 방금 실패한 번호도 목록에서는 'ok'로 보이고, 발송 때만 건너뛴다.
+// 정렬은 최근 방문순이고 같은 시각이면 번호순이다: 화면이 offset/limit로 쪼개 가져가므로 요청마다 순서가
+// 달라지면(DB의 distinct 결과 순서는 보장되지 않는다) 같은 사람이 두 번 보이거나 빠진다.
 const PROMO_CAMPAIGN_MAX_VISITORS = 5000
 
 async function listPromoCampaignCandidates(storeId, start, end, { skipRecentFailures = false } = {}) {
@@ -1705,12 +1711,14 @@ async function listPromoCampaignCandidates(storeId, start, end, { skipRecentFail
   const phones = [...new Set([...resPhones, ...payPhones].map((r) => r.phone).filter(Boolean))]
   const truncated = phones.length >= PROMO_CAMPAIGN_MAX_VISITORS
   const excluded = { optedOut: 0, noConsent: 0, consentExpired: 0, recentlySent: 0, recentlyFailed: 0 }
-  if (!phones.length) return { visitors: 0, recipients: [], excluded, truncated: false }
+  if (!phones.length) return { visitors: 0, recipients: [], excluded, truncated: false, all: [] }
 
   const assessed = await assessPromoPhones(storeId, phones)
   const recipients = []
+  const all = []
   for (const phone of phones) {
     const a = assessed.get(phone)
+    all.push({ phone, carNumber: a.carNumber, lastVisitAt: a.lastVisitAt, status: a.status, lastSentAt: a.lastSentAt })
     if (a.status === 'opted_out') excluded.optedOut += 1
     else if (a.status === 'no_consent') excluded.noConsent += 1
     else if (a.status === 'consent_expired') excluded.consentExpired += 1
@@ -1719,7 +1727,14 @@ async function listPromoCampaignCandidates(storeId, start, end, { skipRecentFail
     else recipients.push({ phone, carNumber: a.carNumber, lastVisitAt: a.lastVisitAt })
   }
   recipients.sort((x, y) => new Date(y.lastVisitAt) - new Date(x.lastVisitAt))
-  return { visitors: phones.length, recipients, excluded, truncated }
+  const visitTime = (row) => (row.lastVisitAt ? new Date(row.lastVisitAt).getTime() : -Infinity)
+  all.sort((x, y) => {
+    const xt = visitTime(x)
+    const yt = visitTime(y)
+    if (xt !== yt) return xt < yt ? 1 : -1
+    return x.phone < y.phone ? -1 : x.phone > y.phone ? 1 : 0
+  })
+  return { visitors: phones.length, recipients, excluded, truncated, all }
 }
 
 // 매장이 POS에서 보는 오늘 현황. 관리자 웹의 getDailySummary와 목적이 다르다 —

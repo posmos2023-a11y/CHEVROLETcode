@@ -734,3 +734,165 @@ testSerial('시연 모드: 잘못된 값은 400, 토큰 없으면 401, 관리자
   assert.equal((await prisma.store.findUnique({ where: { id: other.id } })).promoDemoUntil, null)
   assert.equal((await request(app).post('/api/admin/promo-demo-mode').send({ storeId: store.id, enabled: true })).status, 401)
 })
+
+// --- 미리보기: 방문자 전체 목록(rows) ---------------------------------------------------
+
+// 최근 방문순으로 0001(보낼 수 있음) 0002(보낼 수 있음) 0003(미동의) 0004(수신거부) 0005(10일 전 발송).
+async function seedPromoRows(store) {
+  await visit(store, { phone: '01011110001', carNumber: '11가1111', daysAgo: 1 })
+  await visit(store, { phone: '01011110002', carNumber: '22나2222', daysAgo: 2 })
+  await visit(store, { phone: '01011110003', carNumber: '33다3333', daysAgo: 3, marketing: false })
+  await visit(store, { phone: '01011110004', carNumber: '44라4444', daysAgo: 4 })
+  const optOut = await posOptOut(store, '01011110004')
+  assert.equal(optOut.status, 200, JSON.stringify(optOut.body))
+  await visit(store, { phone: '01011110005', carNumber: '55마5555', daysAgo: 5 })
+  const sentAt = new Date(Date.now() - 10 * DAY)
+  await prisma.promoSend.create({ data: { storeId: store.id, phone: '01011110005', carNumber: '55마5555', sentAt } })
+  return { sentAt }
+}
+
+testSerial('미리보기 rows: 기간 안 방문자 전부를 상태와 함께 최근 방문순으로, 전체 번호 형식으로 준다', async () => {
+  const store = await createStore('rows')
+  const { token } = await adminToken('hq_admin')
+  const { sentAt } = await seedPromoRows(store)
+
+  const res = await preview(token, { storeId: store.id, from: kstDate(-10), to: kstDate(0) })
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.deepEqual(res.body.filterCounts, { all: 5, eligible: 2, excluded: 3 })
+  assert.equal(res.body.rowsTotal, 5)
+  assert.equal(res.body.hasMore, false)
+  assert.deepEqual(
+    res.body.rows.map((r) => [r.phone, r.status]),
+    [
+      ['010-1111-0001', 'ok'],
+      ['010-1111-0002', 'ok'],
+      ['010-1111-0003', 'no_consent'],
+      ['010-1111-0004', 'opted_out'],
+      ['010-1111-0005', 'recently_sent'],
+    ]
+  )
+  assert.equal(res.body.rows[0].carNumber, '11가1111')
+  assert.ok(res.body.rows[0].lastVisitAt)
+  assert.equal(res.body.rows[0].lastSentAt, null)
+  assert.equal(new Date(res.body.rows[4].lastSentAt).getTime(), sentAt.getTime())
+  assert.equal(JSON.stringify(res.body).includes('01011110001'), false) // 하이픈 없는 원문은 내려가지 않는다
+
+  // 기존 필드는 그대로다 -- 관리자 웹이 쓴다.
+  assert.equal(res.body.visitors, 5)
+  assert.equal(res.body.eligible, 2)
+  assert.equal(res.body.sample.length, 2)
+  assert.equal(res.body.sample[0].phoneMasked, '010-****-0001')
+})
+
+testSerial('미리보기 rows: filter=eligible은 보낼 수 있는 사람만, excluded는 나머지만 주고 filterCounts는 그대로다', async () => {
+  const store = await createStore('rows-filter')
+  const { token } = await adminToken('hq_admin')
+  await seedPromoRows(store)
+  const period = { storeId: store.id, from: kstDate(-10), to: kstDate(0) }
+
+  const eligible = await preview(token, { ...period, filter: 'eligible' })
+  assert.equal(eligible.status, 200, JSON.stringify(eligible.body))
+  assert.deepEqual(eligible.body.rows.map((r) => r.phone), ['010-1111-0001', '010-1111-0002'])
+  assert.ok(eligible.body.rows.every((r) => r.status === 'ok'))
+  assert.equal(eligible.body.rowsTotal, 2)
+  assert.equal(eligible.body.hasMore, false)
+  assert.deepEqual(eligible.body.filterCounts, { all: 5, eligible: 2, excluded: 3 })
+
+  const excluded = await preview(token, { ...period, filter: 'excluded' })
+  assert.deepEqual(excluded.body.rows.map((r) => [r.phone, r.status]), [
+    ['010-1111-0003', 'no_consent'],
+    ['010-1111-0004', 'opted_out'],
+    ['010-1111-0005', 'recently_sent'],
+  ])
+  assert.equal(excluded.body.rowsTotal, 3)
+  assert.equal(excluded.body.hasMore, false)
+  assert.deepEqual(excluded.body.filterCounts, { all: 5, eligible: 2, excluded: 3 })
+})
+
+testSerial('미리보기 rows: limit·offset으로 쪼개 받으면 겹침·누락 없이 이어지고 hasMore가 마지막 쪽에서 꺼진다', async () => {
+  const store = await createStore('rows-paging')
+  const { token } = await adminToken('hq_admin')
+  await seedPromoRows(store)
+  const period = { storeId: store.id, from: kstDate(-10), to: kstDate(0) }
+
+  const first = await preview(token, { ...period, limit: 2, offset: 0 })
+  assert.equal(first.body.rows.length, 2)
+  assert.equal(first.body.rowsTotal, 5)
+  assert.equal(first.body.hasMore, true)
+
+  const middle = await preview(token, { ...period, limit: 2, offset: 2 })
+  assert.equal(middle.body.rows.length, 2)
+  assert.equal(middle.body.hasMore, true)
+
+  const last = await preview(token, { ...period, limit: 2, offset: 4 })
+  assert.equal(last.body.rows.length, 1)
+  assert.equal(last.body.hasMore, false)
+
+  const phones = [...first.body.rows, ...middle.body.rows, ...last.body.rows].map((r) => r.phone)
+  assert.deepEqual(phones, ['010-1111-0001', '010-1111-0002', '010-1111-0003', '010-1111-0004', '010-1111-0005'])
+
+  const beyond = await preview(token, { ...period, limit: 2, offset: 50 })
+  assert.deepEqual(beyond.body.rows, [])
+  assert.equal(beyond.body.rowsTotal, 5)
+  assert.equal(beyond.body.hasMore, false)
+
+  // filter와 함께 쓰면 filter를 건 뒤의 목록을 쪼갠다
+  const filtered = await preview(token, { ...period, filter: 'excluded', limit: 2, offset: 2 })
+  assert.deepEqual(filtered.body.rows.map((r) => r.phone), ['010-1111-0005'])
+  assert.equal(filtered.body.rowsTotal, 3)
+  assert.equal(filtered.body.hasMore, false)
+})
+
+testSerial('미리보기 rows: 잘못된 filter·limit·offset은 기본값으로 바로잡고 limit은 500까지만 허용한다', async () => {
+  const store = await createStore('rows-sanitize')
+  const { token } = await adminToken('hq_admin')
+  await seedPromoRows(store)
+  const period = { storeId: store.id, from: kstDate(-10), to: kstDate(0) }
+
+  const bad = await preview(token, { ...period, filter: 'everything', limit: 'abc', offset: '-3' })
+  assert.equal(bad.status, 200, JSON.stringify(bad.body))
+  assert.equal(bad.body.rows.length, 5) // filter는 all, limit은 100, offset은 0
+  assert.equal(bad.body.rows[0].phone, '010-1111-0001')
+  assert.equal(bad.body.rowsTotal, 5)
+
+  const fractional = await preview(token, { ...period, limit: '2.5', offset: '1.5' })
+  assert.equal(fractional.body.rows.length, 2) // limit은 소수점을 버리고, 정수가 아닌 offset은 0
+  assert.equal(fractional.body.rows[0].phone, '010-1111-0001')
+
+  const zero = await preview(token, { ...period, limit: 0 })
+  assert.equal(zero.body.rows.length, 1) // 1 미만은 1로
+
+  const huge = await preview(token, { ...period, limit: 99999 })
+  assert.equal(huge.body.rows.length, 5)
+  assert.equal(huge.body.hasMore, false)
+})
+
+testSerial('미리보기 rows: 기간 안 방문자가 없으면 빈 목록이다', async () => {
+  const store = await createStore('rows-empty')
+  const { token } = await adminToken('hq_admin')
+  await visit(store, { phone: '01011110001', daysAgo: 40 }) // 기간 밖
+  const res = await preview(token, { storeId: store.id, from: kstDate(-7), to: kstDate(0) })
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.deepEqual(res.body.filterCounts, { all: 0, eligible: 0, excluded: 0 })
+  assert.deepEqual(res.body.rows, [])
+  assert.equal(res.body.rowsTotal, 0)
+  assert.equal(res.body.hasMore, false)
+})
+
+testSerial('탭앱 미리보기도 rows를 주고, 다른 매장 방문자는 섞이지 않는다', async () => {
+  const store = await createStore('pos-rows')
+  const other = await createStore('pos-rows-other')
+  await seedPromoRows(store)
+  await visit(other, { phone: '01099990001', daysAgo: 1 })
+
+  const res = await posPreview(store, { from: kstDate(-10), to: kstDate(0), filter: 'excluded', limit: 2 })
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.deepEqual(res.body.filterCounts, { all: 5, eligible: 2, excluded: 3 })
+  assert.deepEqual(res.body.rows.map((r) => [r.phone, r.status]), [
+    ['010-1111-0003', 'no_consent'],
+    ['010-1111-0004', 'opted_out'],
+  ])
+  assert.equal(res.body.rowsTotal, 3)
+  assert.equal(res.body.hasMore, true)
+  assert.equal(res.body.sample.length, 2) // 가린 번호 sample은 그대로
+})
