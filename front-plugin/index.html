@@ -57,21 +57,28 @@
 
       // [결제하기](금액을 직접 넣는 payment.html)는 뺐다. 정비 결제는 전산 주문이 들어오면 아래 watchErpCarts가
       // 결제 화면(erp-pay.html)으로 자동으로 넘기므로, 손님이 누를 버튼은 예약 하나면 된다.
-      sdk.template.renderIdlePage({
-        type: 'oneButton',
-        description: {
-          text: '쉐보레 정비 예약',
-          subText: '차량번호로 예약하면 순서를 알림톡으로 알려드려요',
-        },
-        button: {
-          text: '예약하기',
-          onClick: () => {
-            location.href = './reservation.html'
-          },
-        },
-      })
-
+      // 전산 주문 확인을 화면 그리기보다 **먼저** 시작한다 -- 대기화면 그리기에서 오류가 나도 결제 주문은 받아 가야 한다.
       watchErpCarts().catch((e) => console.error('[index] 전산 주문 확인 실패', e))
+
+      try {
+        sdk.template.renderIdlePage({
+          type: 'oneButton',
+          description: {
+            text: '쉐보레 정비 예약',
+            subText: '차량번호로 예약하면 순서를 알림톡으로 알려드려요',
+          },
+          button: {
+            text: '예약하기',
+            onClick: () => {
+              location.href = './reservation.html'
+            },
+          },
+        })
+      } catch (e) {
+        // 이 단말기 SDK가 oneButton을 못 그리면 기본 대기화면이라도 띄운다(예약은 직원에게 안내).
+        console.error('[index] 대기화면(oneButton)을 그리지 못했습니다', e)
+        try { sdk.template.renderIdlePage() } catch (e2) { console.error('[index] 기본 대기화면도 실패', e2) }
+      }
     </script>
   </body>
 </html>
