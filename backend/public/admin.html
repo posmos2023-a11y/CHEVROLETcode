@@ -243,6 +243,8 @@
   .erp-status.refunded { background: #fdecec; color: #d93025; }
   .erp-status.failed, .erp-status.expired { background: #fff0f1; color: #d93025; }
   .erp-status.dismissed, .erp-status.cancelled { background: #eef0f2; color: var(--muted); }
+  /* 프론트에서 승인됐지만 주문에 반영되지 못한 결제(frontOrphan) -- 같은 주문을 두 번 받았을 수 있어 눈에 띄게 둔다. */
+  .erp-orphan { display: inline-block; margin-top: 4px; padding: 3px 7px; border-radius: 6px; background: #fff0f1; color: #d93025; font-size: 11px; font-weight: 700; }
   .pos-token-input {
     width: 190px;
     padding: 6px 10px;
@@ -832,7 +834,8 @@ function renderErpCarts() {
             ${c.receiptStatus ? `<br><span class="muted">영수증: ${escapeHtml(RECEIPT_STATUS_LABEL[c.receiptStatus] || c.receiptStatus)}</span>` : ''}
             ${c.status === 'paid' ? `<br><button class="row-btn" type="button" data-resend-receipt="${escapeHtml(c.id)}">${c.receiptStatus === 'sent' ? '영수증 다시 보내기' : '영수증 보내기'}</button>` : ''}
             ${c.refundNote ? `<br><span class="muted">${escapeHtml(c.refundNote)}</span>` : ''}
-            ${c.errorMessage ? `<br><span class="muted">${escapeHtml(c.errorMessage)}</span>` : ''}</td>
+            ${c.errorMessage ? `<br><span class="muted">${escapeHtml(c.errorMessage)}</span>` : ''}
+            ${c.frontOrphan ? `<br><span class="erp-orphan">⚠ 프론트 승인 미반영 · ${escapeHtml(formatWhen(c.frontOrphan.at))}${c.frontOrphan.approvalNo ? ` · 승인번호 ${escapeHtml(c.frontOrphan.approvalNo)}` : ''}${c.frontOrphan.amount !== null && c.frontOrphan.amount !== undefined ? ` · ${Number(c.frontOrphan.amount).toLocaleString('ko-KR')}원` : ''} · 대사 필요</span>` : ''}</td>
         <td>${escapeHtml(formatWhen(c.loadedAt))}<br>
             <span class="muted">${escapeHtml(formatWhen(c.paidAt))}</span></td>
       </tr>`).join('')}</tbody>

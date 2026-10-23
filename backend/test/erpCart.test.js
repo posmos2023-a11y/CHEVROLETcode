@@ -1477,7 +1477,8 @@ testSerial('담김 되돌리기: 담은 단말기(같은 attemptId)는 되돌리
   const mine = 'attempt-unload-mine-1'
   const { store, cartId } = await loadedCartWithAttempt('unload-attempt', mine)
 
-  for (const body of [{ attemptId: 'attempt-unload-other' }, {}, { force: true }]) {
+  // 새 탭앱은 늘 checkDevice:true를 싣는다(기억하는 attemptId가 없을 때도).
+  for (const body of [{ attemptId: 'attempt-unload-other' }, { checkDevice: true }, { checkDevice: true, force: true }, { attemptId: 'attempt-unload-other', force: true }]) {
     const res = await unloadCart(store, cartId, body)
     assert.equal(res.status, 409, JSON.stringify(res.body))
     assert.equal(res.body.code, 'LOADED_ON_OTHER_DEVICE')
@@ -1494,6 +1495,109 @@ testSerial('담김 되돌리기: 담은 단말기(같은 attemptId)는 되돌리
   assert.equal(stored.status, 'pending')
   assert.equal(stored.consumeAttemptId, null)
   assert.equal((await unloadCart(store, cartId, { attemptId: 'bad id' })).status, 400)
+})
+
+// R3: checkDevice도 attemptId도 없는 요청은 담은 단말기 확인을 모르는 탭앱(consume에만 attemptId를 싣고 /unload는 빈 바디)이다.
+testSerial('담김 되돌리기: checkDevice·attemptId가 없는 옛 탭앱의 요청은 확인 없이 예전처럼 되돌리고 경고 로그를 남긴다', async () => {
+  const { store, cartId } = await loadedCartWithAttempt('unload-legacy', 'attempt-unload-legacy-1')
+  let res
+  const warns = await captureLogger('warn', async () => {
+    res = await unloadCart(store, cartId, {})
+  })
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal(res.body.status, 'pending')
+  const log = warns.find((c) => c.message.includes('담은 단말기 확인 없이 담기 취소'))
+  assert.ok(log, '경고 로그가 남지 않았다')
+  assert.equal(log.meta.cartId, cartId)
+  assert.equal(log.meta.storeId, store.id)
+  const stored = await prisma.erpCart.findUnique({ where: { id: cartId } })
+  assert.equal(stored.status, 'pending')
+  assert.equal(stored.consumeAttemptId, null)
+
+  // 같은 주문을 새 탭앱(checkDevice:true)이 다른 단말기에서 담았다면 확인한다.
+  assert.equal((await consumeCart(store, cartId, { result: 'loaded', attemptId: 'attempt-unload-legacy-2' })).body.alreadyProcessed, false)
+  const checked = await unloadCart(store, cartId, { checkDevice: true })
+  assert.equal(checked.status, 409, JSON.stringify(checked.body))
+  assert.equal(checked.body.code, 'LOADED_ON_OTHER_DEVICE')
+})
+
+// R4: [담기 취소] 뒤 늦게 도착한 같은 시도의 담기 보고가 주문을 다시 담김으로 만들지 않는다.
+testSerial('담김 되돌리기: 되돌린 담기 시도의 늦은 consume loaded는 다시 담지 않고 처리됨(ownAttempt false)으로 답한다', async () => {
+  const mine = 'attempt-unload-late-1'
+  const { store, cartId } = await loadedCartWithAttempt('unload-late-consume', mine)
+  assert.equal((await unloadCart(store, cartId, { attemptId: mine, checkDevice: true })).status, 200)
+  assert.equal((await prisma.erpCart.findUnique({ where: { id: cartId } })).consumeReleasedAttemptId, mine)
+
+  const late = await consumeCart(store, cartId, { result: 'loaded', attemptId: mine })
+  assert.equal(late.status, 200, JSON.stringify(late.body))
+  assert.deepEqual(late.body, { ok: true, alreadyProcessed: true, status: 'pending', ownAttempt: false })
+  let stored = await prisma.erpCart.findUnique({ where: { id: cartId } })
+  assert.equal(stored.status, 'pending')
+  assert.equal(stored.consumeAttemptId, null)
+  assert.equal((await getPosCarts(store)).body.carts.length, 1)
+
+  // 새 시도로 다시 담는 것은 된다. 그 시도를 되돌리면 두 시도가 모두 묘비 목록에 남는다.
+  const again = 'attempt-unload-late-2'
+  assert.equal((await consumeCart(store, cartId, { result: 'loaded', attemptId: again })).body.alreadyProcessed, false)
+  assert.equal((await unloadCart(store, cartId, { attemptId: again })).status, 200)
+  stored = await prisma.erpCart.findUnique({ where: { id: cartId } })
+  assert.equal(stored.consumeReleasedAttemptId, `${mine},${again}`)
+  // attemptId 없는 옛 탭앱의 담기는 예전처럼 된다.
+  assert.equal((await consumeCart(store, cartId, { result: 'loaded' })).body.alreadyProcessed, false)
+})
+
+testSerial('담김 되돌리기: 늦은 consume이 주문을 읽은 직후 그 시도가 되돌려졌어도 담지 않는다(묘비 확인이 전이 안에 있다)', async () => {
+  const store = await createStore('unload-late-race')
+  assert.equal((await postCart(validBody(store))).status, 201)
+  const cartId = (await getPosCarts(store)).body.carts[0].id
+  const attempt = 'attempt-unload-late-race'
+  const res = await withRaceAfterNext('findUnique', async () => {
+    // consume이 대기(pending)를 읽은 직후, 같은 시도를 되돌린 기록이 먼저 남았다.
+    await prisma.erpCart.update({ where: { id: cartId }, data: { consumeReleasedAttemptId: attempt } })
+  }, () => consumeCart(store, cartId, { result: 'loaded', attemptId: attempt }))
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.deepEqual(res.body, { ok: true, alreadyProcessed: true, status: 'pending', ownAttempt: false })
+  assert.equal((await prisma.erpCart.findUnique({ where: { id: cartId } })).status, 'pending')
+})
+
+// R6: 갇힌 주문이 POS 목록에서 사라지지 않는다.
+testSerial('POS 목록: 결제 중(paying)인 프론트 주문은 접수 24시간이 지나도, 담긴(loaded) 주문은 7일이 지나도 보이고 만료되지 않는다', async () => {
+  const store = await createStore('stuck-lists')
+  const day = 24 * 60 * 60 * 1000
+  const paying = await postCart(validBody(store, { payTarget: 'front' }))
+  const stalePending = await postCart(validBody(store, { payTarget: 'front' }))
+  const loaded = await postCart(validBody(store))
+  assert.equal(paying.status, 201)
+  await prisma.erpCart.update({
+    where: { id: paying.body.cartId },
+    data: { status: 'paying', frontPaymentKey: crypto.randomUUID(), frontPayingAt: new Date(Date.now() - 23 * 60 * 60 * 1000), createdAt: new Date(Date.now() - 30 * 60 * 60 * 1000) },
+  })
+  await prisma.erpCart.update({ where: { id: stalePending.body.cartId }, data: { createdAt: new Date(Date.now() - 30 * 60 * 60 * 1000) } })
+  await consumeCart(store, loaded.body.cartId, { result: 'loaded', attemptId: 'attempt-stuck-loaded' })
+  await prisma.erpCart.update({
+    where: { id: loaded.body.cartId },
+    data: { loadedAt: new Date(Date.now() - 10 * day), createdAt: new Date(Date.now() - 10 * day) },
+  })
+
+  // 만료 잡은 대기(pending)만 만료한다.
+  await expireStaleErpCarts()
+  assert.equal((await prisma.erpCart.findUnique({ where: { id: paying.body.cartId } })).status, 'paying')
+  assert.equal((await prisma.erpCart.findUnique({ where: { id: loaded.body.cartId } })).status, 'loaded')
+  assert.equal((await prisma.erpCart.findUnique({ where: { id: stalePending.body.cartId } })).status, 'expired')
+
+  const queue = await request(app).get('/api/pos/queue').set('X-Store-Token', store.posToken)
+  assert.equal(queue.status, 200)
+  assert.deepEqual(queue.body.frontCarts.map((c) => c.id), [paying.body.cartId])
+  assert.equal(queue.body.frontCarts[0].status, 'paying')
+  assert.ok(queue.body.frontCarts[0].frontPayingAt)
+  const settled = queue.body.settledCarts.find((c) => c.id === loaded.body.cartId)
+  assert.ok(settled, '7일이 지난 담김 주문이 최근 결제 목록에서 빠졌다')
+  assert.equal(settled.status, 'loaded')
+
+  // 담긴 지 오래된 주문이라도 [담기 취소]로 끝낼 수 있다(24시간이 지나 dismissed로 닫힌다).
+  const unload = await unloadCart(store, loaded.body.cartId, { attemptId: 'attempt-stuck-loaded', checkDevice: true })
+  assert.equal(unload.status, 200, JSON.stringify(unload.body))
+  assert.equal(unload.body.status, 'dismissed')
 })
 
 testSerial('담김 되돌리기: 담은 지 30분이 지나면 다른 단말기도 force로 되돌릴 수 있고 경고 로그를 남긴다(force 없이는 여전히 409)', async () => {

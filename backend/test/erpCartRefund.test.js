@@ -681,14 +681,57 @@ testSerial('비상구(취소 중): 10분이 안 지났으면 409와 남은 시�
   assert.equal(cart.refundReleasedAttemptId, a)
   assert.equal(cart.errorMessage, '프론트 취소 상태를 직원이 풀었음')
 
-  // 풀린 시도의 늦은 완료 보고는 반영되지 않고 대사가 필요하다는 로그가 남는다. 늦은 start도 거절된다.
-  const logs = await captureLoggerErrors(async () => {
-    const late = await refundResult(store, cartId, { result: 'refunded', attemptId: a })
-    assert.equal(late.status, 409)
-  })
-  assert.ok(logs.some((l) => l.message.includes('결제 취소 완료 보고를 반영하지 못했습니다')))
+  // 풀린 시도의 늦은 start는 거절된다(직원이 다시 취소를 요청해도 그 시도가 가로채지 못한다).
   assert.equal((await pos(store, 'post', `/api/pos/erp-carts/${cartId}/refund-request`)).status, 200)
   assert.equal((await refundStart(store, cartId, a)).status, 409)
+  // 풀린 시도의 늦은 완료 보고는 카드가 이미 취소된 것이라 환불로 받는다(다시 요청된 취소도 함께 끝난다).
+  const late = await refundResult(store, cartId, { result: 'refunded', attemptId: a })
+  assert.equal(late.status, 200, JSON.stringify(late.body))
+  assert.equal(late.body.status, 'refunded')
+  const refunded = await row(cartId)
+  assert.equal(refunded.status, 'refunded')
+  assert.equal(refunded.refundNote, '프론트에서 결제 취소(풀린 뒤 보고)')
+  assert.equal(refunded.refundRequestedAt, null)
+})
+
+// R7: [취소 중 풀기] 뒤 늦게 온 프론트 '취소 완료' 보고 -- 풀린 시도면 환불로 받고, 목록에 없는 시도는 예전처럼 409.
+testSerial('비상구(취소 중): 풀린 뒤 결제 완료(paid)로 돌아간 주문에 그 시도의 완료 보고가 오면 환불로 받고 경고를 남긴다, 다른 시도는 409', async () => {
+  const store = await createStore('force-refunding-late-done')
+  const cartId = await requestedRefund(store)
+  const a = attemptId('late-a')
+  assert.equal((await refundStart(store, cartId, a)).status, 200)
+  await prisma.erpCart.update({ where: { id: cartId }, data: { refundStartedAt: new Date(Date.now() - 11 * 60 * 1000) } })
+  assert.equal((await forceRelease(store, cartId)).status, 200)
+  assert.equal((await row(cartId)).status, 'paid')
+
+  // 이 주문에서 취소창을 띄운 적이 없는 시도의 완료 보고는 받지 않는다(대사 필요 로그와 409).
+  const errors = await captureLoggerErrors(async () => {
+    const stranger = await refundResult(store, cartId, { result: 'refunded', attemptId: attemptId('late-other') })
+    assert.equal(stranger.status, 409, JSON.stringify(stranger.body))
+  })
+  assert.ok(errors.some((l) => l.message.includes('결제 취소 완료 보고를 반영하지 못했습니다')))
+  assert.equal((await row(cartId)).status, 'paid')
+
+  const original = logger.warn
+  const warns = []
+  logger.warn = (message, meta) => { warns.push({ message, meta }) }
+  let late
+  try {
+    late = await refundResult(store, cartId, { result: 'refunded', attemptId: a })
+  } finally {
+    logger.warn = original
+  }
+  assert.equal(late.status, 200, JSON.stringify(late.body))
+  assert.deepEqual({ ok: late.body.ok, status: late.body.status }, { ok: true, status: 'refunded' })
+  const cart = await row(cartId)
+  assert.equal(cart.status, 'refunded')
+  assert.equal(cart.refundNote, '프론트에서 결제 취소(풀린 뒤 보고)')
+  assert.ok(cart.refundedAt)
+  assert.ok(warns.some((w) => w.message.includes('풀린 취소 시도의 완료 보고') && w.meta.cartId === cartId && w.meta.attemptId === a))
+  // 같은 보고의 재시도는 이미 처리됨
+  const again = await refundResult(store, cartId, { result: 'refunded', attemptId: a })
+  assert.equal(again.status, 200)
+  assert.equal(again.body.alreadyProcessed, true)
 })
 
 testSerial('비상구(취소 중): 시작 시각이 없으면 취소 요청 시각을 기준으로 하고, 다른 매장·다른 상태는 풀 수 없다', async () => {
@@ -820,6 +863,137 @@ testSerial('함께 결제된 건수: 같이 결제된 주문이 7일 밖이거�
   const settled = (await pos(store, 'get', '/api/pos/queue')).body.settledCarts
   assert.deepEqual(settled.map((c) => c.id), [shown])
   assert.equal(settled[0].sharedPaymentCount, 3)
+  // R2: 같은 결제에 묶인 주문 금액 합계도 같은 기준(7일 밖·삭제 포함, 다른 매장 제외)으로 센다.
+  assert.equal(settled[0].sharedPaymentTotal, 3 * 45000)
+})
+
+// R2: 탭앱이 POS 결제 금액과 비교해 전산 밖 POS 품목까지 전액 취소되는지 알 수 있게 합계를 준다.
+testSerial('함께 결제된 금액: 결제 ID가 없거나 혼자 결제된 주문은 자기 금액, 프론트 결제도 자기 금액이다', async () => {
+  const store = await createStore('shared-total')
+  const alone = await posPaidCart(store, unique('640'))
+  const noId = await erp.post(body(store, { totalAmount: 30000, items: [{ productId: 'P', name: '와이퍼', category: '부품', unitPrice: 30000, quantity: 1 }] }))
+  await pos(store, 'post', `/api/pos/erp-carts/${noId.body.cartId}/consume`, { result: 'loaded' })
+  assert.equal((await pos(store, 'post', `/api/pos/erp-carts/${noId.body.cartId}/paid`, {})).status, 200)
+  const front = await frontPaidCart(store, { totalAmount: 70000 })
+
+  const settled = (await pos(store, 'get', '/api/pos/queue')).body.settledCarts
+  const of = (id) => settled.find((c) => c.id === id)
+  assert.equal(of(alone).sharedPaymentTotal, 45000)
+  assert.equal(of(alone).sharedPaymentCount, 1)
+  assert.equal(of(noId.body.cartId).sharedPaymentTotal, 30000)
+  assert.equal(of(front.cartId).sharedPaymentTotal, 70000)
+})
+
+// --- R1: POS에서 결제를 취소하고 다시 결제(카드·할부 바꾸기) ----------------------------------------------
+
+testSerial('취소 후 재결제: 토스 취소 웹훅으로 환불된 주문에 같은 POS 주문의 새 결제가 오면 결제 완료로 되살리고, 보낸 영수증은 다시 보내지 않는다', async () => {
+  const store = await createStore('repay-webhook')
+  const first = tossPayment(store, { orderId: 'ORDER-1' })
+  const cartId = await posPaidCart(store, first.id)
+  await webhook('payment.payment.approved.v1', first)
+  await webhook('payment.payment.cancelled.v1', { ...first, state: 'CANCELLED', cancelledAt: '2026-10-21T11:00:00' })
+  let cart = await row(cartId)
+  assert.equal(cart.status, 'refunded')
+  assert.equal(cart.refundNote, '토스 결제 취소 확인')
+  // 첫 결제 때 영수증을 보냈다고 둔다.
+  await prisma.erpCart.update({ where: { id: cartId }, data: { receiptStatus: 'sent' } })
+  global.__notifications.length = 0
+
+  const second = tossPayment(store, { orderId: 'ORDER-1' })
+  const original = logger.warn
+  const warns = []
+  logger.warn = (message, meta) => { warns.push({ message, meta }) }
+  let res
+  try {
+    res = await pos(store, 'post', `/api/pos/erp-carts/${cartId}/paid`, { paymentId: second.id, orderId: 'ORDER-1' })
+  } finally {
+    logger.warn = original
+  }
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal(res.body.ok, true)
+  assert.equal(res.body.status, 'paid')
+  assert.equal(res.body.restored, true)
+  cart = await row(cartId)
+  assert.equal(cart.status, 'paid')
+  assert.equal(cart.tossPaymentId, second.id)
+  assert.equal(cart.tossOrderId, 'ORDER-1')
+  assert.equal(cart.refundedAt, null)
+  assert.equal(cart.refundNote, null)
+  assert.equal(cart.tossVerifiedAt, null) // 옛 결제의 확인은 새 결제와 무관하다
+  const log = warns.find((w) => w.message === '[pos] 취소 후 재결제로 결제 완료 복원')
+  assert.ok(log, '복원 경고 로그가 남지 않았다')
+  assert.equal(log.meta.previousPaymentId, first.id)
+  assert.equal(log.meta.reportedPaymentId, second.id)
+  assert.equal(log.meta.cartId, cartId)
+  assert.equal(global.__notifications.filter((n) => n.method === 'sendReceiptAlimtalk').length, 0)
+  assert.equal((await erp.get(cart.referenceId)).body.status, 'paid')
+
+  // 같은 통보의 재시도는 처리됨. 새 결제의 승인 웹훅이 오면 이어지고, 옛 결제의 취소 웹훅이 다시 와도 되살린 주문은 그대로다.
+  const again = await pos(store, 'post', `/api/pos/erp-carts/${cartId}/paid`, { paymentId: second.id, orderId: 'ORDER-1' })
+  assert.equal(again.status, 200)
+  assert.equal(again.body.alreadyProcessed, true)
+  await webhook('payment.payment.approved.v1', second)
+  assert.ok((await row(cartId)).tossVerifiedAt)
+  await webhook('payment.payment.cancelled.v1', { ...first, state: 'CANCELLED', cancelledAt: '2026-10-21T11:00:00' })
+  assert.equal((await row(cartId)).status, 'paid')
+})
+
+testSerial('취소 후 재결제: 탭앱 [결제 취소]로 기록된 주문도 직원이 손으로 고른(manual) 새 결제면 다른 POS 주문이어도 되살린다', async () => {
+  const store = await createStore('repay-pos-cancel')
+  const firstId = unique('640')
+  const cartId = await posPaidCart(store, firstId)
+  assert.equal((await pos(store, 'post', `/api/pos/erp-carts/${cartId}/refunded`, { method: 'pos' })).status, 200)
+  assert.equal((await row(cartId)).refundNote, 'POS에서 결제 취소')
+
+  // 다른 POS 주문의 결제는 manual 없이는 되살리지 않는다(같은 주문의 재결제인지 알 수 없다).
+  const stranger = await pos(store, 'post', `/api/pos/erp-carts/${cartId}/paid`, { paymentId: unique('640'), orderId: 'ORDER-NEW' })
+  assert.equal(stranger.status, 409, JSON.stringify(stranger.body))
+  assert.equal(stranger.body.code, 'ALREADY_PAID_OTHER')
+  assert.equal((await row(cartId)).status, 'refunded')
+
+  const secondId = unique('640')
+  const res = await pos(store, 'post', `/api/pos/erp-carts/${cartId}/paid`, { paymentId: secondId, orderId: 'ORDER-NEW', manual: true })
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.deepEqual({ ok: res.body.ok, status: res.body.status, restored: res.body.restored }, { ok: true, status: 'paid', restored: true })
+  const cart = await row(cartId)
+  assert.equal(cart.status, 'paid')
+  assert.equal(cart.tossPaymentId, secondId)
+  assert.equal(cart.tossOrderId, 'ORDER-NEW')
+})
+
+testSerial('취소 후 재결제: 24시간이 지난 환불, 프론트 취소·현금 환불, 같은 결제 ID의 통보는 되살리지 않는다', async () => {
+  const store = await createStore('repay-guard')
+  // 24시간이 지난 환불
+  const oldId = unique('640')
+  const old = await posPaidCart(store, oldId)
+  await pos(store, 'post', `/api/pos/erp-carts/${old}/refunded`, { method: 'pos' })
+  await prisma.erpCart.update({ where: { id: old }, data: { refundedAt: new Date(Date.now() - 25 * 60 * 60 * 1000) } })
+  const late = await pos(store, 'post', `/api/pos/erp-carts/${old}/paid`, { paymentId: unique('640'), orderId: 'ORDER-1', manual: true })
+  assert.equal(late.status, 409)
+  assert.equal(late.body.code, 'ALREADY_PAID_OTHER')
+  assert.equal((await row(old)).status, 'refunded')
+
+  // POS 쪽 취소가 아닌 환불 기록
+  const other = await posPaidCart(store, unique('640'))
+  await prisma.erpCart.update({ where: { id: other }, data: { status: 'refunded', refundedAt: new Date(), refundNote: '프론트에서 결제 취소' } })
+  const notPos = await pos(store, 'post', `/api/pos/erp-carts/${other}/paid`, { paymentId: unique('640'), orderId: 'ORDER-1', manual: true })
+  assert.equal(notPos.status, 409)
+  assert.equal((await row(other)).status, 'refunded')
+
+  // 취소된 바로 그 결제의 통보(재시도)는 되살릴 근거가 아니다.
+  const sameId = unique('640')
+  const same = await posPaidCart(store, sameId)
+  await pos(store, 'post', `/api/pos/erp-carts/${same}/refunded`, { method: 'pos' })
+  const retry = await pos(store, 'post', `/api/pos/erp-carts/${same}/paid`, { paymentId: sameId, orderId: 'ORDER-1' })
+  assert.equal(retry.status, 409)
+  assert.equal((await row(same)).status, 'refunded')
+
+  // 프론트 결제 건은 POS 결제로 되살리지 않는다.
+  const front = await frontPaidCart(store)
+  await prisma.erpCart.update({ where: { id: front.cartId }, data: { status: 'refunded', refundedAt: new Date(), refundNote: '토스 결제 취소 확인', tossPaymentId: unique('640'), tossOrderId: 'ORDER-1' } })
+  const frontRes = await pos(store, 'post', `/api/pos/erp-carts/${front.cartId}/paid`, { paymentId: unique('640'), orderId: 'ORDER-1', manual: true })
+  assert.equal(frontRes.status, 409)
+  assert.equal((await row(front.cartId)).status, 'refunded')
 })
 
 // --- 웹훅이 먼저 와서 생긴 Payment 백업 기록의 이중 집계 ---------------------------------------------
@@ -859,6 +1033,70 @@ testSerial('백업 기록: POS 결제 통보로 이어져도 erp_linked가 된�
   assert.equal((await summaryOf(store)).payments.total, 1)
   await posPaidCart(store, tp.id)
   assert.equal((await prisma.payment.findFirst()).status, 'erp_linked')
+  assert.equal((await summaryOf(store)).payments.total, 0)
+})
+
+// R8: 웹훅이 주문을 찾지 못한 직후(백업 기록을 만들기 전) 결제 통보가 끝까지 처리되는 경우. 통보 쪽은 백업 기록이 아직 없어 바꾸지
+// 못하므로, 늦게 확인하는 웹훅 쪽이 백업을 만든 뒤 다시 이어 erp_linked로 바꿔야 한다.
+// 웹훅이 백업 기록이 있는지 보는 순간(findPaymentByKey)에 body()를 끝까지 실행한다.
+async function withWebhookPausedBeforeBackup(orderId, body, run) {
+  const original = prisma.payment.findUnique
+  let fired = false
+  prisma.payment.findUnique = async (...args) => {
+    if (!fired && args[0]?.where?.paymentKey === orderId) {
+      fired = true
+      await body()
+    }
+    return original.apply(prisma.payment, args)
+  }
+  try {
+    await run()
+  } finally {
+    prisma.payment.findUnique = original
+  }
+  assert.ok(fired, '웹훅이 백업 기록 확인까지 가지 않았다')
+}
+
+testSerial('백업 기록: 웹훅이 주문을 못 찾은 직후 POS 결제 통보가 먼저 이어도, 백업을 만든 웹훅이 다시 이어 erp_linked로 바꾼다', async () => {
+  const store = await createStore('backup-race-pos')
+  const tp = tossPayment(store)
+  const created = await erp.post(body(store))
+  const cartId = created.body.cartId
+  await pos(store, 'post', `/api/pos/erp-carts/${cartId}/consume`, { result: 'loaded' })
+
+  await withWebhookPausedBeforeBackup(tp.orderId, async () => {
+    const paid = await pos(store, 'post', `/api/pos/erp-carts/${cartId}/paid`, { paymentId: tp.id, orderId: tp.orderId })
+    assert.equal(paid.status, 200, JSON.stringify(paid.body))
+    // 통보 쪽은 백업 기록이 아직 없어 바꿀 것이 없었다.
+    assert.equal(await prisma.payment.count({ where: { storeId: store.id } }), 0)
+  }, async () => {
+    const res = await webhook('payment.payment.approved.v1', tp)
+    assert.equal(res.status, 200, JSON.stringify(res.body))
+  })
+
+  const backups = await prisma.payment.findMany({ where: { storeId: store.id } })
+  assert.equal(backups.length, 1)
+  assert.equal(backups[0].status, 'erp_linked')
+  assert.equal((await row(cartId)).status, 'paid')
+  assert.ok((await row(cartId)).tossVerifiedAt)
+  const summary = await summaryOf(store)
+  assert.equal(summary.payments.total, 0)
+  assert.equal(summary.erpCarts.paid, 1)
+})
+
+testSerial('백업 기록: 웹훅이 주문을 못 찾은 직후 프론트 결과 보고가 먼저 이어도 erp_linked로 바뀐다', async () => {
+  const store = await createStore('backup-race-front')
+  const tp = tossPayment(store, { approvedNo: '55550000' })
+  let front
+  await withWebhookPausedBeforeBackup(tp.orderId, async () => {
+    front = await frontPaidCart(store, { approvalNumber: '55550000' })
+    assert.equal((await row(front.cartId)).tossPaymentId, tp.id)
+  }, async () => {
+    assert.equal((await webhook('payment.payment.approved.v1', tp)).status, 200)
+  })
+  const backups = await prisma.payment.findMany({ where: { storeId: store.id } })
+  assert.equal(backups.length, 1)
+  assert.equal(backups[0].status, 'erp_linked')
   assert.equal((await summaryOf(store)).payments.total, 0)
 })
 

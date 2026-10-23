@@ -77,6 +77,8 @@ const {
   FORCE_RELEASE_AFTER_MS,
   markErpCartFrontPaid,
   markErpCartFrontPaidAfterRelease,
+  recordErpCartFrontOrphan,
+  clearErpCartFrontOrphan,
   sendErpCartToFront,
   returnErpCartToPos,
   listFrontErpCartsForPos,
@@ -85,12 +87,15 @@ const {
   linkErpCartsToTossPayment,
   linkFrontCartToRecordedTossPayment,
   markErpCartsRefundedByToss,
+  TOSS_CANCEL_REFUND_NOTE,
+  restoreErpCartPaidAfterPosCancel,
   requestErpCartRefund,
   withdrawErpCartRefund,
   markErpCartRefunding,
   releaseErpCartRefunding,
   markErpCartRefundAttemptReleased,
   markErpCartRefunded,
+  markErpCartRefundedAfterRelease,
   listSettledErpCartsForPos,
   listErpCarts,
   getPosDailySummary,
@@ -1094,15 +1099,22 @@ app.get('/api/pos/queue', posIpFloodLimiter, posQueueReadLimiter, requireStoreTo
   // 한도에 잘려 있으면 1건으로 보이는데, 실제로 /refunded는 같은 tossPaymentId의 주문을 전부 취소한다. 직원이 "1건"이라
   // 믿고 취소했다가 다른 주문까지 취소되는 사고가 된다. 그래서 기간·삭제 여부와 무관하게 DB에서 따로 센다.
   // storeId를 건 이유: /refunded의 형제 주문 조회가 같은 매장으로 한정되어 있어 표시와 실제 취소 범위를 맞춘다.
+  // 같은 결제에 묶인 주문들의 금액 합계(sharedPaymentTotal)도 같은 기준으로 센다. 탭앱이 POS 결제 금액과 비교해, 전산 주문 밖의
+  // POS 품목까지 함께 결제된 건이면 [결제 취소]가 그 품목까지 전액 취소한다는 것을 미리 알린다(SDK 취소는 결제 한 건 전체를 취소한다).
   const sharedIds = [...new Set(settledRows.map((row) => row.tossPaymentId).filter(Boolean))]
   const sharedCount = new Map()
+  const sharedTotal = new Map()
   if (sharedIds.length) {
     const grouped = await prisma.erpCart.groupBy({
       by: ['tossPaymentId'],
       where: { storeId: req.store.id, tossPaymentId: { in: sharedIds } },
       _count: { _all: true },
+      _sum: { totalAmount: true },
     })
-    for (const g of grouped) sharedCount.set(g.tossPaymentId, g._count._all)
+    for (const g of grouped) {
+      sharedCount.set(g.tossPaymentId, g._count._all)
+      sharedTotal.set(g.tossPaymentId, g._sum.totalAmount ?? 0)
+    }
   }
   return res.json({
     ok: true,
@@ -1126,6 +1138,7 @@ app.get('/api/pos/queue', posIpFloodLimiter, posQueueReadLimiter, requireStoreTo
         createdAt: row.createdAt,
         // 결제 중(paying)이 10분 넘게 갇혔을 때 탭앱이 [결제 상태 풀기]를 보여주는 기준(force-release)
         frontPayingAt: row.frontPayingAt,
+        frontOrphan: frontOrphanOf(row),
       }
     }),
     // 최근 7일 결제된 전산 주문(결제 완료·취소 진행·취소됨). 정비 대기열의 결제 취소는 여기서 한다.
@@ -1156,6 +1169,8 @@ app.get('/api/pos/queue', posIpFloodLimiter, posQueueReadLimiter, requireStoreTo
         tossOrderId: row.tossOrderId,
         tossVerified: Boolean(row.tossVerifiedAt),
         sharedPaymentCount: row.tossPaymentId ? sharedCount.get(row.tossPaymentId) || 1 : 1,
+        sharedPaymentTotal: row.tossPaymentId && sharedTotal.has(row.tossPaymentId) ? sharedTotal.get(row.tossPaymentId) : row.totalAmount,
+        frontOrphan: frontOrphanOf(row),
         paymentMethod: front?.paymentMethod || null,
         cashWithoutReceipt: row.payTarget === 'front' ? isUncancellableCash(row) : false,
         // 탭앱 정리·영수증 다시 보내기용
@@ -1212,9 +1227,17 @@ async function loadPendingErpCartsForResponse(storeId, payTarget = 'pos') {
       linkedReservation: Boolean(row.reservationId),
       // 프론트의 "2분 쉬기" 열쇠용(다시 보낸 주문은 바로 뜨게) -- schema.prisma frontSentAt
       frontSentAt: row.frontSentAt || null,
+      frontOrphan: frontOrphanOf(row),
     })
   }
   return carts
+}
+
+// 프론트에서 승인됐지만 이 주문에 반영하지 못한 결제의 흔적(/result의 PAID_AFTER_RELEASE). 탭앱은 이 값이 있으면 경고를 띄우고
+// 같은 주문을 또 결제하기 전에 확인받는다. 없으면 null.
+function frontOrphanOf(row) {
+  if (!row?.frontOrphanAt) return null
+  return { at: row.frontOrphanAt, approvalNo: row.frontOrphanApprovalNo ?? null, amount: row.frontOrphanAmount ?? null }
 }
 
 // ⚠️ 이 라우트는 **구버전 탭앱 호환용**으로 남겨둔다. 새 탭앱은 /api/pos/queue 응답의
@@ -1289,6 +1312,16 @@ app.post('/api/pos/erp-carts/:id/consume', posIpFloodLimiter, posLimiter, requir
     return res.json(alreadyProcessedBody(cart))
   }
 
+  // [담기 취소]로 되돌린 담기 시도의 늦은 보고(재전송·응답을 못 받은 첫 요청의 재시도)다. 다시 담김으로 만들면 POS 품목도 탭앱
+  // 기록도 없는데 서버만 담김이 된다. 처리된 것으로 답하되 자기 시도가 아니라고 알려(ownAttempt false) 탭앱이 담긴 것으로 보지 않게 한다.
+  const releasedAttemptBody = (row) => {
+    logger.warn('[pos] 되돌린 담기 시도의 늦은 담기 보고를 받지 않음', { storeId: req.store.id, cartId: cart.id, attemptId, status: row?.status })
+    return { ok: true, alreadyProcessed: true, status: row?.status, ownAttempt: false }
+  }
+  if (result === 'loaded' && isReleasedToken(cart.consumeReleasedAttemptId, attemptId)) {
+    return res.json(releasedAttemptBody(cart))
+  }
+
   // 위에서 pending을 확인했더라도 이 사이에 다른 요청(POS 단말기 2대가 동시에 consume하는 경우)이
   // 먼저 전이시켰을 수 있다 -- markErpCartLoaded/Failed 자체가 원자적 updateMany라 그 경쟁을
   // 최종적으로 판정한다. 반환값(changed)이 false면 내가 아니라 그 사이의 다른 요청이 이겼다는
@@ -1314,6 +1347,10 @@ app.post('/api/pos/erp-carts/:id/consume', posIpFloodLimiter, posLimiter, requir
       // 사전 확인과 같은 409를 돌려 탭앱이 담은 품목을 되돌리고 결제하지 않게 한다.
       return res.status(409).json({ ok: false, error: '프론트에서 결제하도록 넘긴 주문입니다.', status: latest.status, payTarget: 'front' })
     }
+    // 읽은 직후 이 시도가 되돌려졌다(markErpCartLoaded가 묘비 목록과 함께 확인해 담지 않았다).
+    if (result === 'loaded' && latest?.status === 'pending' && isReleasedToken(latest.consumeReleasedAttemptId, attemptId)) {
+      return res.json(releasedAttemptBody(latest))
+    }
     return res.json(alreadyProcessedBody(latest))
   }
   return res.json({ ok: true, alreadyProcessed: false, status: result })
@@ -1321,10 +1358,13 @@ app.post('/api/pos/erp-carts/:id/consume', posIpFloodLimiter, posLimiter, requir
 
 // 담김(loaded) 되돌리기. 직원이 잘못 담았거나 POS 장바구니를 비워서 이 주문을 다시 담아야 할 때, 탭앱이 호출한다.
 // 결제 통보(paidAt)가 이미 있는 주문과 프론트 결제 건은 되돌리지 않는다(store.markErpCartUnloaded).
-// body: { attemptId?(담을 때 consume에 실은 값), force?(다른 단말기가 담은 주문을 직원이 확인하고 되돌림) }
+// body: { checkDevice?(새 탭앱은 늘 true), attemptId?(담을 때 consume에 실은 값), force?(다른 단말기가 담은 주문을 직원이 확인하고 되돌림) }
 // 담은 단말기만 되돌릴 수 있다(consumeAttemptId 비교). 다른 단말기가 되돌리면 담은 단말기의 POS 장바구니와 결제 대기 기록은
 // 그대로 남아, 이 주문이 다시 담기거나 프론트로 넘어가 결제된 뒤 담은 단말기에서 또 결제될 수 있다. 담은 단말기가 사라진
 // 경우를 위해 담은 지 UNLOAD_FORCE_AFTER_MS가 지났고 force:true면 허용한다. 옛 탭앱이 담은 주문(consumeAttemptId 없음)은 예전처럼.
+// 이 확인은 요청이 checkDevice:true나 attemptId를 실었을 때만 한다. 둘 다 없는 요청은 이 확인을 모르는 탭앱(attemptId를 consume에만
+// 싣고 /unload는 빈 바디로 보내던 버전)이다 -- 그 탭앱은 force를 보낼 수 없어, 확인하면 자기가 담은 주문도 영영 되돌리지 못한다.
+// 그래서 예전처럼 되돌리고 경고 로그만 남긴다. 새 탭앱은 기억하는 attemptId가 없어도 checkDevice:true를 싣는다.
 // 담긴 채 24시간이 넘은 주문은 되돌려도 전산 주문 목록에 다시 뜨지 않으므로 pending 대신 dismissed로 닫는다.
 app.post('/api/pos/erp-carts/:id/unload', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
   const attemptId = parseAttemptId(req.body?.attemptId)
@@ -1332,6 +1372,7 @@ app.post('/api/pos/erp-carts/:id/unload', posIpFloodLimiter, posLimiter, require
     return res.status(400).json({ ok: false, error: 'attemptId는 8~64자의 영문/숫자/하이픈/밑줄이어야 합니다.' })
   }
   const force = req.body?.force === true
+  const checkDevice = req.body?.checkDevice === true || attemptId !== null
   const cart = await prisma.erpCart.findUnique({ where: { id: req.params.id } })
   if (!cart || cart.storeId !== req.store.id) {
     return res.status(404).json({ ok: false, error: '주문을 찾을 수 없습니다.' })
@@ -1353,10 +1394,12 @@ app.post('/api/pos/erp-carts/:id/unload', posIpFloodLimiter, posLimiter, require
 
   // 되돌릴 수 있는 상태(loaded)일 때만 담은 단말기를 따진다(그 밖은 아래 전이가 실패해 상태와 함께 409로 답한다).
   const waitMs = otherDeviceWaitMs(cart)
-  if (waitMs !== null && (!force || waitMs > 0)) {
+  if (checkDevice && waitMs !== null && (!force || waitMs > 0)) {
     return res.status(409).json(otherDeviceBody(cart, waitMs))
   }
-  const forced = waitMs !== null
+  const forced = checkDevice && waitMs !== null
+  // 담은 단말기 확인을 모르는 탭앱의 요청이라 확인 없이 되돌린다(위 주석). 다른 단말기가 담은 주문이었다면 이중 결제를 이 로그로 되짚는다.
+  const uncheckedOtherDevice = !checkDevice && waitMs !== null
 
   // 읽은 담기 시도 그대로일 때만 되돌린다 -- 확인한 뒤 그 사이 다른 단말기가 되돌렸다가 다시 담은 주문을 건드리지 않는다.
   const outcome = await markErpCartUnloaded(cart.id, req.store.id, { consumeAttemptId: cart.consumeAttemptId ?? null })
@@ -1374,6 +1417,11 @@ app.post('/api/pos/erp-carts/:id/unload', posIpFloodLimiter, posLimiter, require
   if (forced) {
     // 담은 단말기에는 이 주문의 품목과 결제 대기 기록이 남아 있을 수 있다 -- 이중 결제가 나면 이 로그로 되짚는다.
     logger.warn('[pos] 다른 단말기에서 담은 주문을 직원이 확인하고 되돌림', {
+      storeId: req.store.id, cartId: cart.id, referenceId: cart.referenceId, loadedAt: cart.loadedAt, outcome,
+    })
+  }
+  if (uncheckedOtherDevice) {
+    logger.warn('[pos] 담은 단말기 확인 없이 담기 취소(확인을 모르는 옛 탭앱)', {
       storeId: req.store.id, cartId: cart.id, referenceId: cart.referenceId, loadedAt: cart.loadedAt, outcome,
     })
   }
@@ -1791,6 +1839,8 @@ app.get('/api/admin/erp-carts', requireAuth, asyncHandler(async (req, res) => {
         receiptStatus: r.receiptStatus || null,
         itemCount: items.length,
         errorMessage: r.errorMessage,
+        // 프론트에서 승인됐지만 이 주문에 반영하지 못한 결제(PAID_AFTER_RELEASE) -- 대사가 필요하다.
+        frontOrphan: frontOrphanOf(r),
         createdAt: r.createdAt,
         loadedAt: r.loadedAt,
         paidAt: r.paidAt,
@@ -1869,9 +1919,12 @@ async function processWebhookPayment(body, webhookId) {
   // 문서상 payment.orderId는 토스 주문 ID라 우리 paymentKey와 같다는 아래(기존) 전제는 맞지 않을 수
   // 있다 -- 전산 주문은 승인번호+금액으로 잇는다(linkErpCartsToTossPayment).
   const isPaymentEvent = eventType === 'payment.payment.approved.v1' || eventType === 'payment.payment.cancelled.v1'
+  // 아래 백업 기록을 만든 뒤 다시 잇기 위해 남겨 둔다(전산 주문과 잇지 못한 경우에만 쓰인다).
+  let tossPaymentForLink = null
   if (isPaymentEvent && payment.id) {
     const mappedStore = await findStoreByMerchantId(merchantId)
     const tossPayment = await recordTossPayment({ ...payment, merchantId }, mappedStore?.id)
+    tossPaymentForLink = tossPayment
     const carts = await linkErpCartsToTossPayment(tossPayment)
     if (carts.length) {
       // 늦게 재전송된 '승인' 웹훅이어도 이미 취소된 결제면(recordTossPayment가 CANCELLED를 지킨다) 이은 주문도 취소로 맞춘다.
@@ -1933,6 +1986,18 @@ async function processWebhookPayment(body, webhookId) {
       amount,
     })
     console.log(`[webhook] 결제 승인 백업 기록 생성: payment id=${recorded.id}, paymentKey=${paymentKey}`)
+    // 위에서 잇지 못한 뒤 백업 기록을 만들기 전, 그 사이에 POS 결제 통보(/paid)나 프론트 결과 보고(/result)가 같은 토스 결제를 주문과
+    // 이었을 수 있다. 그쪽은 백업 기록이 아직 없어 erp_linked로 바꾸지 못했으므로, 백업을 만든 뒤 한 번 더 잇고 이어졌으면 여기서
+    // 바꾼다(늦게 잇는 쪽이 바꾼다 -- 둘 중 하나는 반드시 백업 기록이 생긴 뒤에 확인한다). 안 하면 같은 돈이 Payment와 전산 주문
+    // 양쪽에서 집계된다(getDailySummary).
+    if (tossPaymentForLink) {
+      const relinked = await linkErpCartsToTossPayment(tossPaymentForLink)
+      if (relinked.length) {
+        if (tossPaymentForLink.state === 'CANCELLED') await markErpCartsRefundedByToss(relinked.map((c) => c.id))
+        const marked = await markBackupPaymentErpLinked(tossPaymentForLink)
+        logger.info('[webhook] 백업 기록을 만든 사이 전산 주문과 이어져 집계에서 뺐습니다', { webhookId, tossPaymentId: tossPaymentForLink.id, marked })
+      }
+    }
     return
   }
 
@@ -2930,12 +2995,33 @@ function isSamePosPayment(row, reportedPaymentId) {
   return !reportedPaymentId || !row.tossPaymentId || row.tossPaymentId === reportedPaymentId
 }
 
+// POS 결제 취소로 환불된 주문의 refundNote. 탭앱 [결제 취소] 기록(/refunded method 'pos')과 토스 취소 웹훅(store.markErpCartsRefundedByToss)이
+// 남긴다. "취소 후 재결제" 복원(/paid)이 이 두 문구로 POS 쪽 취소였는지 가린다 -- 프론트 취소·현금 환불은 되살리지 않는다.
+const POS_CANCEL_REFUND_NOTE = 'POS에서 결제 취소'
+const POS_SIDE_CANCEL_REFUND_NOTES = [TOSS_CANCEL_REFUND_NOTE, POS_CANCEL_REFUND_NOTE]
+// 취소 후 재결제로 볼 수 있는 시간. 카드를 바꿔 다시 결제하는 것은 그 자리에서 일어난다. 오래된 환불을 되살리면 남의 결제를 붙인다.
+const POS_REPAY_RESTORE_WINDOW_MS = 24 * 60 * 60 * 1000
+
+// 환불된(refunded) 주문에 온 POS 결제 통보가 "취소 후 재결제"인지. 직원이 POS [주문]에서 결제 P를 취소하고(손님이 카드·할부를 바꿈)
+// 같은 주문을 P2로 다시 결제하면, 토스 취소 웹훅(또는 탭앱의 취소 기록)이 주문을 refunded로 바꾼 뒤 P2의 통보가 온다. 그대로 거절하면
+// P2로 받은 돈이 어디에도 기록되지 않고 전산은 환불로 안다(다시 청구하면 이중 결제). 다음을 모두 만족할 때만 그렇게 본다:
+// POS 결제 건, POS 쪽 취소로 환불됨, 환불이 24시간 안, 보고된 결제 ID가 저장된(취소된) 결제 ID와 다름(둘 다 있어야 가릴 수 있다),
+// 직원이 손으로 고른 결제(manual)이거나 같은 POS 주문(orderId)의 결제.
+function isPosCancelRepay(cart, { reportedPaymentId, reportedOrderId, manual }) {
+  if (cart.status !== 'refunded' || cart.payTarget !== 'pos') return false
+  if (!POS_SIDE_CANCEL_REFUND_NOTES.includes(cart.refundNote)) return false
+  if (!cart.refundedAt || Date.now() - new Date(cart.refundedAt).getTime() > POS_REPAY_RESTORE_WINDOW_MS) return false
+  if (!reportedPaymentId || !cart.tossPaymentId || reportedPaymentId === cart.tossPaymentId) return false
+  return manual || (Boolean(cart.tossOrderId) && reportedOrderId === cart.tossOrderId)
+}
+
 app.post('/api/pos/erp-carts/:id/paid', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
   const cart = await prisma.erpCart.findUnique({ where: { id: req.params.id } })
   if (!cart || cart.storeId !== req.store.id) {
     return res.status(404).json({ ok: false, error: '장바구니를 찾을 수 없습니다.' })
   }
   const reportedPaymentId = req.body?.paymentId ? String(req.body.paymentId).slice(0, 200) : null
+  const reportedOrderId = req.body?.orderId ? String(req.body.orderId).slice(0, 200) : null
   // manual: 탭앱이 결제를 자동으로 맞추지 못해 직원이 [주문] 탭을 보고 손으로 고른 결제다. 나중에 대사할 때 구분하려고 남긴다.
   const manual = req.body?.manual === true
   const reportMeta = (row) => ({
@@ -2966,7 +3052,81 @@ app.post('/api/pos/erp-carts/:id/paid', posIpFloodLimiter, posLimiter, requireSt
       error: '이 주문은 이미 다른 결제로 결제 완료됐습니다. 같은 주문을 두 번 결제했는지 [주문] 탭에서 확인해주세요.',
     })
   }
+
+  // 이 요청이 주문을 결제 완료로 바꾼 뒤의 처리(토스 결제와 잇기·예약 정비완료·영수증). restored: 취소 후 재결제로 되살린 주문 --
+  // 첫 결제 때 영수증을 이미 보냈으면 다시 보내지 않는다(같은 정비의 영수증이 두 번 간다).
+  const finishPaid = async ({ restored = false } = {}) => {
+    // 토스 웹훅이 이 보고보다 먼저 와 있었다면 지금 잇는다(매핑 실패는 결제 기록을 막지 않는다).
+    if (reportedPaymentId) {
+      try {
+        const tossPayment = await prisma.tossPayment.findUnique({ where: { id: reportedPaymentId } })
+        if (tossPayment) {
+          const linked = await linkErpCartsToTossPayment(tossPayment)
+          if (tossPayment.state === 'CANCELLED') await markErpCartsRefundedByToss(linked.map((c) => c.id))
+          // 웹훅이 먼저 와서 Payment 백업 기록이 만들어졌다면 이제 같은 돈이 전산 주문으로 집계되므로 빼 둔다.
+          if (linked.length) await markBackupPaymentErpLinked(tossPayment)
+        }
+      } catch (e) {
+        logger.error('[pos] 토스 결제 매핑 실패', { cartId: cart.id, error: e.message })
+      }
+    }
+
+    // 위 매핑이 이미 취소된 토스 결제를 이어 이 주문을 refunded로 바꿨을 수 있다. 취소된 주문의 예약을 완료 처리하고
+    // 영수증을 보내면 손님이 환불받은 결제의 영수증을 받게 되므로, 아직 paid일 때만 결제 후 처리를 한다.
+    const settled = await prisma.erpCart.findUnique({ where: { id: cart.id }, select: { status: true } })
+    const reservationId = await linkPaidCartToReservation(cart)
+    const restoredFlag = restored ? { restored: true } : {}
+    if (settled?.status !== 'paid') {
+      return res.json({ ok: true, alreadyProcessed: false, status: settled?.status ?? 'paid', ...restoredFlag, reservationCompleted: false, receipt: null })
+    }
+
+    // 예약이 이어져 있으면 정비완료까지 자동으로 처리한다 — 결제가 끝났다는 건 정비가 끝났다는
+    // 뜻이라, 직원이 [완료]를 또 누르게 할 이유가 없다. 이미 완료/취소된 예약이면 아무 일도
+    // 일어나지 않는다(completeReservationAfterPayment가 상태를 확인한다).
+    let reservationCompleted = false
+    if (reservationId) {
+      try {
+        reservationCompleted = await completeReservationAfterPayment(reservationId)
+      } catch (e) {
+        // 자동완료는 부가 기능이다. 여기서 실패해도 결제 기록 자체는 이미 남았으므로 500을
+        // 내지 않는다 — 직원이 대기열에서 직접 완료 처리하면 된다.
+        logger.error('[pos] 결제 후 예약 자동완료 실패', { cartId: cart.id, error: e.message })
+      }
+    }
+    // 프론트 결제와 같이 예약 번호로 전자영수증(품목·금액)을 보낸다. 이 요청이 paid로 바꾼 한 번만.
+    const receipt = restored && cart.receiptStatus === 'sent'
+      ? 'sent'
+      : await sendErpCartReceipt({ ...cart, reservationId }, req.store.name)
+
+    return res.json({ ok: true, alreadyProcessed: false, status: 'paid', ...restoredFlag, reservationCompleted, receipt })
+  }
+
   if (cart.status === 'paid') return respondPaidRow(cart)
+
+  // 취소 후 재결제(isPosCancelRepay 주석). 읽은 그 환불 그대로일 때만 되살린다 -- 그 사이 다른 요청이 바꿨으면 다시 읽어 위 규칙대로 답한다.
+  if (isPosCancelRepay(cart, { reportedPaymentId, reportedOrderId, manual })) {
+    const restored = await restoreErpCartPaidAfterPosCancel(cart.id, req.store.id, {
+      expectedPaymentId: cart.tossPaymentId,
+      paymentId: reportedPaymentId,
+      orderId: reportedOrderId,
+      refundNotes: POS_SIDE_CANCEL_REFUND_NOTES,
+      since: new Date(Date.now() - POS_REPAY_RESTORE_WINDOW_MS),
+    })
+    if (!restored) {
+      const latest = await prisma.erpCart.findUnique({ where: { id: cart.id } })
+      return respondPaidRow(latest || cart)
+    }
+    // 대사용: 취소된 결제(previousPaymentId)와 새 결제(paymentId)가 같은 주문에 이어졌다는 기록.
+    logger.warn('[pos] 취소 후 재결제로 결제 완료 복원', {
+      ...reportMeta(cart),
+      previousPaymentId: cart.tossPaymentId,
+      previousOrderId: cart.tossOrderId,
+      refundNote: cart.refundNote,
+      refundedAt: cart.refundedAt,
+    })
+    return finishPaid({ restored: true })
+  }
+
   if (cart.payTarget !== 'pos' || !['pending', 'loaded'].includes(cart.status)) {
     if (CLOSED_CART_STATUSES.includes(cart.status)) {
       // 이미 끝난 주문인데 POS에서는 돈이 나갔다는 통보가 왔다. 조용히 409만 돌려주면 결제된 사실이 우리 기록 어디에도
@@ -3009,47 +3169,7 @@ app.post('/api/pos/erp-carts/:id/paid', posIpFloodLimiter, posLimiter, requireSt
   if (cart.deletedAt) {
     logger.warn('[pos] 삭제했던 주문이 결제 완료로 확정되어 되살립니다', { storeId: req.store.id, cartId: cart.id, referenceId: cart.referenceId })
   }
-
-  // 토스 웹훅이 이 보고보다 먼저 와 있었다면 지금 잇는다(매핑 실패는 결제 기록을 막지 않는다).
-  if (req.body?.paymentId) {
-    try {
-      const tossPayment = await prisma.tossPayment.findUnique({ where: { id: String(req.body.paymentId) } })
-      if (tossPayment) {
-        const linked = await linkErpCartsToTossPayment(tossPayment)
-        if (tossPayment.state === 'CANCELLED') await markErpCartsRefundedByToss(linked.map((c) => c.id))
-        // 웹훅이 먼저 와서 Payment 백업 기록이 만들어졌다면 이제 같은 돈이 전산 주문으로 집계되므로 빼 둔다.
-        if (linked.length) await markBackupPaymentErpLinked(tossPayment)
-      }
-    } catch (e) {
-      logger.error('[pos] 토스 결제 매핑 실패', { cartId: cart.id, error: e.message })
-    }
-  }
-
-  // 위 매핑이 이미 취소된 토스 결제를 이어 이 주문을 refunded로 바꿨을 수 있다. 취소된 주문의 예약을 완료 처리하고
-  // 영수증을 보내면 손님이 환불받은 결제의 영수증을 받게 되므로, 아직 paid일 때만 결제 후 처리를 한다.
-  const settled = await prisma.erpCart.findUnique({ where: { id: cart.id }, select: { status: true } })
-  const reservationId = await linkPaidCartToReservation(cart)
-  if (settled?.status !== 'paid') {
-    return res.json({ ok: true, alreadyProcessed: false, status: settled?.status ?? 'paid', reservationCompleted: false, receipt: null })
-  }
-
-  // 예약이 이어져 있으면 정비완료까지 자동으로 처리한다 — 결제가 끝났다는 건 정비가 끝났다는
-  // 뜻이라, 직원이 [완료]를 또 누르게 할 이유가 없다. 이미 완료/취소된 예약이면 아무 일도
-  // 일어나지 않는다(completeReservationAfterPayment가 상태를 확인한다).
-  let reservationCompleted = false
-  if (reservationId) {
-    try {
-      reservationCompleted = await completeReservationAfterPayment(reservationId)
-    } catch (e) {
-      // 자동완료는 부가 기능이다. 여기서 실패해도 결제 기록 자체는 이미 남았으므로 500을
-      // 내지 않는다 — 직원이 대기열에서 직접 완료 처리하면 된다.
-      logger.error('[pos] 결제 후 예약 자동완료 실패', { cartId: cart.id, error: e.message })
-    }
-  }
-  // 프론트 결제와 같이 예약 번호로 전자영수증(품목·금액)을 보낸다. 이 요청이 paid로 바꾼 한 번만.
-  const receipt = await sendErpCartReceipt({ ...cart, reservationId }, req.store.name)
-
-  return res.json({ ok: true, alreadyProcessed: false, status: 'paid', reservationCompleted, receipt })
+  return finishPaid()
 }))
 
 // --- 탭앱 정리: 최근 결제 숨기기·삭제, 프론트 대기 주문 지우기, 정비 이력 숨기기 ---------------------
@@ -3097,6 +3217,22 @@ app.post('/api/pos/erp-carts/:id/dismiss-front', posIpFloodLimiter, posLimiter, 
   const changed = cart.status === 'pending' ? await markErpCartDismissed(cart.id, '매장이 프론트 대기에서 지움', 'front') : false
   if (!changed) return res.status(409).json({ ok: false, error: '손님이 결제 중이거나 이미 처리된 주문이라 지울 수 없습니다.', status: cart.status })
   return res.json({ ok: true, alreadyProcessed: false })
+}))
+
+// 프론트 미반영 승인 경고(frontOrphan) 지우기. 직원이 토스 결제내역에서 그 승인을 확인하고(환불했거나 이 주문의 결제로 맞췄음)
+// 누른다. 주문 상태는 바꾸지 않는다. 지운 사람·내용은 로그로 남긴다(나중에 이중 결제를 되짚는 근거).
+app.post('/api/pos/erp-carts/:id/clear-front-orphan', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  const cart = await prisma.erpCart.findUnique({ where: { id: req.params.id } })
+  if (!cart || cart.storeId !== req.store.id) {
+    return res.status(404).json({ ok: false, error: '주문을 찾을 수 없습니다.' })
+  }
+  if (!cart.frontOrphanAt) return res.json({ ok: true, alreadyProcessed: true })
+  await clearErpCartFrontOrphan(cart.id, req.store.id)
+  logger.warn('[pos] 직원이 프론트 미반영 승인 경고를 지움', {
+    storeId: req.store.id, cartId: cart.id, referenceId: cart.referenceId, status: cart.status,
+    orphanAt: cart.frontOrphanAt, approvalNo: cart.frontOrphanApprovalNo, amount: cart.frontOrphanAmount,
+  })
+  return res.json({ ok: true })
 }))
 
 // 정비 이력에서 한 방문 숨기기. body: { reservationId } 또는 { cartId }
@@ -3228,6 +3364,16 @@ function sanitizeFrontPayment(raw) {
     isSelfIssuance: typeof p.isSelfIssuance === 'boolean' ? p.isSelfIssuance : null,
     easyPayProvider: trimmedString(p.easyPayProvider, 40),
   }
+}
+
+// 프론트가 결과 보고에 실은 결제 금액(payment.amount 또는 amount). 없거나 형식이 틀리면 null -- 호출부가 주문 금액으로 대신한다.
+function reportedFrontAmount(body) {
+  for (const raw of [body?.payment?.amount, body?.amount]) {
+    if (raw === undefined || raw === null || raw === '') continue
+    const n = Number(raw)
+    if (Number.isSafeInteger(n) && n >= 0 && n <= ERP_MAX_TOTAL_AMOUNT) return n
+  }
+  return null
 }
 
 function parseFrontPayment(cart) {
@@ -3374,7 +3520,7 @@ app.post('/api/pos/erp-carts/:id/refunded', posIpFloodLimiter, posLimiter, requi
     const ids = siblings.map((s) => s.id)
     const result = await prisma.erpCart.updateMany({
       where: { id: { in: ids }, status: 'paid' },
-      data: { status: 'refunded', refundedAt: new Date(), refundNote: 'POS에서 결제 취소' },
+      data: { status: 'refunded', refundedAt: new Date(), refundNote: POS_CANCEL_REFUND_NOTE },
     })
     if (!result.count) {
       const latest = await prisma.erpCart.findUnique({ where: { id: cart.id } })
@@ -3430,10 +3576,12 @@ app.post('/api/pos/erp-carts/:id/force-release', posIpFloodLimiter, posLimiter, 
     const latest = await prisma.erpCart.findUnique({ where: { id: cart.id } })
     return res.status(409).json({ ok: false, error: '그 사이 주문 상태가 바뀌었습니다. 다시 확인해주세요.', status: latest?.status, retryAfterSec: 0 })
   }
+  // 결제 중을 풀면 'pending', 24시간이 지난 주문이면 'dismissed'(forceReleaseErpCartFrontPaying). 취소 중을 풀면 true(paid로 복귀).
+  const status = cart.status === 'paying' ? released : 'paid'
   logger.warn('[pos] 직원이 갇힌 프론트 주문을 풀었습니다', {
-    storeId: req.store.id, cartId: cart.id, referenceId: cart.referenceId, previousStatus: cart.status,
+    storeId: req.store.id, cartId: cart.id, referenceId: cart.referenceId, previousStatus: cart.status, status,
   })
-  return res.json({ ok: true, previousStatus: cart.status, status: cart.status === 'paying' ? 'pending' : 'paid' })
+  return res.json({ ok: true, previousStatus: cart.status, status })
 }))
 
 // 프론트 대기화면이 몇 초마다 부른다. POS 폴링과 같은 한도(매장 토큰 기준)를 쓴다.
@@ -3497,6 +3645,9 @@ app.post('/api/front/erp-carts/:id/refund-start', posIpFloodLimiter, posLimiter,
   return res.json({ ok: true, alreadyProcessed: false, id: cart.id, refund: frontRefundParams(cart) })
 }))
 
+// 풀린 취소 시도의 늦은 완료 보고를 환불로 받을 때 남기는 refundNote(관리자 웹·탭앱에 보인다)
+const FRONT_REFUND_AFTER_RELEASE_NOTE = '프론트에서 결제 취소(풀린 뒤 보고)'
+
 // 프론트 결제 취소 결과. result: 'refunded' | 'failed' | 'cancelled'(손님이 취소창을 닫음)
 app.post('/api/front/erp-carts/:id/refund-result', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
   const result = req.body?.result
@@ -3533,6 +3684,17 @@ app.post('/api/front/erp-carts/:id/refund-result', posIpFloodLimiter, posLimiter
 
   if (result === 'refunded') {
     const changed = await markErpCartRefunded(cart.id, req.store.id, ['refunding'], '프론트에서 결제 취소')
+    // 풀린 취소 시도의 늦은 완료 보고(직원이 [취소 중 풀기]로 paid로 돌렸거나 다시 취소를 요청한 뒤). 카드는 이미 취소됐으므로
+    // 그 시도가 묘비 목록에 있으면 환불로 받는다(store.markErpCartRefundedAfterRelease). 목록에 없는 시도는 아래처럼 거절한다.
+    if (!changed && attemptId) {
+      const afterRelease = await markErpCartRefundedAfterRelease(cart.id, req.store.id, attemptId, FRONT_REFUND_AFTER_RELEASE_NOTE)
+      if (afterRelease) {
+        logger.warn('[front] 풀린 취소 시도의 완료 보고를 받아 환불로 기록', {
+          storeId: req.store.id, cartId: cart.id, referenceId: cart.referenceId, attemptId, previousStatus: cart.status,
+        })
+        return res.json({ ok: true, alreadyProcessed: false, status: 'refunded' })
+      }
+    }
     if (!changed) {
       // 손님 돈은 돌려줬는데 상태가 맞지 않는다 -- 대사가 필요하므로 크게 남긴다.
       logger.error('[front] 결제 취소 완료 보고를 반영하지 못했습니다. 확인이 필요합니다.', { cartId: cart.id, status: cart.status })
@@ -3728,14 +3890,22 @@ app.post('/api/front/erp-carts/:id/result', posIpFloodLimiter, posLimiter, requi
       // 돈은 나갔는데 주문에 붙일 수 없다(POS로 되돌림·다른 키로 결제 중이거나 결제됨·지움·만료·전산 취소 등). 조용히 넘기면
       // 아무도 모르는 결제가 생기므로 오류로 크게 남긴다 -- 관리자가 승인번호로 대사해야 한다. 전용 code로 프론트가 "완료 알림"
       // 대신 "직원 확인 필요"를 띄우고 같은 주문의 결제를 다시 시작하지 않게 한다.
+      const orphanAmount = reportedFrontAmount(req.body) ?? cart.totalAmount
       logger.error('[front] 결제가 승인됐지만 주문에 반영하지 못함. 대사 필요', {
         cartId: cart.id,
         status: latest?.status ?? null,
         payTarget: latest?.payTarget ?? null,
         paymentKey,
         approvalNumber: payment.approvalNumber,
-        amount: cart.totalAmount,
+        amount: orphanAmount,
       })
+      // 주문 행에도 흔적을 남긴다(schema.prisma frontOrphan*). 로그만 남기면 POS 화면에는 평범한 주문으로 보여 직원이 같은 주문을
+      // 또 결제한다. 남기지 못해도 409는 그대로 준다(로그가 대사 근거다).
+      try {
+        await recordErpCartFrontOrphan(cart.id, req.store.id, { approvalNo: payment.approvalNumber, amount: orphanAmount })
+      } catch (e) {
+        logger.error('[front] 미반영 승인 흔적을 주문에 남기지 못함', { cartId: cart.id, error: e.message })
+      }
       return res.status(409).json({
         ok: false,
         code: 'PAID_AFTER_RELEASE',
@@ -3747,6 +3917,17 @@ app.post('/api/front/erp-carts/:id/result', posIpFloodLimiter, posLimiter, requi
       logger.warn('[front] 풀린 결제 시도의 승인 보고를 결제 완료로 반영했습니다', {
         storeId: req.store.id, cartId: cart.id, referenceId: cart.referenceId, approvalNumber: payment.approvalNumber,
       })
+    }
+    // 앞서 반영하지 못했던 그 승인(같은 승인번호)이 이제 이 주문의 결제로 기록됐다 -- 미반영 흔적을 지운다. 다른 승인번호면 지우지
+    // 않는다: 같은 주문을 두 번 받은 것이라 직원이 확인해야 한다.
+    if (cart.frontOrphanAt && payment.approvalNumber) {
+      try {
+        if (await clearErpCartFrontOrphan(cart.id, req.store.id, { approvalNo: payment.approvalNumber })) {
+          logger.warn('[front] 미반영이던 승인이 결제 완료로 반영되어 흔적을 지움', { storeId: req.store.id, cartId: cart.id, approvalNumber: payment.approvalNumber })
+        }
+      } catch (e) {
+        logger.error('[front] 미반영 승인 흔적 정리 실패', { cartId: cart.id, error: e.message })
+      }
     }
     if (cart.deletedAt) {
       logger.warn('[front] 삭제했던 주문이 결제 완료로 확정되어 되살립니다', { storeId: req.store.id, cartId: cart.id, referenceId: cart.referenceId })
@@ -4059,8 +4240,14 @@ const PROMO_DEFINITE_FAILURE_RETRY_MS = 24 * 60 * 60 * 1000
 // 이 기간에 같은 매장·번호로 자동 홍보가 이만큼 확실히 실패했으면 그 결제의 자동 홍보를 "보내지 않음"으로 닫는다.
 const PROMO_DEFINITE_FAILURE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
 const PROMO_DEFINITE_FAILURE_MAX = 3
+// 발송사 계정·설정 탓의 실패(solapi.classifySendFailure 'provider')나 결과를 모르는 실패가 한 실행에서 이만큼 이어지면(그 사이 성공도
+// 수신자 탓 실패도 없이) 발송사 쪽 장애로 보고 실행을 멈춘다(stopped:'provider'). 남은 대상은 claim만 풀어 다음 실행에 그대로 보낸다
+// -- 계속 돌면 차례가 온 결제마다 실패를 쌓거나(결과 모름은 보낸 것으로 닫는다) 쓸데없이 하루씩 밀린다. 한 건의 실패로는 멈추지 않는다:
+// 목록에 없는 상태 코드 하나(그 번호만의 사정일 수 있다) 때문에 전 매장의 발송이 날마다 멈추면 안 된다.
+const PROMO_PROVIDER_FAILURE_STOP_AFTER = 3
 
 // 자동 홍보가 확실히 실패했다(지금 실패도 PromoSend 'failed'로 이미 남아 있다). 최근 실패가 상한에 이르렀으면 닫고, 아니면 하루 뒤로 미룬다.
+// 수신자 탓의 실패만 이 함수로 온다 -- 발송사 계정·설정 탓은 세지 않고 미루기만 한다(sendDuePromotions).
 async function settleDefinitePromoFailure(payment) {
   let failures = 0
   try {
@@ -4097,6 +4284,8 @@ async function sendDuePromotions() {
   let batches = 0
   let exhausted = false
   let stopped = null
+  // 이 실행에서 이어진 발송사 탓·결과 모름 실패 수(PROMO_PROVIDER_FAILURE_STOP_AFTER). 성공하거나 수신자 탓 실패가 나오면 0으로.
+  let providerFailureStreak = 0
 
   // 광고는 야간(21~8시)에 보내지 않는다. 스케줄러 시각이 바뀌거나 사람이 늦게 수동 실행해도 서버가 막는다.
   if (isPromoNightNow()) return { claimed, sent, failed, skipped, batches, exhausted, stopped: 'night' }
@@ -4117,8 +4306,14 @@ async function sendDuePromotions() {
       // 묶음 안에서도 시간 예산과 야간을 본다. 넘기면 남은 건의 claim을 풀고 끝낸다 -- 안 풀면 10분 동안
       // 아무도 못 잡고, 그 사이 이 실행이 계속 돌면 다른 실행이 다시 잡은 건과 겹친다.
       const overTime = Date.now() - startedAt >= PROMO_TIME_BUDGET_MS
-      if (overTime || isPromoNightNow()) {
-        stopped = overTime ? 'time' : 'night'
+      const providerDown = providerFailureStreak >= PROMO_PROVIDER_FAILURE_STOP_AFTER
+      if (overTime || providerDown || isPromoNightNow()) {
+        stopped = overTime ? 'time' : providerDown ? 'provider' : 'night'
+        if (providerDown) {
+          logger.error('[promotion-job] 발송사 계정·설정 탓 실패가 이어져 자동 홍보 실행을 멈춥니다. 솔라피 잔액·키·발신번호·템플릿을 확인하세요', {
+            streak: providerFailureStreak, released: due.length - index,
+          })
+        }
         for (const rest of due.slice(index)) await releasePromoClaim(rest.id, rest.promoClaimedAt)
         break
       }
@@ -4152,24 +4347,48 @@ async function sendDuePromotions() {
         })
         await finishPromoSend(claim.record.id, 'sent')
         if (await markPromoSent(payment.id)) sent += 1
+        providerFailureStreak = 0
         // 같은 방문의 다른 결제(분할·재결제)가 30일 뒤 같은 광고를 또 보내지 않게 닫는다.
         await closeSiblingDuePromotions(payment.storeId, payment.phone, payment.id, PROMO_MIN_INTERVAL_DAYS)
       } catch (notifyError) {
         failed += 1
-        const definite = solapi.isDefiniteSendFailure(notifyError)
+        // recipient(이 번호 탓) | provider(발송사 계정·설정 탓) | unknown(결과 모름) -- solapi.classifySendFailure
+        const failure = solapi.classifySendFailure(notifyError)
         logger.error('프로모션 알림톡 발송 실패', {
           paymentId: payment.id,
           storeId: payment.storeId,
-          definite,
+          failure,
+          definite: failure !== 'unknown',
+          statusCode: notifyError?.statusCode ?? notifyError?.failedMessageList?.[0]?.statusCode ?? null,
           error: notifyError.message,
         })
-        await finishPromoSend(claim.record.id, definite ? 'failed' : 'unknown')
-        // 결과를 모르면(시간 초과 등) 나갔을 수 있으므로 보낸 것으로 닫는다 -- 같은 광고가 두 번 가는 쪽이 더 나쁘다.
-        if (definite) await settleDefinitePromoFailure(payment)
-        else await markPromoSent(payment.id)
+        if (failure === 'recipient') {
+          providerFailureStreak = 0
+          await finishPromoSend(claim.record.id, 'failed')
+          await settleDefinitePromoFailure(payment)
+        } else if (failure === 'provider') {
+          // 번호와 무관한 실패라 실패 횟수에 넣지 않고(PromoSend 'failed_provider') 하루 뒤로 미루기만 한다.
+          providerFailureStreak += 1
+          await finishPromoSend(claim.record.id, 'failed_provider')
+          await postponeDuePromotion(payment.id, new Date(Date.now() + PROMO_DEFINITE_FAILURE_RETRY_MS), payment.promoClaimedAt)
+        } else {
+          // 결과를 모르면(시간 초과 등) 나갔을 수 있으므로 보낸 것으로 닫는다 -- 같은 광고가 두 번 가는 쪽이 더 나쁘다.
+          // 나갔다고 보는 것이므로 성공과 같이 같은 방문의 다른 결제도 닫는다(안 닫으면 30일 뒤 같은 광고가 또 나간다).
+          providerFailureStreak += 1
+          await finishPromoSend(claim.record.id, 'unknown')
+          await markPromoSent(payment.id)
+          await closeSiblingDuePromotions(payment.storeId, payment.phone, payment.id, PROMO_MIN_INTERVAL_DAYS)
+        }
       }
     }
     claimed += due.length
+    // 묶음의 마지막 건들에서 연속 실패가 상한에 닿았다 -- 다음 묶음을 잡았다가 바로 풀지 않도록 여기서 멈춘다.
+    if (!stopped && providerFailureStreak >= PROMO_PROVIDER_FAILURE_STOP_AFTER) {
+      stopped = 'provider'
+      logger.error('[promotion-job] 발송사 계정·설정 탓 실패가 이어져 자동 홍보 실행을 멈춥니다. 솔라피 잔액·키·발신번호·템플릿을 확인하세요', {
+        streak: providerFailureStreak, released: 0,
+      })
+    }
     if (stopped) {
       exhausted = stopped === 'time'
       break

@@ -151,24 +151,69 @@ function renderItemList(items) {
   `
 }
 
+// ── 프론트 승인 미반영 경고(frontOrphan) ─────────────────────────────────────
+// 서버가 이 주문의 손님 카드 승인을 프론트에서 받았지만 주문에 기록하지 못한 경우다([결제 중 풀기] 뒤 늦게 온 승인 등). 서버는
+// 주문에 frontOrphan {at, approvalNo, amount}를 남겨 POS의 모든 카드(전산 주문·프론트 결제·최근 결제)에 싣는다. 이 주문을 POS에서
+// 다시 결제하면 손님이 두 번 낸다 -- 빨간 경고를 띄우고, 담기·프론트로 넘기기·[POS에서 결제했어요]는 따로 한 번 더 확인받는다.
+// 직원이 토스 결제내역에서 정리했으면 [확인했어요](두 번 눌러 확인)로 경고를 지운다(서버 clear-front-orphan).
+export function hasFrontOrphan(cart) {
+  return Boolean(cart && cart.frontOrphan && typeof cart.frontOrphan === 'object')
+}
+
+export function frontOrphanText(orphan) {
+  const approvalNo = orphan && orphan.approvalNo ? String(orphan.approvalNo) : '확인 불가'
+  const amount = orphan && typeof orphan.amount === 'number' && Number.isFinite(orphan.amount) ? formatWon(orphan.amount) : '확인 불가'
+  return `프론트에서 이미 승인된 결제가 있습니다 (승인번호 ${approvalNo}, 금액 ${amount}). 다시 결제하지 마세요.`
+}
+
+// 경고를 읽고 토스 결제내역을 볼 시간이 필요해서 일반 확인(3초)보다 길게 준다.
+const ORPHAN_CONFIRM_MS = 10 * 1000
+const ORPHAN_LOAD_CONFIRM = '프론트 승인 건입니다. 그래도 담을까요?'
+const ORPHAN_FRONT_CONFIRM = '프론트 승인 건입니다. 그래도 넘길까요?'
+export const ORPHAN_ACK_CONFIRM = '토스 결제내역에서 정리했나요? 경고를 지웁니다'
+// `${'load' | 'front'}:${cartId}` -> timeoutId. 프론트 승인 경고가 있는 주문의 담기·넘기기 앞 확인 단계.
+const orphanConfirm = new Map()
+// [확인했어요] 두 번 누르기 확인(전산 주문·프론트 결제 목록이 함께 쓴다) cartId -> timeoutId, 그리고 보내는 중인 cart.
+const orphanAckConfirm = new Map()
+const orphanAckBusy = new Set()
+
+function loadLabelOf(cart) {
+  return cart && cart.autoPay ? '담고 결제 시작' : 'POS에 담기'
+}
+
+function frontOrphanBlock(cart) {
+  if (!hasFrontOrphan(cart)) return ''
+  const acking = orphanAckConfirm.has(cart.id)
+  return `
+      <div class="erp-cart-memo front-orphan-warn">${deps.escapeHtml(frontOrphanText(cart.frontOrphan))}</div>
+      <div class="erp-cart-actions">
+        <button class="erp-cart-orphan-ack${acking ? ' confirming' : ''}" type="button"
+                data-cart-id="${deps.escapeHtml(cart.id)}" ${orphanAckBusy.has(cart.id) ? 'disabled' : ''}>${acking ? ORPHAN_ACK_CONFIRM : '확인했어요'}</button>
+      </div>`
+}
+
 function cartHtml(cart) {
-  const buttonLabel = cart.autoPay ? '담고 결제 시작' : 'POS에 담기'
+  const loadArmed = orphanConfirm.has(`load:${cart.id}`)
+  const frontArmed = orphanConfirm.has(`front:${cart.id}`)
+  const buttonLabel = loadArmed ? ORPHAN_LOAD_CONFIRM : loadLabelOf(cart)
   const dismissing = dismissConfirm.has(cart.id)
   const sendingToFront = frontConfirm.has(cart.id)
+  const frontLabel = frontArmed ? ORPHAN_FRONT_CONFIRM : sendingToFront ? '프론트로 넘길까요?' : '프론트 결제'
   return `
-    <article class="erp-cart-item" data-cart-id="${deps.escapeHtml(cart.id)}">
+    <article class="erp-cart-item${hasFrontOrphan(cart) ? ' has-front-orphan' : ''}" data-cart-id="${deps.escapeHtml(cart.id)}">
       <div class="erp-cart-ref">${deps.escapeHtml(cart.referenceId || '')}</div>
       <div class="erp-cart-head">
         <strong class="erp-cart-car">${deps.escapeHtml(cart.carNumber || cart.memo || '-')}</strong>
         ${cart.linkedReservation ? '<span class="erp-cart-linked">예약 연결됨</span>' : ''}
       </div>
       ${cart.carNumber && cart.memo ? `<div class="erp-cart-memo">${deps.escapeHtml(cart.memo)}</div>` : ''}
+      ${frontOrphanBlock(cart)}
       ${renderItemList(cart.items)}
       <div class="erp-cart-total">${formatWon(cart.totalAmount)}</div>
       <div class="erp-cart-actions">
-        <button class="erp-cart-button" type="button" data-cart-id="${deps.escapeHtml(cart.id)}">${buttonLabel}</button>
-        <button class="erp-cart-front${sendingToFront ? ' confirming' : ''}" type="button"
-                data-cart-id="${deps.escapeHtml(cart.id)}">${sendingToFront ? '프론트로 넘길까요?' : '프론트 결제'}</button>
+        <button class="erp-cart-button${loadArmed ? ' confirming' : ''}" type="button" data-cart-id="${deps.escapeHtml(cart.id)}">${buttonLabel}</button>
+        <button class="erp-cart-front${sendingToFront || frontArmed ? ' confirming' : ''}" type="button"
+                data-cart-id="${deps.escapeHtml(cart.id)}">${frontLabel}</button>
         <button class="erp-cart-dismiss${dismissing ? ' confirming' : ''}" type="button"
                 data-cart-id="${deps.escapeHtml(cart.id)}">${dismissing ? '정말 지울까요?' : '지우기'}</button>
       </div>
@@ -294,8 +339,100 @@ function syncConfirmButtons() {
   for (const node of Array.from(listEl.children)) {
     const id = node.dataset && node.dataset.cartId
     if (!id || inFlight.has(id)) continue
+    const cart = lastCarts.find((c) => c.id === id)
+    const frontArmed = orphanConfirm.has(`front:${id}`)
     setConfirmButton(node.querySelector('button.erp-cart-dismiss'), dismissConfirm.has(id), '정말 지울까요?', '지우기')
-    setConfirmButton(node.querySelector('button.erp-cart-front'), frontConfirm.has(id), '프론트로 넘길까요?', '프론트 결제')
+    setConfirmButton(node.querySelector('button.erp-cart-front'), frontConfirm.has(id) || frontArmed,
+      frontArmed ? ORPHAN_FRONT_CONFIRM : '프론트로 넘길까요?', '프론트 결제')
+    setConfirmButton(node.querySelector('button.erp-cart-button'), orphanConfirm.has(`load:${id}`), ORPHAN_LOAD_CONFIRM, loadLabelOf(cart))
+    setConfirmButton(node.querySelector('button.erp-cart-orphan-ack'), orphanAckConfirm.has(id), ORPHAN_ACK_CONFIRM, '확인했어요')
+  }
+}
+
+function clearOrphanConfirm(key) {
+  const timeoutId = orphanConfirm.get(key)
+  if (timeoutId) clearTimeout(timeoutId)
+  orphanConfirm.delete(key)
+}
+
+// 프론트 승인 경고가 있는 주문의 담기·프론트로 넘기기 앞에 두는 확인 단계. 한 번 누르면 경고 문구로 바뀌고 10초 안에 한 번 더
+// 눌러야 원래 동작으로 넘어간다(프론트로 넘기기는 그다음 평소의 "프론트로 넘길까요?" 확인을 한 번 더 거친다). true면 원래 동작을
+// 이어 가고, false면 이번 누름은 확인 단계로 쓰였다.
+function passOrphanGate(kind, cartId) {
+  const cart = lastCarts.find((c) => c.id === cartId)
+  if (!hasFrontOrphan(cart)) return true
+  // 경고 확인을 마치고 평소 확인("프론트로 넘길까요?") 중인 누름이다.
+  if (kind === 'front' && frontConfirm.has(cartId)) return true
+  const key = `${kind}:${cartId}`
+  if (orphanConfirm.has(key)) {
+    clearOrphanConfirm(key)
+    syncConfirmButtons()
+    return true
+  }
+  // 화면에 "정말?"이 여러 개 떠 있으면 헷갈린다 -- 다른 확인 상태는 취소한다.
+  Array.from(orphanConfirm.keys()).forEach(clearOrphanConfirm)
+  Array.from(dismissConfirm.keys()).forEach(clearDismissConfirm)
+  Array.from(frontConfirm.keys()).forEach(clearFrontConfirm)
+  orphanConfirm.set(key, setTimeout(() => {
+    orphanConfirm.delete(key)
+    syncConfirmButtons()
+  }, ORPHAN_CONFIRM_MS))
+  syncConfirmButtons()
+  return false
+}
+
+// [확인했어요]: 두 번 눌러야 서버에 경고 지우기를 보낸다(전산 주문·프론트 결제 목록 공용).
+function handleOrphanAckClick(cartId) {
+  if (orphanAckBusy.has(cartId)) return
+  if (orphanAckConfirm.has(cartId)) {
+    clearTimeout(orphanAckConfirm.get(cartId))
+    orphanAckConfirm.delete(cartId)
+    syncConfirmButtons()
+    renderFrontCarts()
+    clearFrontOrphan(cartId)
+    return
+  }
+  Array.from(orphanAckConfirm.values()).forEach(clearTimeout)
+  orphanAckConfirm.clear()
+  orphanAckConfirm.set(cartId, setTimeout(() => {
+    orphanAckConfirm.delete(cartId)
+    syncConfirmButtons()
+    renderFrontCarts()
+  }, ORPHAN_CONFIRM_MS))
+  syncConfirmButtons()
+  renderFrontCarts()
+}
+
+// 서버에 프론트 승인 경고를 지웠다고 알린다. 최근 결제 화면(settledCarts)도 이 함수를 쓴다. 성공하면 true.
+export async function clearFrontOrphan(cartId) {
+  if (!deps || orphanAckBusy.has(cartId)) return false
+  orphanAckBusy.add(cartId)
+  renderFrontCarts()
+  try {
+    let res
+    try {
+      res = await deps.apiPost(`/api/pos/erp-carts/${cartId}/clear-front-orphan`)
+    } catch {
+      deps.notify('error', '서버에 연결하지 못해 경고를 지우지 못했습니다. 잠시 후 다시 시도해주세요.')
+      return false
+    }
+    if (!res.ok) {
+      if (res.status === 401) {
+        deps.onUnauthorized(res.body && res.body.error)
+        return false
+      }
+      deps.notify('error', (res.body && res.body.error) || '프론트 승인 경고를 지우지 못했습니다.')
+      return false
+    }
+    afterMutation()
+    lastCarts = lastCarts.map((c) => (c.id === cartId ? { ...c, frontOrphan: null } : c))
+    lastFrontCarts = lastFrontCarts.map((c) => (c.id === cartId ? { ...c, frontOrphan: null } : c))
+    deps.notify('success', '프론트 승인 경고를 지웠습니다.')
+    return true
+  } finally {
+    orphanAckBusy.delete(cartId)
+    renderErpCarts(lastCarts)
+    renderFrontCarts()
   }
 }
 
@@ -321,16 +458,68 @@ function handleDismissClick(cartId) {
   syncConfirmButtons()
 }
 
+// [지우기]에 서버가 "이미 처리됨"으로 답했을 때 실제 상태를 알리는 문구. 지운 것이 아니므로 "지웠습니다"라고 하지 않는다 -- 다른
+// 단말기가 방금 담은 주문을 "지웠다"고 믿은 직원이 손님·전산에 취소됐다고 알리면, 전산이 다시 보내 두 번 결제될 수 있다.
+//   forget: 이 단말기의 결제 대기 기록·담기 표식도 지울지(닫힌 주문만). 담김·결제된 주문의 기록은 결제 통보의 근거라 둔다.
+function dismissAlreadyNote(status, label) {
+  switch (status) {
+    case 'dismissed':
+      return { forget: true, message: `이미 지워진 주문입니다${label}. 다른 단말기에서 먼저 지웠을 수 있습니다.` }
+    case 'loaded':
+      return { forget: false, message: `다른 단말기에서 이미 POS에 담은 주문이라 지우지 않았습니다${label}. 그 단말기에서 결제하거나 [최근 결제]에서 담기 취소해주세요.` }
+    case 'paid':
+    case 'refund_requested':
+    case 'refunding':
+    case 'refunded':
+      return { forget: false, message: `이미 결제된 주문이라 지우지 않았습니다${label}. [최근 결제]에서 확인해주세요.` }
+    case 'cancelled':
+      return { forget: true, message: `전산에서 이미 취소한 주문입니다${label}. 따로 지울 필요가 없습니다.` }
+    case 'expired':
+      return { forget: true, message: `이미 만료된 주문입니다${label}. 따로 지울 필요가 없습니다.` }
+    case 'failed':
+      return { forget: true, message: `이미 담기 실패로 닫힌 주문입니다${label}. 따로 지울 필요가 없습니다.` }
+    default:
+      return { forget: false, message: `이미 처리된 주문이라 지우지 않았습니다${label}${status ? ` (상태: ${status})` : ''}. 목록을 새로 불러옵니다.` }
+  }
+}
+
 async function dismissCart(cartId) {
   const cart = lastCarts.find((c) => c.id === cartId)
+  const label = cart && cart.referenceId ? ` (${cart.referenceId})` : ''
   inFlight.add(cartId)
   try {
-    const { ok } = await reportConsume(cartId, { result: 'dismissed', errorMessage: '매장에서 지움' })
-    if (!ok) return // reportConsume이 이미 안내했다. 카드는 그대로 둬서 다시 시도할 수 있게 한다.
+    const { ok, status, body } = await reportConsume(cartId, { result: 'dismissed', errorMessage: '매장에서 지움' })
+    if (!ok) {
+      // 네트워크·5xx는 reportConsume이 이미 안내했고, 401은 토큰 화면으로 갔다. 4xx는 안내가 없으니 여기서 알린다
+      // (예전에는 아무 반응 없이 끝났다). 카드는 서버 목록에 맞춘다.
+      if (status && status !== 401 && status < 500) {
+        if (status === 409 && body && body.payTarget === 'front') {
+          sentToFront.set(cartId, Date.now())
+          lastCarts = lastCarts.filter((c) => c.id !== cartId)
+          deps.notify('warn', `프론트에서 결제하도록 넘어간 주문이라 지우지 않았습니다${label}. [프론트 결제] 목록에서 확인해주세요.`)
+        } else {
+          deps.notify('error', (body && body.error) || `지우지 못했습니다${label}. 목록을 새로 불러옵니다.`)
+        }
+        refreshErpCarts()
+      }
+      return
+    }
+    if (body && body.alreadyProcessed) {
+      const note = dismissAlreadyNote(body.status, label)
+      if (note.forget) {
+        forgetPendingPaid(cartId)
+        forgetLoadAttempt(cartId)
+      }
+      removeCartFromView(cartId)
+      deps.notify('warn', note.message)
+      refreshErpCarts()
+      return
+    }
     // 지운 주문에 대기 중인 결제 기록이 남아 있으면 나중에 엉뚱한 결제와 맞아 "결제완료"로 보고될 수 있다.
     forgetPendingPaid(cartId)
+    forgetLoadAttempt(cartId)
     removeCartFromView(cartId)
-    deps.notify('success', `전산 주문을 지웠습니다${cart ? ` (${cart.referenceId})` : ''}. 전산에는 "매장에서 지움"으로 남습니다.`)
+    deps.notify('success', `전산 주문을 지웠습니다${label}. 전산에는 "매장에서 지움"으로 남습니다.`)
   } finally {
     inFlight.delete(cartId)
     renderErpCarts(lastCarts)
@@ -458,12 +647,13 @@ function renderFrontCarts() {
           </div>`
       }
       return `
-        <article class="erp-cart-item front-cart-item" data-cart-id="${deps.escapeHtml(cart.id)}">
+        <article class="erp-cart-item front-cart-item${hasFrontOrphan(cart) ? ' has-front-orphan' : ''}" data-cart-id="${deps.escapeHtml(cart.id)}">
           <div class="erp-cart-ref">${deps.escapeHtml(cart.referenceId || '')}</div>
           <div class="erp-cart-head">
             <strong class="erp-cart-car">${deps.escapeHtml(cart.carNumber || cart.memo || '-')}</strong>
             <span class="front-cart-status${paying ? ' paying' : ''}">${statusText}</span>
           </div>
+          ${frontOrphanBlock(cart)}
           ${renderItemList(cart.items)}
           <div class="erp-cart-total">${formatWon(cart.totalAmount)}</div>
           ${actions}
@@ -529,6 +719,11 @@ async function returnCartToPos(cartId) {
 }
 
 function handleFrontListClick(e) {
+  const ackBtn = e.target.closest('button.erp-cart-orphan-ack')
+  if (ackBtn && !ackBtn.disabled) {
+    handleOrphanAckClick(ackBtn.dataset.cartId)
+    return
+  }
   // [결제 중 풀기]는 .erp-cart-return 클래스를 재사용(CSS)하므로 아래 되돌리기 검사보다 먼저 가른다.
   const releaseBtn = e.target.closest('button.erp-cart-force-release')
   if (releaseBtn && !releaseBtn.disabled) {
@@ -655,10 +850,17 @@ function cardActionBlocked(cartId) {
 }
 
 function handleListClick(e) {
+  const ackBtn = e.target.closest('button.erp-cart-orphan-ack')
+  if (ackBtn && !ackBtn.disabled) {
+    const id = ackBtn.dataset.cartId
+    if (!inFlight.has(id)) handleOrphanAckClick(id)
+    return
+  }
+
   const frontBtn = e.target.closest('button.erp-cart-front')
   if (frontBtn && !frontBtn.disabled) {
     const id = frontBtn.dataset.cartId
-    if (!cardActionBlocked(id)) handleFrontClick(id)
+    if (!cardActionBlocked(id) && passOrphanGate('front', id)) handleFrontClick(id)
     return
   }
 
@@ -677,6 +879,8 @@ function handleListClick(e) {
   if (cardActionBlocked(cartId)) return
   const cart = lastCarts.find((c) => c.id === cartId)
   if (!cart) return
+  // 프론트에서 이미 승인된 결제가 있는 주문은 담기 전에 한 번 더 확인받는다(passOrphanGate).
+  if (!passOrphanGate('load', cartId)) return
   // 담기 도중 어떤 예외가 나든 화면까지 죽이지 않는다. 여기서 새면 처리되지 않은 거부가 되어
   // 원인을 알 수 없는 상태로 남는다.
   loadCartToPos(cart).catch((e) => {
@@ -734,6 +938,69 @@ function savePendingPaid(ids) {
   }
 }
 
+// ── 담기 시도 표식(attemptId) ────────────────────────────────────────────────
+// 서버는 [담기 취소]를 담은 단말기에서만 받는다(담을 때 consume에 실은 attemptId와 같은지 본다). 예전에는 이 값을 결제 대기 기록 안에만
+// 두어서, 직원이 POS 장바구니에서 품목을 지우고 5분이 지나 기록이 정리되면(dropVanishedEntries) attemptId도 함께 사라졌다 -- 담은
+// 단말기에서 누른 [담기 취소]가 '다른 단말기에서 담은 주문'으로 최대 30분 거절됐다(단말기가 한 대뿐인 매장에서도).
+// 그래서 대조용 기록과 따로, 기록 정리가 건드리지 않는 곳에 7일 동안 남긴다(cartId -> {attemptId, at}). 지우는 때는 담기 취소가
+// 성공했을 때, 결제 완료로 기록됐을 때, 이 단말기가 담지 않은 것으로 판명됐을 때(다른 단말기가 가져감·지우기)뿐이다. 남은 값이
+// 틀려도(그 뒤 다른 단말기가 다시 담음) 서버가 다르다고 거절할 뿐이라 해가 없다. 대기 기록에 껍데기를 남기는 방식은 쓰지 않는다 --
+// 결제 대조(handlePaid)가 기록이 있다고 보고 모든 POS 결제를 맞추지 못한 결제로 만들 수 있다.
+const LOAD_ATTEMPTS_KEY = 'chevrolet_erp_load_attempts'
+const LOAD_ATTEMPT_TTL_MS = 7 * 24 * 60 * 60 * 1000
+const LOAD_ATTEMPTS_MAX = 200
+
+function loadAttempts() {
+  try {
+    const raw = localStorage.getItem(LOAD_ATTEMPTS_KEY)
+    const parsed = raw ? JSON.parse(raw) : {}
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+    const now = Date.now()
+    const out = {}
+    for (const id of Object.keys(parsed)) {
+      const v = parsed[id]
+      if (v && typeof v.attemptId === 'string' && v.attemptId && Number.isFinite(v.at) && now - v.at <= LOAD_ATTEMPT_TTL_MS) out[id] = v
+    }
+    return out
+  } catch {
+    return {}
+  }
+}
+
+function saveAttempts(map) {
+  try {
+    const ids = Object.keys(map).sort((a, b) => map[a].at - map[b].at).slice(-LOAD_ATTEMPTS_MAX)
+    if (!ids.length) {
+      localStorage.removeItem(LOAD_ATTEMPTS_KEY)
+      return
+    }
+    const kept = {}
+    for (const id of ids) kept[id] = map[id]
+    localStorage.setItem(LOAD_ATTEMPTS_KEY, JSON.stringify(kept))
+  } catch {
+    // 저장이 막힌 환경이면 담기 취소가 '다른 단말기'로 거절될 수 있을 뿐이다(30분 뒤 [그래도 되돌리기]로 풀린다).
+  }
+}
+
+function rememberLoadAttempt(cartId, attemptId) {
+  if (!cartId || !attemptId) return
+  const map = loadAttempts()
+  map[cartId] = { attemptId, at: Date.now() }
+  saveAttempts(map)
+}
+
+function forgetLoadAttempt(cartId) {
+  const map = loadAttempts()
+  if (!map[cartId]) return
+  delete map[cartId]
+  saveAttempts(map)
+}
+
+function loadAttemptOf(cartId) {
+  const v = loadAttempts()[cartId]
+  return v ? v.attemptId : null
+}
+
 function rememberLoadedCart(cart, keys, attemptId) {
   const items = (cart.items || []).map((i) => ({
     title: String(i.name ?? ''),
@@ -744,6 +1011,8 @@ function rememberLoadedCart(cart, keys, attemptId) {
   const entry = { id: cart.id, ref: cart.referenceId || '', at: Date.now(), keys, totalAmount, items, attemptId }
   // 같은 주문의 옛 기록은 키가 다르다(그 품목은 이미 지워졌거나 다른 시도의 것) -- 새 기록으로 바꾼다.
   savePendingPaid([...loadPendingPaid().filter((e) => e.id !== cart.id), entry])
+  // 담기 표식은 대조용 기록과 따로 남긴다(위 '담기 시도 표식' 주석). consume 보고보다 먼저 남겨야 보고가 안 닿아도 남는다.
+  rememberLoadAttempt(cart.id, attemptId)
 }
 
 function patchPendingEntry(cartId, patch) {
@@ -764,25 +1033,41 @@ export function peekLoadedCartKeys(cartId) {
 }
 
 // 최근 결제 화면이 [담기 취소]·[POS에서 결제했어요]를 판단할 때 이 단말기의 기록을 본다(기록은 바꾸지 않는다).
-// 이 단말기가 담은 주문이 아니면 null이다.
+// 이 단말기가 담은 주문이 아니면 null이다(대조용 기록이 정리됐어도 담기 표식이 남아 있으면 attemptId만 실어 돌려준다).
 //   attemptId: 담을 때 만든 표식. 서버는 담기 취소를 담은 단말기에서만 받는다(같은 표식인지 본다).
 //   paymentId: 이 단말기가 결제를 확인했지만 전산 통보가 밀려 있는 건. 이때 담기 취소하면 받은 돈이 기록에서 사라진다.
 //   goneAt: POS 장바구니에서 이 기록의 품목이 사라진 시각. 결제로 비워졌을 수도 있다.
 export function peekLoadedRecord(cartId) {
   const entry = loadPendingPaid().find((e) => e.id === cartId)
-  if (!entry) return null
+  const attemptId = (entry && entry.attemptId) || loadAttemptOf(cartId)
+  if (!entry && !attemptId) return null
   return {
-    attemptId: entry.attemptId || null,
-    paymentId: entry.paymentId || null,
-    goneAt: entry.goneAt || null,
-    keys: Array.isArray(entry.keys) ? entry.keys : [],
+    attemptId: attemptId || null,
+    paymentId: (entry && entry.paymentId) || null,
+    goneAt: (entry && entry.goneAt) || null,
+    keys: entry && Array.isArray(entry.keys) ? entry.keys : [],
   }
 }
 
 // [POS에서 결제했어요]로 결제를 기록한 뒤 부른다. 대기 기록이 남아 있으면 나중의 다른 결제와 또 맞을 수 있다.
 export function forgetPaidCart(cartId) {
   forgetPendingPaid(cartId)
+  forgetLoadAttempt(cartId)
   afterMutation()
+}
+
+// [POS에서 결제했어요]·[POS에서 다시 결제했어요]로 고른 결제를 서버에 기록한 뒤 부른다(settledCarts.submitManualPaid).
+//   - 그 결제는 맞추지 못한 결제 목록에서 바로 지우지 않고 기록한 주문을 붙여 둔다. 한 결제로 전산 주문 여러 건을 함께 계산했을 수
+//     있다(할인 때문에 자동 대조가 못 맞춘 경우 등) -- 다른 주문도 같은 결제로 기록할 수 있어야 한다. 기록한 주문 합계가 결제 금액에
+//     이르면 뺀다(markUnmatchedRecorded).
+//   - 이 POS 주문을 전산에 알렸다고 남긴다(취소 후 다시 결제를 알아보는 데 쓴다, rememberReportedOrder).
+//   - 이 단말기의 결제 대기 기록과 담기 표식을 지운다. 남겨 두면 나중의 다른 결제와 또 맞을 수 있다.
+export function noteManualPaid(cart, payment) {
+  if (!cart || !payment || !payment.paymentId) return
+  const ref = cart.referenceId || ''
+  markUnmatchedRecorded(payment.paymentId, { id: cart.id, ref, total: Number(cart.totalAmount) || 0 })
+  if (payment.orderId) rememberReportedOrder(payment.orderId, payment.paymentId, [{ id: cart.id, ref }])
+  forgetPaidCart(cart.id)
 }
 
 // 최근 결제 목록의 [POS에서 비우기](서버 unload)가 성공한 뒤 부른다. 서버는 그 주문을 pending으로
@@ -795,6 +1080,8 @@ export function forgetPaidCart(cartId) {
 export function forgetLoadedCart(cartId) {
   const forgotten = loadPendingPaid().find((e) => e.id === cartId)
   if (!(forgotten && forgotten.paymentId)) forgetPendingPaid(cartId)
+  // 서버가 담기를 되돌렸으니 이 시도의 표식은 더 쓸 데가 없다(다시 담으면 새 표식이 생긴다).
+  forgetLoadAttempt(cartId)
   consumed.delete(cartId)
   // refreshErpCarts보다 먼저 올려야 새 세대로 출발한다(returnCartToPos와 같은 이유).
   afterMutation()
@@ -979,22 +1266,33 @@ async function readPaymentAmount(paymentId) {
 //                                  relevant는 다 결제되면 맞을 기록이 지금 있는지(안내를 띄울지)다.
 //   { kind: 'closed' }  읽어 보니 이미 취소·환불된 주문이다
 //   { kind: 'none' | 'ambiguous' | 'unreadable' }  맞추지 못했다
-async function matchFreshEntries(fresh, paymentId, orderId) {
-  let order = null
+async function readPosOrder(orderId) {
   try {
     // SDK 버전에 따라 없을 수 있다. 없으면 대조할 방법이 없으니 보고하지 않는다.
-    if (posPluginSdk.order && typeof posPluginSdk.order.getOrder === 'function') {
-      order = await posPluginSdk.order.getOrder(orderId)
+    if (orderId && posPluginSdk.order && typeof posPluginSdk.order.getOrder === 'function') {
+      return (await posPluginSdk.order.getOrder(orderId)) || null
     }
   } catch (e) {
     console.error('[erp-cart] 결제된 POS 주문을 읽지 못했습니다.', e?.message)
   }
-  if (!order) return { kind: 'unreadable', summary: { amount: await readPaymentAmount(paymentId), titles: [] } }
+  return null
+}
+
+// 결제된 POS 주문을 읽어 대조 값(paid)과 직원에게 보여줄 값(summary)을 만든다. 주문을 못 읽으면 paid는 null이고 금액만 결제에서 읽는다.
+async function readPaidSummary(paymentId, orderId) {
+  const order = await readPosOrder(orderId)
+  if (!order) return { paid: null, summary: { amount: await readPaymentAmount(paymentId), titles: [] } }
   const paid = readPaidOrder(order)
   const summary = {
     amount: paid.amount,
     titles: paid.tally ? [...paid.tally].map(([title, quantity]) => `${title} ×${quantity}`) : [],
   }
+  return { paid, summary }
+}
+
+async function matchFreshEntries(fresh, paymentId, orderId) {
+  const { paid, summary } = await readPaidSummary(paymentId, orderId)
+  if (!paid) return { kind: 'unreadable', summary }
   if (paid.progress === 'closed') return { kind: 'closed', summary }
   if (paid.progress === 'partial') {
     // 지금 금액(청구 총액)은 이미 다 결제됐을 때와 같아서, 다 결제되면 맞을지 미리 볼 수 있다.
@@ -1009,10 +1307,17 @@ async function matchFreshEntries(fresh, paymentId, orderId) {
 // 전산 주문과 맞추지 못한 실제 POS 결제. 예전에는 안내만 띄우고 버려서 받은 돈이 어느 전산 주문 몫인지 남는 곳이
 // 없었다 -- 최근 결제에는 그 주문이 'POS에 담김 · 결제 전'으로 남고 [담기 취소]만 보여, 되돌린 뒤 다시 결제하면
 // 이중 청구였다. 이 단말기에 24시간(최대 30건) 남겨 두고, 최근 결제의 [POS에서 결제했어요]에서 직원이 골라 기록한다.
-// 모양: { paymentId, orderId, amount(원, 모르면 null), at(결제를 받은 시각 ms), titles:['이름 ×수량'] }
+// 모양: { paymentId, orderId, amount(원, 모르면 null), at(결제를 받은 시각 ms), titles:['이름 ×수량'],
+//   recordedCartIds?, recordedRefs?, recordedTotal?  -- [POS에서 결제했어요]로 이미 기록한 주문(한 결제로 여러 주문을 함께 계산한 경우)
+//   hintCartIds?, hintRefs?, hintKind?  -- 이 결제와 이어졌을 수 있는 주문. 'repaid' = 전산에 알린 POS 주문에 다시 들어온 결제,
+//                                         'lost' = 그 주문의 결제 통보가 실패한 사이 대기 기록이 지워짐 }
 const UNMATCHED_KEY = 'chevrolet_erp_unmatched_payments'
 const UNMATCHED_TTL_MS = 24 * 60 * 60 * 1000
 const UNMATCHED_MAX = 30
+
+function stringList(value) {
+  return Array.isArray(value) ? value.filter((v) => typeof v === 'string' && v) : []
+}
 
 export function listUnmatchedPayments() {
   try {
@@ -1039,25 +1344,192 @@ function saveUnmatchedPayments(list) {
 
 function rememberUnmatchedPayment(payment) {
   if (!payment || !payment.paymentId) return
+  const paymentId = String(payment.paymentId)
+  const all = listUnmatchedPayments()
+  const prev = all.find((p) => p.paymentId === paymentId)
+  const amount = typeof payment.amount === 'number' && Number.isFinite(payment.amount) ? payment.amount : null
+  const at = Number.isFinite(payment.at) ? payment.at : Date.now()
+  const titles = Array.isArray(payment.titles) ? payment.titles.map(String).slice(0, 20) : []
   const entry = {
-    paymentId: String(payment.paymentId),
-    orderId: payment.orderId ? String(payment.orderId) : '',
-    amount: typeof payment.amount === 'number' && Number.isFinite(payment.amount) ? payment.amount : null,
-    at: Number.isFinite(payment.at) ? payment.at : Date.now(),
-    titles: Array.isArray(payment.titles) ? payment.titles.map(String).slice(0, 20) : [],
+    paymentId,
+    orderId: payment.orderId ? String(payment.orderId) : (prev && prev.orderId) || '',
+    amount: amount !== null ? amount : prev ? prev.amount : null,
+    // 같은 결제를 다시 남겨도 처음 받은 시각을 둔다 -- 고르기 칸은 "담은 뒤의 결제"를 이 시각으로 가른다.
+    at: prev ? Math.min(prev.at, at) : at,
+    titles: titles.length ? titles : (prev && prev.titles) || [],
+  }
+  // 이미 기록한 주문과 이어진 주문 표시는 다시 남길 때도 잃지 않는다.
+  if (prev && stringList(prev.recordedCartIds).length) {
+    entry.recordedCartIds = stringList(prev.recordedCartIds)
+    entry.recordedRefs = Array.isArray(prev.recordedRefs) ? prev.recordedRefs.map(String) : []
+    entry.recordedTotal = Number(prev.recordedTotal) || 0
+  }
+  const hintCartIds = stringList(prev && prev.hintCartIds)
+  const hintRefs = prev && Array.isArray(prev.hintRefs) ? prev.hintRefs.map(String) : []
+  stringList(payment.hintCartIds).forEach((id, i) => {
+    if (hintCartIds.includes(id)) return
+    hintCartIds.push(id)
+    hintRefs.push(String((payment.hintRefs && payment.hintRefs[i]) || id))
+  })
+  if (hintCartIds.length) {
+    entry.hintCartIds = hintCartIds
+    entry.hintRefs = hintRefs
+    entry.hintKind = payment.hintKind || (prev && prev.hintKind) || null
   }
   // 같은 결제는 한 번만 남긴다(같은 'paid'가 두 번 와도). 오래된 것부터 밀려난다.
-  const list = listUnmatchedPayments().filter((p) => p.paymentId !== entry.paymentId)
+  const list = all.filter((p) => p.paymentId !== paymentId)
   list.push(entry)
   list.sort((a, b) => a.at - b.at)
   saveUnmatchedPayments(list)
 }
 
-// [POS에서 결제했어요]로 전산 주문에 기록한 결제는 목록에서 뺀다.
+// [POS에서 결제했어요]로 이 결제를 주문 하나에 기록했다. 목록에서 바로 빼지 않는다 -- 같은 결제로 함께 계산한 다른 전산 주문(할인으로
+// 합계가 안 맞아 자동 대조가 못 맞춘 경우 등)도 이 결제로 기록할 수 있어야 한다. 예전에는 바로 빼서, 둘째 주문은 돈을 받았는데도
+// 'POS에 담김 · 결제 전'으로 갇혔다. 기록한 주문 합계가 결제 금액에 이르면 더 나눠 쓸 몫이 없으니 뺀다(금액을 모르면 24시간 뒤 빠진다).
+function markUnmatchedRecorded(paymentId, cart) {
+  const list = listUnmatchedPayments()
+  const p = list.find((x) => x.paymentId === paymentId)
+  if (!p) return
+  const ids = stringList(p.recordedCartIds)
+  const refs = Array.isArray(p.recordedRefs) ? p.recordedRefs.map(String) : []
+  let total = Number(p.recordedTotal) || 0
+  if (!ids.includes(cart.id)) {
+    ids.push(cart.id)
+    refs.push(cart.ref || cart.id)
+    total += Math.max(0, Number(cart.total) || 0)
+  }
+  if (typeof p.amount === 'number' && total >= p.amount) {
+    saveUnmatchedPayments(list.filter((x) => x.paymentId !== paymentId))
+    return
+  }
+  saveUnmatchedPayments(list.map((x) => (x.paymentId === paymentId
+    ? { ...x, recordedCartIds: ids, recordedRefs: refs, recordedTotal: total }
+    : x)))
+}
+
+// 목록에서 결제를 뺀다(POS에서 취소된 결제 등 더 기록할 수 없는 결제).
 export function removeUnmatchedPayment(paymentId) {
   const list = listUnmatchedPayments()
   const next = list.filter((p) => p.paymentId !== paymentId)
   if (next.length !== list.length) saveUnmatchedPayments(next)
+}
+
+// ── 전산에 결제 완료로 알린 POS 주문 ──────────────────────────────────────────
+// POS 주문 -> { paymentId, cartIds, refs, at }. 24시간 남긴다(탭앱이 다시 로드돼도 남게 저장소에 둔다).
+// 직원이 POS [주문]에서 결제를 취소하고 다른 카드로 다시 결제하면(카드 바꿔 결제·할부 변경) 같은 POS 주문에 새 'paid'가 온다. 예전에는
+// 처리한 주문 ID로 걸러 그 결제를 그냥 버렸고, 전산 주문은 토스 취소 웹훅으로 refunded가 되어 받은 돈이 어디에도 남지 않았다.
+// 이 기록으로 "이미 전산에 알린 주문의 새 결제"를 알아보고, 자동으로 보고하지 않고 그 주문 ID를 붙여 맞추지 못한 결제로 남긴다.
+const REPORTED_ORDERS_KEY = 'chevrolet_erp_reported_orders'
+const REPORTED_ORDER_TTL_MS = 24 * 60 * 60 * 1000
+const REPORTED_ORDERS_MAX = 100
+
+function loadReportedOrders() {
+  try {
+    const raw = localStorage.getItem(REPORTED_ORDERS_KEY)
+    const parsed = raw ? JSON.parse(raw) : {}
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+    const now = Date.now()
+    const out = {}
+    for (const orderId of Object.keys(parsed)) {
+      const v = parsed[orderId]
+      if (v && typeof v.paymentId === 'string' && Number.isFinite(v.at) && now - v.at <= REPORTED_ORDER_TTL_MS) {
+        out[orderId] = { paymentId: v.paymentId, cartIds: stringList(v.cartIds), refs: Array.isArray(v.refs) ? v.refs.map(String) : [], at: v.at }
+      }
+    }
+    return out
+  } catch {
+    return {}
+  }
+}
+
+function saveReportedOrders(map) {
+  try {
+    const ids = Object.keys(map).sort((a, b) => map[a].at - map[b].at).slice(-REPORTED_ORDERS_MAX)
+    if (!ids.length) {
+      localStorage.removeItem(REPORTED_ORDERS_KEY)
+      return
+    }
+    const kept = {}
+    for (const id of ids) kept[id] = map[id]
+    localStorage.setItem(REPORTED_ORDERS_KEY, JSON.stringify(kept))
+  } catch {
+    // 저장이 막힌 환경이면 취소 후 다시 결제를 알아보지 못할 뿐이다(그 결제는 맞추지 못한 결제 규칙을 탄다).
+  }
+}
+
+// carts: [{ id, ref }]. 같은 결제로 여러 번 부르면 주문을 더한다(한 결제로 함께 계산한 주문). 결제가 바뀌면 새 결제로 바꾼다.
+function rememberReportedOrder(orderId, paymentId, carts) {
+  if (!orderId || !paymentId) return
+  const map = loadReportedOrders()
+  const key = String(orderId)
+  const prev = map[key]
+  const same = prev && prev.paymentId === String(paymentId)
+  const cartIds = same ? prev.cartIds.slice() : []
+  const refs = same ? prev.refs.slice() : []
+  for (const c of carts) {
+    if (!c || !c.id || cartIds.includes(c.id)) continue
+    cartIds.push(c.id)
+    refs.push(c.ref || c.id)
+  }
+  map[key] = { paymentId: String(paymentId), cartIds, refs, at: Date.now() }
+  saveReportedOrders(map)
+}
+
+function reportedOrderOf(orderId) {
+  if (!orderId) return null
+  return loadReportedOrders()[String(orderId)] || null
+}
+
+// ── 이 매장의 결제 전·취소된 POS 전산 주문 ───────────────────────────────────
+// 최근 결제 목록(서버)에서 본 이 매장의 POS 전산 주문을 요약해 둔다. 이 단말기에 결제 대기 기록이 없어도 POS 결제를 맞추지 못한 결제로
+// 남길지 정하는 데 쓴다: 기록이 지워졌거나(업그레이드·정리) 다른 단말기가 담은 주문을 여기서 결제했거나, POS에서 취소된 주문을 다시
+// 결제했을 수 있다. 그런 주문이 하나도 없으면 평범한 POS 판매라 남기지 않는다. 결제 화면이 열리며 탭앱이 다시 로드된 직후에도
+// 쓰도록 저장소에 남긴다(24시간이 지난 요약은 쓰지 않는다).
+const OPEN_POS_CARTS_KEY = 'chevrolet_erp_open_pos_carts'
+const OPEN_POS_CARTS_TTL_MS = 24 * 60 * 60 * 1000
+// POS 결제 취소가 기록된 사유(서버 refundNote). 토스 취소 웹훅과 탭앱·직원의 POS 취소 기록이다.
+const POS_CANCEL_NOTES = new Set(['토스 결제 취소 확인', 'POS에서 결제 취소'])
+// 취소 후 다시 결제를 기록할 수 있는 기간. 서버도 같은 24시간 안에서만 되살린다.
+const REPAY_WINDOW_MS = 24 * 60 * 60 * 1000
+let openPosCartsMemo = null
+
+// POS 결제가 POS·토스 쪽 취소로 환불된 지 24시간이 안 된 전산 주문인지([POS에서 다시 결제했어요] 대상).
+export function isRecentPosCancel(cart) {
+  if (!cart || cart.status !== 'refunded' || cart.payTarget !== 'pos') return false
+  if (!POS_CANCEL_NOTES.has(String(cart.refundNote || ''))) return false
+  const at = Date.parse(cart.refundedAt || '')
+  return Number.isFinite(at) && Date.now() - at <= REPAY_WINDOW_MS
+}
+
+// 최근 결제 목록이 올 때마다 부른다(settledCarts.applySettledCarts).
+export function noteRecentCarts(carts) {
+  const list = Array.isArray(carts) ? carts : []
+  const loaded = list.filter((c) => c && c.status === 'loaded' && c.payTarget !== 'front').length
+  const repayable = list.filter(isRecentPosCancel).length
+  const now = Date.now()
+  // 폴링마다 쓰지 않는다 -- 값이 바뀌었거나 한 시간이 지났을 때만 저장한다.
+  if (openPosCartsMemo && openPosCartsMemo.loaded === loaded && openPosCartsMemo.repayable === repayable &&
+      now - openPosCartsMemo.at < 60 * 60 * 1000) return
+  openPosCartsMemo = { at: now, loaded, repayable }
+  try {
+    localStorage.setItem(OPEN_POS_CARTS_KEY, JSON.stringify(openPosCartsMemo))
+  } catch {
+    // 저장이 막히면 메모리 값만 쓴다.
+  }
+}
+
+function storeHasOpenPosCarts() {
+  let snap = openPosCartsMemo
+  if (!snap) {
+    try {
+      const raw = localStorage.getItem(OPEN_POS_CARTS_KEY)
+      snap = raw ? JSON.parse(raw) : null
+    } catch {
+      snap = null
+    }
+  }
+  if (!snap || !Number.isFinite(snap.at) || Date.now() - snap.at > OPEN_POS_CARTS_TTL_MS) return false
+  return Number(snap.loaded) > 0 || Number(snap.repayable) > 0
 }
 
 // 결제 완료 통보. reportConsume과 같은 수준(2회 재시도, 4xx는 재시도 안 함, 401 처리,
@@ -1158,7 +1630,9 @@ async function settleReports(targets) {
     // 그래야 다음 폴링 때 같은 건을 같은 결제 참조로 다시 보고할 수 있다.
     const abandoned = []
     const kept = []
+    const present = new Set()
     for (const e of loadPendingPaid()) {
+      present.add(e.id)
       if (gone.has(e.id)) continue
       const f = failedById.get(e.id)
       if (!f) {
@@ -1178,6 +1652,9 @@ async function settleReports(targets) {
       if (rejects >= PAID_REJECT_LIMIT) abandoned.push({ ...f, entry: next })
       else kept.push(next)
     }
+    // 보고하는 사이 다른 경로(다시 담기·지우기 등)가 그 기록을 지웠다. 통보가 실패한 결제를 여기서 버리면 받은 돈이 어디에도 남지
+    // 않는데 직원에게는 "자동으로 다시 시도합니다"가 뜬다 -- 맞추지 못한 결제로 옮겨 [POS에서 결제했어요]로 기록하게 한다.
+    const orphaned = failed.filter((r) => !present.has(r.entry.id))
     savePendingPaid(kept)
     abandoned.forEach((r) => rememberUnmatchedPayment({
       paymentId: r.entry.paymentId,
@@ -1186,9 +1663,32 @@ async function settleReports(targets) {
       at: r.entry.paidAt,
       titles: r.entry.paidTitles || [],
     }))
+    orphaned.forEach((r) => rememberUnmatchedPayment({
+      paymentId: r.paymentId,
+      orderId: r.orderId,
+      amount: r.entry.paidAmount ?? (r.summary ? r.summary.amount : null),
+      at: r.entry.paidAt || Date.now(),
+      titles: r.entry.paidTitles || (r.summary ? r.summary.titles : []),
+      hintCartIds: [r.entry.id],
+      hintRefs: [r.entry.ref || r.entry.id],
+      hintKind: 'lost',
+    }))
+    // 전산에 알린 POS 주문을 남긴다(취소 후 다시 결제를 알아보는 데 쓴다). 결제 완료가 확정됐으니 담기 표식도 더 쓸 데가 없다.
+    for (const r of succeeded) {
+      rememberReportedOrder(r.orderId, r.paymentId, [{ id: r.entry.id, ref: r.entry.ref || '' }])
+      forgetLoadAttempt(r.entry.id)
+    }
+    terminal.forEach((r) => forgetLoadAttempt(r.entry.id))
     if (succeeded.length) afterMutation()
     const abandonedIds = new Set(abandoned.map((r) => r.entry.id))
-    return { succeeded, failed: failed.filter((r) => !abandonedIds.has(r.entry.id)), terminal, abandoned }
+    const orphanedIds = new Set(orphaned.map((r) => r.entry.id))
+    return {
+      succeeded,
+      failed: failed.filter((r) => !abandonedIds.has(r.entry.id) && !orphanedIds.has(r.entry.id)),
+      terminal,
+      abandoned,
+      orphaned,
+    }
   } finally {
     todo.forEach((t) => reportingIds.delete(t.entry.id))
   }
@@ -1196,44 +1696,180 @@ async function settleReports(targets) {
 
 const UNMATCHED_PAYMENT_MESSAGE =
   'POS 결제를 전산 주문과 맞추지 못했습니다. 이 결제가 전산 주문 몫이면 [최근 결제]에서 그 주문의 [POS에서 결제했어요]를 눌러 이 결제를 골라주세요.'
+// 이 단말기에 대조할 기록이 없는데 이 매장에 결제 전(POS에 담김)이거나 POS에서 취소된 전산 주문이 있을 때(handleUnrecordedPaid).
+const UNRECORDED_PAYMENT_MESSAGE =
+  'POS 결제를 전산 주문과 맞추지 못했습니다(이 단말기에 담기 기록 없음). 결제 전으로 남은 전산 주문이나 POS에서 취소된 전산 주문의 ' +
+  '결제였다면 [최근 결제]에서 그 주문의 [POS에서 결제했어요] 또는 [POS에서 다시 결제했어요]로 이 결제를 골라주세요.'
 const PARTIAL_PAYMENT_MESSAGE = '나눠 결제 중인 주문입니다. 남은 금액까지 결제되면 전산에 결제 완료를 알립니다.'
+
+function repaidMessage(reported) {
+  const refs = reported.refs.length ? reported.refs.join(', ') : '전산 주문'
+  return `이미 전산에 결제 완료로 알린 POS 주문에 새 결제가 들어왔습니다 (${refs}). 이전 결제를 취소하고 다시 결제했다면 ` +
+    '[최근 결제]에서 그 주문의 [POS에서 다시 결제했어요]로 이 결제를 기록해주세요. 자동으로 기록하지 않았습니다.'
+}
+
+// settleReports가 맞추지 못한 결제로 옮긴 통보 실패 건(대기 기록이 그 사이 지워짐)을 알린다.
+function notifyOrphanedPaid(list) {
+  if (!list || !list.length) return
+  const refs = list.map((r) => r.entry.ref || r.entry.id).join(', ')
+  deps.notify(
+    'error',
+    `결제는 완료됐지만 전산에 알리지 못했고, 그 사이 이 주문의 대기 기록이 정리됐습니다 (${refs}). 결제를 취소하지 마세요 — ` +
+    '이 결제는 맞추지 못한 결제로 남겨 뒀습니다. [최근 결제]에서 그 주문의 [POS에서 결제했어요]로 기록해주세요.'
+  )
+}
 
 // 나눠 결제 중인 POS 주문 → { paymentId, at, relevant }. 남은 금액이 결제되면 같은 주문의 'paid'가 다시 오지만, 그때
 // 읽은 주문이 아직 옛 상태이거나 이벤트를 놓칠 수 있어(실단말기 미검증) 폴링(retryPendingPaid)이 주문을 다시 읽어
 // 본다. 30분이 지나도 끝나지 않으면 지켜보기를 멈춘다(기록은 그대로 남아 다음 결제를 기다린다).
 const PARTIAL_WATCH_MS = 30 * 60 * 1000
 const partialOrders = new Map()
-// 처리를 끝낸 POS 주문 → 처리한 시각. 같은 주문의 'paid'가 두 번 오거나, 나눠 결제가 끝난 것을 폴링이 먼저 확인한
-// 뒤 마지막 'paid'가 도착해도 두 번 처리하지 않는다(두 번째에는 기록이 이미 없어 맞추지 못한 결제로 잘못 남는다).
-const HANDLED_ORDER_TTL_MS = 60 * 60 * 1000
-const handledOrders = new Map()
+// 처리를 끝낸 POS 결제 → { at, orderId }. 같은 결제의 'paid'가 두 번 와도 두 번 처리하지 않는다. 예전에는 POS 주문 ID로 걸렀는데,
+// 직원이 POS [주문]에서 결제를 취소하고 같은 주문을 다른 카드로 다시 결제하면 새 결제까지 걸러져 받은 돈이 어디에도 남지 않았다.
+// 같은 주문의 다른 결제는 handlePaid가 나눠 결제의 나머지인지(앞 결제가 그대로 살아 있음) 다시 결제한 것인지(앞 결제가 취소됨) 가른다.
+const HANDLED_PAYMENT_TTL_MS = 60 * 60 * 1000
+const handledPayments = new Map()
 
-function isHandledOrder(orderId) {
-  const at = handledOrders.get(orderId)
-  if (at === undefined) return false
-  if (Date.now() - at > HANDLED_ORDER_TTL_MS) {
-    handledOrders.delete(orderId)
+function isHandledPayment(paymentId) {
+  const v = handledPayments.get(paymentId)
+  if (!v) return false
+  if (Date.now() - v.at > HANDLED_PAYMENT_TTL_MS) {
+    handledPayments.delete(paymentId)
     return false
   }
   return true
 }
 
-function markHandledOrder(orderId) {
-  if (!orderId) return
-  handledOrders.set(orderId, Date.now())
-  for (const [id, at] of handledOrders) {
-    if (Date.now() - at > HANDLED_ORDER_TTL_MS) handledOrders.delete(id)
+function markHandledPayment(paymentId, orderId) {
+  if (!paymentId) return
+  const now = Date.now()
+  handledPayments.set(paymentId, { at: now, orderId: orderId || '' })
+  for (const [id, v] of handledPayments) {
+    if (now - v.at > HANDLED_PAYMENT_TTL_MS) handledPayments.delete(id)
   }
 }
 
-async function handlePaid(paymentId, orderId) {
-  if (orderId && isHandledOrder(orderId)) return
-  const entries = loadPendingPaid()
-  // 이 단말기에 담아 둔 전산 주문이 없으면 평범한 POS 판매다 -- 맞출 것도, 남길 것도 없다.
-  if (!entries.length) {
+// 이 POS 주문에서 앞서 처리했거나 전산에 알린 다른 결제들.
+function priorPaymentIdsOf(orderId, paymentId) {
+  const ids = new Set()
+  const now = Date.now()
+  for (const [id, v] of handledPayments) {
+    if (v.orderId === orderId && id !== paymentId && now - v.at <= HANDLED_PAYMENT_TTL_MS) ids.add(id)
+  }
+  const reported = reportedOrderOf(orderId)
+  if (reported && reported.paymentId !== paymentId) ids.add(reported.paymentId)
+  return [...ids]
+}
+
+// startedAt 이후 같은 주문의 다른 결제를 처리했는지(주문을 읽는 사이 이벤트·폴링이 먼저 끝낸 경우).
+function orderHandledSince(orderId, startedAt, paymentId) {
+  for (const [id, v] of handledPayments) {
+    if (v.orderId === orderId && id !== paymentId && v.at >= startedAt) return true
+  }
+  return false
+}
+
+// POS에서 취소된 결제(SDK 'cancel' 이벤트) → 받은 시각. 같은 주문의 새 결제가 다시 결제한 것인지 가르는 데 쓴다.
+const CANCELLED_PAYMENT_TTL_MS = 24 * 60 * 60 * 1000
+const cancelledPayments = new Map()
+
+// 앞서 처리한 결제가 그 주문에서 취소됐는지. true = 취소됨(다시 결제), false = 그대로 살아 있음(나눠 결제의 나머지),
+// null = 주문을 못 읽어 알 수 없음.
+async function priorPaymentsCancelled(orderId, priorIds) {
+  if (priorIds.some((id) => cancelledPayments.has(id))) return true
+  const order = await readPosOrder(orderId)
+  const payments = order && Array.isArray(order.payments) ? order.payments : null
+  if (!payments) return null
+  const byId = new Map(payments.filter(Boolean).map((p) => [String(p.id), p]))
+  // 앞 결제가 취소됐거나 그 주문에서 사라졌으면 다시 결제한 것이다.
+  if (priorIds.some((id) => {
+    const p = byId.get(String(id))
+    return !p || p.state === 'CANCELLED'
+  })) return true
+  // 취소가 아직 주문에 반영되지 않았어도, 살아 있는 결제의 합이 주문 청구 금액보다 크면 나눠 결제가 아니라 다시 결제한 것이다.
+  const live = payments.filter((p) => p && p.state !== 'CANCELLED')
+  const charge = order.chargePrice && typeof order.chargePrice.chargePriceValue === 'number' ? order.chargePrice.chargePriceValue : null
+  const amounts = live.map((p) => p.amountMoney)
+  if (charge !== null && amounts.length && amounts.every((a) => typeof a === 'number')) {
+    if (amounts.reduce((sum, a) => sum + a, 0) > charge) return true
+  }
+  return false
+}
+
+// 이 단말기에 대조할 기록이 없는 결제(기록이 없거나 모두 다른 결제에 이미 맞춰짐). 이 매장에 결제 전(POS에 담김)이거나 POS에서
+// 취소된 전산 주문이 있으면 맞추지 못한 결제로 남긴다 -- 기록이 지워졌거나(업그레이드·정리) 다른 단말기가 담은 주문을 여기서
+// 결제했을 수 있는데, 예전에는 아무 데도 남지 않아 그 주문을 결제 완료로 기록할 방법이 없었다. 그런 주문이 없으면 평범한 POS 판매라
+// 남기지 않는다. 나눠 결제가 시작될 때는 맞을 기록이 있었는데(relevant) 그 사이 기록이 정리된 경우도 남긴다.
+async function handleUnrecordedPaid(paymentId, orderId, partialBefore) {
+  const relevant = Boolean(partialBefore && partialBefore.relevant)
+  if (!relevant && !storeHasOpenPosCarts()) {
     partialOrders.delete(orderId)
+    markHandledPayment(paymentId, orderId)
     return
   }
+  const { paid, summary } = await readPaidSummary(paymentId, orderId)
+  if (isHandledPayment(paymentId)) return
+  if (paid && paid.progress === 'partial') {
+    // 남은 금액이 결제되면 그때 남긴다(같은 주문의 'paid'가 다시 오거나 폴링이 주문을 다시 읽는다).
+    const prev = partialOrders.get(orderId)
+    partialOrders.set(orderId, { paymentId, at: prev ? prev.at : Date.now(), relevant })
+    return
+  }
+  partialOrders.delete(orderId)
+  markHandledPayment(paymentId, orderId)
+  if (paid && paid.progress === 'closed') return
+  rememberUnmatchedPayment({ paymentId, orderId, at: Date.now(), ...summary })
+  deps.notify('warn', relevant ? UNMATCHED_PAYMENT_MESSAGE : UNRECORDED_PAYMENT_MESSAGE)
+}
+
+// partialInfo: 폴링(recheckPartialOrders)이 나눠 결제가 끝난 것을 확인하고 부를 때 넘기는 그 주문의 지켜보기 정보.
+async function handlePaid(paymentId, orderId, { partialInfo = null } = {}) {
+  if (!paymentId || isHandledPayment(paymentId)) return
+  const startedAt = Date.now()
+  // 이 결제로 이미 전산에 알린 주문이다(탭앱이 다시 로드된 뒤 같은 'paid'가 또 왔다).
+  const reported = reportedOrderOf(orderId)
+  if (reported && reported.paymentId === paymentId) {
+    markHandledPayment(paymentId, orderId)
+    return
+  }
+  // 같은 POS 주문의 다른 결제를 이미 처리했다: 나눠 결제의 나머지 카드이거나, 앞 결제를 취소하고 다시 결제한 것이다.
+  const priorIds = orderId ? priorPaymentIdsOf(orderId, paymentId) : []
+  if (priorIds.length) {
+    const cancelledBefore = await priorPaymentsCancelled(orderId, priorIds)
+    if (isHandledPayment(paymentId)) return
+    if (cancelledBefore === false) {
+      // 앞 결제가 그대로 살아 있다 -- 나눠 결제의 나머지다. 그 주문은 이미 처리했다(전산에 알렸거나 맞추지 못한 결제로 남겼다).
+      markHandledPayment(paymentId, orderId)
+      partialOrders.delete(orderId)
+      return
+    }
+    const reportedNow = reportedOrderOf(orderId)
+    if (reportedNow && reportedNow.paymentId !== paymentId) {
+      // 전산에 결제 완료로 알린 POS 주문에 새 결제가 왔다(앞 결제가 취소됐거나, 주문을 못 읽어 알 수 없음). 그 전산 주문은 앞 결제의
+      // 취소 웹훅으로 취소(refunded)가 된다. 자동으로 보고하지 않고 그 주문을 붙여 맞추지 못한 결제로 남긴다 -- 직원이 그 주문의
+      // [POS에서 다시 결제했어요]로 기록하면 서버가 결제 완료로 되살린다.
+      markHandledPayment(paymentId, orderId)
+      partialOrders.delete(orderId)
+      const { summary } = await readPaidSummary(paymentId, orderId)
+      // 같은 주문에 결제가 여럿이라 주문 금액보다 이 결제 금액이 정확하다.
+      const amount = await readPaymentAmount(paymentId)
+      rememberUnmatchedPayment({
+        paymentId,
+        orderId,
+        at: Date.now(),
+        titles: summary.titles,
+        amount: amount !== null ? amount : summary.amount,
+        hintCartIds: reportedNow.cartIds,
+        hintRefs: reportedNow.refs,
+        hintKind: 'repaid',
+      })
+      deps.notify('warn', repaidMessage(reportedNow))
+      return
+    }
+    // 앞서 처리했지만 전산에 알리지 않은 주문(맞추지 못한 결제로 남긴 주문 등)이면 처음 온 결제처럼 다룬다.
+  }
+  const partialBefore = partialOrders.get(orderId) || partialInfo
+  const entries = loadPendingPaid()
   // 예전에 통보가 실패해 남아 있던 항목(paymentId가 이미 있다)은 그때 확정된 자기 값을 그대로 다시 써야
   // 한다 — 지금 결제와는 다른 건이라, 새 값을 붙이면 전산에 엉뚱한 결제 건으로 기록된다.
   const targets = entries
@@ -1242,10 +1878,12 @@ async function handlePaid(paymentId, orderId) {
   // 아직 결제가 안 붙은 항목은 이번 결제가 정말 자기 것인지 주문 내용으로 확인한 것만 이번 값을 쓴다.
   // 지금 보고 중인 기록은 다른 결제에 이미 맞춰진 것이라 뺀다.
   const fresh = entries.filter((e) => !e.paymentId && !reportingIds.has(e.id))
-  if (fresh.length) {
+  if (!fresh.length) {
+    await handleUnrecordedPaid(paymentId, orderId, partialBefore)
+  } else {
     const picked = await matchFreshEntries(fresh, paymentId, orderId)
-    // 주문을 읽는 사이 같은 주문을 다른 쪽(이벤트·폴링)이 먼저 처리했으면 여기서는 손대지 않는다.
-    if (orderId && isHandledOrder(orderId)) return
+    // 주문을 읽는 사이 같은 결제나 같은 주문의 다른 결제를 다른 쪽(이벤트·폴링)이 먼저 처리했으면 여기서는 손대지 않는다.
+    if (isHandledPayment(paymentId) || (orderId && orderHandledSince(orderId, startedAt, paymentId))) return
     if (picked.kind === 'partial') {
       // 남은 금액이 결제될 때까지 기록을 그대로 둔다. 안내는 처음 한 번만, 다 결제되면 맞을 주문이 있을 때만 띄운다.
       const prev = partialOrders.get(orderId)
@@ -1253,9 +1891,16 @@ async function handlePaid(paymentId, orderId) {
       if (picked.relevant && !prev) deps.notify('warn', PARTIAL_PAYMENT_MESSAGE)
     } else {
       partialOrders.delete(orderId)
-      markHandledOrder(orderId)
+      markHandledPayment(paymentId, orderId)
       if (picked.kind === 'match') {
-        picked.entries.forEach((e) => targets.push({ entry: e, paymentId, orderId, summary: picked.summary }))
+        const paidAt = Date.now()
+        for (const e of picked.entries) {
+          // 통보를 기다리는 사이 다른 경로(품목이 사라진 기록 정리·담기 취소)가 이 기록을 지우지 않게, 맞춘 결제를 먼저 기록에
+          // 붙인다. paymentId가 붙은 기록은 정리·담기 취소가 건드리지 않는다.
+          const patch = { paymentId, orderId, paidAt, paidAmount: picked.summary.amount, paidTitles: picked.summary.titles }
+          patchPendingEntry(e.id, patch)
+          targets.push({ entry: { ...e, ...patch }, paymentId, orderId, summary: picked.summary })
+        }
       } else if (picked.kind !== 'closed') {
         rememberUnmatchedPayment({ paymentId, orderId, at: Date.now(), ...picked.summary })
         deps.notify('warn', UNMATCHED_PAYMENT_MESSAGE)
@@ -1264,9 +1909,10 @@ async function handlePaid(paymentId, orderId) {
   }
   if (!targets.length) return
 
-  const { succeeded, failed, terminal, abandoned } = await settleReports(targets)
+  const { succeeded, failed, terminal, abandoned, orphaned } = await settleReports(targets)
   terminal.forEach(notifyTerminalPaid)
   abandoned.forEach(notifyAbandonedPaid)
+  notifyOrphanedPaid(orphaned)
   if (succeeded.length) deps.notify('success', '결제 완료를 전산에 알렸습니다.')
   if (failed.length) {
     // 결제 자체는 이미 끝났다 — 취소하라는 뜻이 아니라, 전산이 아직 모른다는 뜻이다.
@@ -1298,8 +1944,51 @@ async function recheckPartialOrders() {
     if (progress === 'partial') continue
     partialOrders.delete(orderId)
     if (progress === 'closed') continue
-    await handlePaid(info.paymentId, orderId)
+    // 지켜보던 정보를 넘긴다 -- 그 사이 기록이 정리됐어도 맞을 기록이 있던 결제(relevant)면 맞추지 못한 결제로 남긴다.
+    await handlePaid(info.paymentId, orderId, { partialInfo: info })
   }
+}
+
+// 이 탭앱이 [결제 취소]로 직접 취소하는 결제 → 시각. 그 취소의 'cancel' 이벤트에는 따로 안내하지 않는다(취소 흐름이 이미 안내한다).
+const SELF_CANCEL_TTL_MS = 5 * 60 * 1000
+const selfCancels = new Map()
+
+export function noteSelfCancel(paymentId) {
+  if (!paymentId) return
+  selfCancels.set(String(paymentId), Date.now())
+}
+
+// POS에서 결제가 취소됐다(posPluginSdk.payment.on('cancel')). 직원이 POS [주문]에서 취소하고 다른 카드로 다시 결제하는 일이 흔하다.
+//   - 맞추지 못한 결제 목록에 있던 결제는 더 기록할 수 없으니 뺀다(남겨 두면 취소된 돈을 결제 완료로 기록할 수 있다).
+//   - 전산에 결제 완료로 알린 결제였으면 어느 전산 주문인지 알린다 -- 토스 취소 웹훅이 그 주문을 취소로 바꾸는데, 다시 결제했다면
+//     새 결제를 [POS에서 다시 결제했어요]로 기록해야 한다.
+//   - 이 탭앱의 [결제 취소]로 취소한 결제는 그 흐름이 이미 안내했다.
+function handleCancelled(paymentId, orderId) {
+  if (!paymentId) return
+  const id = String(paymentId)
+  const now = Date.now()
+  cancelledPayments.set(id, now)
+  for (const [k, at] of cancelledPayments) {
+    if (now - at > CANCELLED_PAYMENT_TTL_MS) cancelledPayments.delete(k)
+  }
+  const listed = listUnmatchedPayments().find((p) => p.paymentId === id)
+  if (listed) removeUnmatchedPayment(id)
+  const selfAt = selfCancels.get(id)
+  if (selfAt !== undefined && now - selfAt <= SELF_CANCEL_TTL_MS) {
+    selfCancels.delete(id)
+    return
+  }
+  const byOrder = reportedOrderOf(orderId)
+  const reported = byOrder && byOrder.paymentId === id
+    ? byOrder
+    : Object.values(loadReportedOrders()).find((v) => v.paymentId === id) || null
+  const refs = reported ? reported.refs : listed && Array.isArray(listed.recordedRefs) ? listed.recordedRefs : []
+  if (!refs.length) return
+  deps.notify(
+    'warn',
+    `POS에서 결제가 취소됐습니다. 이 결제로 결제 완료를 알린 전산 주문: ${refs.join(', ')}. 토스 취소 확인이 오면 전산 주문은 취소로 바뀝니다. ` +
+    '다른 카드로 다시 결제했다면 [최근 결제]에서 그 주문의 [POS에서 다시 결제했어요]로 새 결제를 기록해주세요.'
+  )
 }
 
 // consume 보고가 닿지 못한 기록(needsConsume)의 보고를 다시 보낸다. 같은 attemptId라서 서버가 이미 받았다면
@@ -1318,6 +2007,7 @@ async function resendConsume(entry) {
   if (!r.ok) {
     if (r.status === 404 || r.status === 409) {
       forgetPendingPaid(entry.id)
+      forgetLoadAttempt(entry.id)
       if (r.status === 409 && r.body && r.body.payTarget === 'front') {
         deps.notify('error', `프론트에서 결제하도록 넘어간 주문입니다 (${label}). POS에서는 결제하지 마세요. [주문] 탭에 담긴 품목을 직접 지워주세요.`)
       } else if (r.status === 404) {
@@ -1341,6 +2031,7 @@ async function resendConsume(entry) {
     (body.ownAttempt === false || (body.ownAttempt === undefined && body.status !== 'loaded' && body.status !== 'paid'))
   if (lostToOther) {
     forgetPendingPaid(entry.id)
+    forgetLoadAttempt(entry.id)
     deps.notify('error', `다른 단말기에서 이미 처리한 주문입니다 (${label}). POS에서 결제하지 말고 [주문] 탭에 담긴 품목을 직접 지워주세요.`)
     return
   }
@@ -1377,9 +2068,10 @@ async function retryPendingPaid() {
       .filter((e) => e.paymentId && ids.has(e.id))
       .map((e) => ({ entry: e, paymentId: e.paymentId, orderId: e.orderId }))
     if (!targets.length) return
-    const { succeeded, terminal, abandoned } = await settleReports(targets)
+    const { succeeded, terminal, abandoned, orphaned } = await settleReports(targets)
     terminal.forEach(notifyTerminalPaid)
     abandoned.forEach(notifyAbandonedPaid)
+    notifyOrphanedPaid(orphaned)
     if (succeeded.length) deps.notify('success', `결제 완료를 전산에 알렸습니다 (${succeeded.length}건).`)
   } catch {
     // 재시도는 실패해도 조용히 넘어간다 - 폴링마다 오류를 띄우면 화면이 안내로 뒤덮인다.
@@ -1399,6 +2091,19 @@ function initPaymentWatch() {
   } catch (e) {
     // SDK 버전에 따라 이 이벤트가 없을 수 있다. 없으면 결제 통보만 빠지고 나머지는 그대로 돈다.
     console.error('[erp-cart] 결제 이벤트를 구독하지 못했습니다.', e?.message)
+  }
+  try {
+    // sdk.d.ts의 Payment.on(event: 'cancel' | 'paid', (paymentId, orderId) => void). 실단말기에서 POS [주문] 취소에도 오는지는 미검증이다 --
+    // 안 와도 같은 주문의 새 결제는 handlePaid가 주문을 읽어 가르고, 취소된 주문은 [POS에서 다시 결제했어요]로 기록할 수 있다.
+    posPluginSdk.payment.on('cancel', (paymentId, orderId) => {
+      try {
+        handleCancelled(paymentId, orderId)
+      } catch (e) {
+        console.error('[erp-cart] 결제 취소 처리 중 오류가 났습니다.', e?.message)
+      }
+    })
+  } catch (e) {
+    console.error('[erp-cart] 결제 취소 이벤트를 구독하지 못했습니다.', e?.message)
   }
 }
 
@@ -1549,6 +2254,7 @@ async function runLoadCartToPos(cart) {
     if (!reported.ok && reported.status === 409 && reported.body?.payTarget === 'front') {
       const reverted = await revertLoadedLines(cart, revert)
       forgetPendingPaid(cart.id)
+      forgetLoadAttempt(cart.id)
       sentToFront.set(cart.id, Date.now())
       lastCarts = lastCarts.filter((c) => c.id !== cart.id)
       deps.notify('error', `프론트에서 결제하도록 넘긴 주문입니다. ${revertNoteOf(reverted)} POS에서는 결제하지 마세요.`)
@@ -1602,8 +2308,9 @@ async function runLoadCartToPos(cart) {
       // 있는지와 할 일을 알려준다(revertNoteOf).
       const revertNote = revertNoteOf(await revertLoadedLines(cart, revert))
       // 이 단말기에서는 결제를 시작하지 않으므로 결제 대기 기록도 지운다 — 남겨두면 나중에
-      // 이 단말기에서 벌어지는 다른 결제에 이 주문이 딸려가 "결제완료"로 잘못 보고된다.
+      // 이 단말기에서 벌어지는 다른 결제에 이 주문이 딸려가 "결제완료"로 잘못 보고된다. 담기 표식도 이 단말기 것이 아니게 됐다.
       forgetPendingPaid(cart.id)
+      forgetLoadAttempt(cart.id)
       removeCartFromView(cart.id)
       if (reported.body.status === 'dismissed') {
         // status가 dismissed라는 건 다른 단말기가 이 주문을 "지우기"로 거부했다는 뜻이다.

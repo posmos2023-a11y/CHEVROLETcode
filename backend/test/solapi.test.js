@@ -125,11 +125,60 @@ test('SDK 오류 태그: 접수 거부·잘못된 요청·4xx만 확실한 실�
   assert.equal(solapi.isDefiniteSendFailure(tagged({ _tag: 'BadRequestError' })), true)
   assert.equal(solapi.isDefiniteSendFailure(tagged({ _tag: 'ApiKeyError' })), true)
   assert.equal(solapi.isDefiniteSendFailure(tagged({ _tag: 'ClientError', httpStatus: 400 })), true)
-  assert.equal(solapi.isDefiniteSendFailure(tagged({ _tag: 'ClientError', httpStatus: 429 })), false)
+  // 요청 한도(429)는 요청을 받지 않았다는 응답이라 확실히 안 나갔다(발송사 쪽 사정 -- classifySendFailure 'provider').
+  assert.equal(solapi.isDefiniteSendFailure(tagged({ _tag: 'ClientError', httpStatus: 429 })), true)
+  assert.equal(solapi.isDefiniteSendFailure(tagged({ _tag: 'ClientError', httpStatus: 408 })), false)
   assert.equal(solapi.isDefiniteSendFailure(tagged({ _tag: 'ServerError', httpStatus: 500 })), false)
   assert.equal(solapi.isDefiniteSendFailure(tagged({ _tag: 'NetworkError' })), false)
   assert.equal(solapi.isDefiniteSendFailure(tagged({ _tag: 'ResponseSchemaMismatchError' })), false)
   assert.equal(solapi.isDefiniteSendFailure(new Error('socket hang up')), false)
+})
+
+test('실패 분류: 수신자 탓(수신거부·카카오 미사용자 등)과 계정·설정 탓(잔액·키·발신번호·템플릿·한도)과 결과 모름을 가른다', () => {
+  const tagged = (props) => Object.assign(new Error('x'), props)
+  const notReceived = (...codes) => tagged({ _tag: 'MessageNotReceivedError', failedMessageList: codes.map((statusCode) => ({ statusCode, statusMessage: 'x' })) })
+  // 수신자 탓 -- 그 번호로는 다시 보내도 같다.
+  for (const code of ['1061', '2061', '3061', '1065', '3010', '3104', '3107']) {
+    assert.equal(solapi.classifySendFailure(notReceived(code)), 'recipient', code)
+  }
+  // 계정·설정 탓 -- 번호와 무관하다(잔액·계정·발신번호·템플릿·변수·스팸 필터·접수 서버 오류).
+  for (const code of ['1030', '2230', '1020', '1062', '2062', '1060', '1042', '1043', '1057', '3105', '3101', '2254', '1024']) {
+    assert.equal(solapi.classifySendFailure(notReceived(code)), 'provider', code)
+  }
+  // 표에 없는 코드는 세지 않는 쪽(provider)으로 본다.
+  assert.equal(solapi.classifySendFailure(notReceived('9999')), 'provider')
+  // 섞여 있으면 수신자 탓만으로 단정하지 않는다.
+  assert.equal(solapi.classifySendFailure(notReceived('3104', '1030')), 'provider')
+  assert.equal(solapi.classifySendFailure(tagged({ _tag: 'ApiKeyError' })), 'provider')
+  assert.equal(solapi.classifySendFailure(tagged({ _tag: 'BadRequestError' })), 'provider')
+  assert.equal(solapi.classifySendFailure(tagged({ _tag: 'DefaultError', errorCode: 'AuthError' })), 'provider')
+  for (const httpStatus of [400, 401, 402, 403, 404, 429]) {
+    assert.equal(solapi.classifySendFailure(tagged({ _tag: 'ClientError', httpStatus })), 'provider', String(httpStatus))
+  }
+  // 결과 모름
+  assert.equal(solapi.classifySendFailure(tagged({ _tag: 'ClientError', httpStatus: 408 })), 'unknown')
+  assert.equal(solapi.classifySendFailure(tagged({ _tag: 'ServerError', httpStatus: 503 })), 'unknown')
+  assert.equal(solapi.classifySendFailure(tagged({ _tag: 'NetworkError' })), 'unknown')
+  assert.equal(solapi.classifySendFailure(tagged({ _tag: 'DefaultError', errorCode: 'ParseError' })), 'unknown')
+  assert.equal(solapi.classifySendFailure(tagged({ code: 'SOLAPI_TIMEOUT' })), 'unknown')
+  assert.equal(solapi.classifySendFailure(new Error('socket hang up')), 'unknown')
+  assert.equal(solapi.classifySendFailure(null), 'unknown')
+  // 상태 코드 없는 예전 형식의 접수 거부는 예전처럼 그 번호의 실패다.
+  assert.equal(solapi.classifySendFailure(tagged({ definiteFailure: true })), 'recipient')
+  assert.equal(solapi.classifySendFailure(tagged({ _tag: 'MessageNotReceivedError' })), 'recipient')
+})
+
+test('실패 분류: failedMessageList로 거부되면 그 상태 코드를 오류에 실어 분류한다', async () => {
+  sendImpl = () => Promise.resolve({ failedMessageList: [{ statusCode: '1030', statusMessage: '잔액 부족' }] })
+  const balance = await solapi.sendPromoAlimtalk({ phone: '01000000000', storeName: '테스트매장', storeId: 1 }).catch((e) => e)
+  assert.equal(balance.statusCode, '1030')
+  assert.equal(solapi.classifySendFailure(balance), 'provider')
+  assert.equal(solapi.isDefiniteSendFailure(balance), true)
+
+  sendImpl = () => Promise.resolve({ failedMessageList: [{ statusCode: 3104, statusMessage: '카카오톡 미사용자' }] })
+  const nonUser = await solapi.sendPromoAlimtalk({ phone: '01000000000', storeName: '테스트매장', storeId: 1 }).catch((e) => e)
+  assert.equal(nonUser.statusCode, '3104')
+  assert.equal(solapi.classifySendFailure(nonUser), 'recipient')
 })
 
 test('홍보 문자 본문은 "(광고) 매장명"으로 시작하고 수신거부 안내로 끝난다', () => {

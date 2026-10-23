@@ -72,6 +72,8 @@ async function sendAlimtalk({ phone, text, templateId, variables, storeId, recor
       const err = new Error(msg)
       // 문자 회사가 접수를 거부했다고 응답한 것 -- 확실히 안 나갔다.
       err.definiteFailure = true
+      // 상태 코드로 수신자 탓인지 계정·설정 탓인지 가린다(classifySendFailure).
+      if (firstErr?.statusCode !== undefined && firstErr?.statusCode !== null) err.statusCode = String(firstErr.statusCode)
       throw err
     }
     logger.info('[solapi] 알림 발송 성공', {
@@ -213,23 +215,63 @@ async function sendPromoAlimtalk({ phone, carNumber, storeName, storeId, payment
   })
 }
 
-// 발송 실패가 "확실히 안 나간" 것인지. 광고 발송 기록을 실패로 돌려 다시 보낼 수 있게 할지 정하는 데 쓴다.
-// 확실한 것만 true다: 문자 회사가 접수 거부를 응답했거나(failedMessageList, MessageNotReceivedError),
-// 요청 자체가 잘못돼 접수되지 않은 경우(BadRequestError, 4xx ClientError, ApiKeyError).
-// 시간 초과·네트워크 오류·5xx·응답 해석 실패는 문자 회사가 받아서 보냈을 수 있으므로 false다 --
-// 다시 보내면 같은 광고가 두 번 갈 수 있다.
-const DEFINITE_FAILURE_TAGS = new Set(['MessageNotReceivedError', 'BadRequestError', 'ApiKeyError'])
+// 발송 실패의 종류. 광고 발송 기록을 실패로 돌려 다시 보낼지, 그 번호의 실패로 셀지 정하는 데 쓴다.
+//   'unknown'   결과를 모름 -- 시간 초과·네트워크 오류·5xx·응답 해석 실패·408. 문자 회사가 받아서 보냈을 수 있다(다시 보내면
+//               같은 광고가 두 번 갈 수 있다).
+//   'recipient' 이 수신자 때문에 확실히 안 나감 -- 수신거부(080·발신자 거부), 없는 번호·단말 사정, 카카오 미사용자·알림톡 차단.
+//               그 번호로는 다시 보내도 같은 결과라 자동 홍보가 실패 횟수로 센다.
+//   'provider'  발송사 계정·설정 탓으로 확실히 안 나감 -- 잔액 부족, API 키·인증 오류(ApiKeyError, 401·403), 발신번호 미등록·차단,
+//               알림톡 템플릿·변수 불일치, 요청 한도(429), 요청 형식 오류(BadRequestError·4xx), 접수 서버 오류. 번호와 무관해
+//               세면 안 된다(며칠 이어지면 그동안 차례가 온 손님들의 홍보가 영구히 닫힌다). 미루기만 하고, 이어지면 실행을 멈춘다.
+// 상태 코드는 솔라피 메시지 상태 코드표 기준(1xxx 접수 단계, 2xxx 플랫폼 처리, 3xxx 통신사·카카오 결과). 아래 목록에 없는 코드는
+// 'provider'로 본다 -- 세지 않고 미루는 쪽이 되돌릴 수 있다(목록에 없는 수신자 탓 코드라면 그 결제는 하루마다 다시 시도될 뿐이다).
+const RECIPIENT_STATUS_CODES = new Set([
+  '1061', '2061', '3061', // 080 무료 수신거부
+  '1065', '2065', // 발신자 수신거부
+  '3010', // 수신번호 형식 오류
+  '3031', '3032', '3041', '3042', '3043', '3044', '3045', '3046', '3047', '3050', '3051', '3062', // 단말·가입자 사정
+  '3055', // 수신자가 스팸 차단 등록한 번호
+  '3102', '3104', '3107', // 카카오: 친구 아님·카카오톡 미사용자·72시간 미사용 또는 알림톡 차단
+])
 
-function isDefiniteSendFailure(error) {
-  if (!error) return false
-  if (error.code === 'SOLAPI_TIMEOUT') return false
-  if (error.definiteFailure === true) return true
-  if (DEFINITE_FAILURE_TAGS.has(error._tag)) return true
+// 오류에 실린 상태 코드들(solapi.js가 만든 오류의 statusCode, SDK MessageNotReceivedError의 failedMessageList).
+function failureStatusCodes(error) {
+  const codes = []
+  if (error.statusCode !== undefined && error.statusCode !== null && error.statusCode !== '') codes.push(String(error.statusCode))
+  if (Array.isArray(error.failedMessageList)) {
+    for (const m of error.failedMessageList) {
+      if (m?.statusCode !== undefined && m?.statusCode !== null && m?.statusCode !== '') codes.push(String(m.statusCode))
+    }
+  }
+  return codes
+}
+
+function classifySendFailure(error) {
+  if (!error) return 'unknown'
+  if (error.code === 'SOLAPI_TIMEOUT') return 'unknown'
+  const codes = failureStatusCodes(error)
+  if (codes.length) return codes.every((c) => RECIPIENT_STATUS_CODES.has(c)) ? 'recipient' : 'provider'
+  // 보내기 전에 SDK가 거절했다(키 없음·요청 형식). 번호는 정규화된 값만 쓰므로 설정 탓으로 본다.
+  if (error._tag === 'ApiKeyError' || error._tag === 'BadRequestError') return 'provider'
+  // HMAC 서명을 만들지 못했다(보내기 전).
+  if (error._tag === 'DefaultError' && error.errorCode === 'AuthError') return 'provider'
   if (error._tag === 'ClientError') {
     const status = Number(error.httpStatus)
-    return status >= 400 && status < 500 && status !== 408 && status !== 429
+    if (status === 408) return 'unknown'
+    // 요청 전체를 거절한 응답(인증·권한·잔액·한도·형식) -- 수신자와 무관하다.
+    if (status >= 400 && status < 500) return 'provider'
+    return 'unknown'
   }
-  return false
+  // 상태 코드 없이 접수 거부만 알 수 있는 경우(예전 형식)는 예전처럼 그 번호의 실패로 본다.
+  if (error._tag === 'MessageNotReceivedError' || error.definiteFailure === true) return 'recipient'
+  return 'unknown'
+}
+
+// 발송 실패가 "확실히 안 나간" 것인지(수신자 탓이든 계정·설정 탓이든). 광고 발송 기록을 실패로 돌려 다시 보낼 수 있게 할지 정한다.
+// 429(요청 한도)도 확실한 실패다 -- 요청 자체를 받지 않았다는 응답이라, 예전처럼 "결과 모름"으로 두면 안 나간 광고를 보낸 것으로
+// 닫거나 그 번호를 30일 동안 막는다.
+function isDefiniteSendFailure(error) {
+  return classifySendFailure(error) !== 'unknown'
 }
 
 module.exports = {
@@ -240,5 +282,6 @@ module.exports = {
   sendPromoAlimtalk,
   buildPromoText,
   isDefiniteSendFailure,
+  classifySendFailure,
   DEFAULT_PROMO_OPT_OUT_TEXT,
 }

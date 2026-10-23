@@ -33,8 +33,21 @@ const promoCalls = []
 let failNext = null // null | 'error'(확실한 실패) | 'timeout' | 'network'(결과 모름)
 // 발송사가 접수를 늘 거부하는 번호(보낼 때마다 확실한 실패)
 const rejectedPhones = new Set()
+// 모든 발송이 같은 이유로 실패한다: 솔라피 상태 코드(예: '1030' 잔액 부족, '3104' 카카오톡 미사용자) 또는 'timeout'(결과 모름)
+let failAllWith = null
 solapi.sendPromoAlimtalk = async (payload) => {
   promoCalls.push(payload)
+  if (failAllWith === 'timeout') {
+    const err = new Error('Solapi 발송 시간 초과 (10초)')
+    err.code = 'SOLAPI_TIMEOUT'
+    throw err
+  }
+  if (failAllWith) {
+    const err = new Error(`발송사 접수 거부 ${failAllWith}(테스트)`)
+    err.definiteFailure = true // solapi.js가 failedMessageList에서 만든 오류와 같은 모양
+    err.statusCode = failAllWith
+    throw err
+  }
   if (rejectedPhones.has(payload.phone)) {
     const err = new Error('수신번호 접수 거부(테스트)')
     err.definiteFailure = true
@@ -74,6 +87,7 @@ async function resetDatabase() {
   )
   promoCalls.length = 0
   failNext = null
+  failAllWith = null
   rejectedPhones.clear()
 }
 
@@ -618,6 +632,123 @@ testSerial('자동 홍보: 같은 번호가 7일 안에 3번 확실히 실패하
   const rowQ = await prisma.payment.findUnique({ where: { id: q.id } })
   assert.equal(rowQ.promoSent, false)
   assert.ok(rowQ.promoAt.getTime() > Date.now() + DAY - 5 * 60 * 1000)
+})
+
+// --- R9: 발송사 계정·설정 탓 실패는 세지 않고, 이어지면 실행을 멈춘다 ----------------------------------------
+
+testSerial('자동 홍보: 잔액 부족 같은 발송사 탓 실패는 실패 횟수에 넣지 않고 하루 뒤로 미루기만 한다(failed_provider)', async () => {
+  if (!isDaytimeKst()) return
+  const { sendDuePromotions } = require('../server')
+  const { countRecentAutoPromoFailures } = require('../src/store')
+  const store = await createStore('auto-provider')
+  const phone = '01020300001'
+  const p = await duePayment(store, phone)
+  // 이 번호로 수신자 탓 실패가 이미 두 번 있었다 -- 예전에는 지금 실패까지 세어 3번이 되어 영구히 닫혔다.
+  for (const daysAgo of [1, 2]) {
+    await prisma.promoSend.create({ data: { storeId: store.id, phone, via: 'auto', status: 'failed', sentAt: new Date(Date.now() - daysAgo * DAY) } })
+  }
+  failAllWith = '1030'
+  const before = Date.now()
+  const result = await sendDuePromotions()
+  assert.equal(result.failed, 1, JSON.stringify(result))
+  const row = await prisma.payment.findUnique({ where: { id: p.id } })
+  assert.equal(row.promoSent, false)
+  assert.equal(row.promoClaimedAt, null)
+  assert.ok(row.promoAt.getTime() >= before + DAY - 60 * 1000, `promoAt=${row.promoAt.toISOString()}`)
+  const latest = await prisma.promoSend.findFirst({ where: { storeId: store.id, phone }, orderBy: { sentAt: 'desc' } })
+  assert.equal(latest.status, 'failed_provider')
+  assert.equal(await countRecentAutoPromoFailures(store.id, phone, new Date(Date.now() - 7 * DAY)), 2)
+  // 안 나간 발송이라 30일 제한에도 들어가지 않는다 -- 발송사가 돌아오면 그대로 보낸다.
+  failAllWith = null
+  await prisma.payment.update({ where: { id: p.id }, data: { promoAt: new Date(Date.now() - 60 * 1000) } })
+  const retry = await sendDuePromotions()
+  assert.equal(retry.sent, 1, JSON.stringify(retry))
+  assert.ok((await prisma.payment.findUnique({ where: { id: p.id } })).promoSentAt)
+})
+
+testSerial('자동 홍보: 발송사 탓 실패가 이어지면 실행을 멈추고(stopped provider) 남은 대상은 다음 실행에 그대로 보낸다', async () => {
+  if (!isDaytimeKst()) return
+  const { sendDuePromotions } = require('../server')
+  const store = await createStore('auto-provider-stop')
+  const payments = []
+  for (let i = 0; i < 6; i += 1) {
+    payments.push(await duePayment(store, `0103030000${i}`, { promoAt: new Date(Date.now() - (10 - i) * 60 * 1000) }))
+  }
+  failAllWith = '1062' // 발신번호 미등록
+  const before = Date.now()
+  const result = await sendDuePromotions()
+  assert.equal(result.stopped, 'provider', JSON.stringify(result))
+  assert.equal(result.exhausted, false)
+  assert.equal(promoCalls.length, 3)
+  const rows = await prisma.payment.findMany({ where: { id: { in: payments.map((p) => p.id) } }, orderBy: { promoAt: 'asc' } })
+  const tried = rows.filter((r) => r.promoAt.getTime() >= before + DAY - 60 * 1000)
+  const untouched = rows.filter((r) => r.promoAt.getTime() < before)
+  assert.equal(tried.length, 3)
+  assert.equal(untouched.length, 3)
+  assert.ok(rows.every((r) => !r.promoSent && !r.promoClaimedAt), '닫히거나 claim이 남은 결제가 있다')
+  assert.equal(await prisma.promoSend.count({ where: { storeId: store.id, status: 'failed_provider' } }), 3)
+
+  // 발송사가 돌아오면 남은 대상이 다음 실행에 나간다.
+  failAllWith = null
+  const next = await sendDuePromotions()
+  assert.equal(next.sent, 3, JSON.stringify(next))
+})
+
+testSerial('자동 홍보: 수신자 탓 실패(카카오톡 미사용자)는 예전처럼 세어 3번째에 닫고, 이어져도 실행을 멈추지 않는다', async () => {
+  if (!isDaytimeKst()) return
+  const { sendDuePromotions } = require('../server')
+  const store = await createStore('auto-recipient')
+  const capped = await duePayment(store, '01020310001')
+  for (const daysAgo of [1, 2]) {
+    await prisma.promoSend.create({ data: { storeId: store.id, phone: '01020310001', via: 'auto', status: 'failed', sentAt: new Date(Date.now() - daysAgo * DAY) } })
+  }
+  const others = []
+  for (let i = 2; i <= 5; i += 1) others.push(await duePayment(store, `0102031000${i}`))
+  failAllWith = '3104'
+  const result = await sendDuePromotions()
+  assert.equal(result.stopped, null, JSON.stringify(result))
+  assert.equal(promoCalls.length, 5)
+  const cappedRow = await prisma.payment.findUnique({ where: { id: capped.id } })
+  assert.equal(cappedRow.promoSent, true)
+  assert.equal(cappedRow.promoSentAt, null)
+  const otherRows = await prisma.payment.findMany({ where: { id: { in: others.map((p) => p.id) } } })
+  assert.ok(otherRows.every((r) => !r.promoSent))
+  assert.equal(await prisma.promoSend.count({ where: { storeId: store.id, status: 'failed', sentAt: { gte: new Date(Date.now() - 60 * 1000) } } }), 5)
+})
+
+testSerial('자동 홍보: 결과를 모르는 실패가 이어져도 실행을 멈춰, 보냈는지 모르는 채 닫히는 결제를 줄인다', async () => {
+  if (!isDaytimeKst()) return
+  const { sendDuePromotions } = require('../server')
+  const store = await createStore('auto-unknown-stop')
+  const payments = []
+  for (let i = 0; i < 5; i += 1) payments.push(await duePayment(store, `0103040000${i}`, { promoAt: new Date(Date.now() - (10 - i) * 60 * 1000) }))
+  failAllWith = 'timeout'
+  const result = await sendDuePromotions()
+  assert.equal(result.stopped, 'provider', JSON.stringify(result))
+  assert.equal(promoCalls.length, 3)
+  const rows = await prisma.payment.findMany({ where: { id: { in: payments.map((p) => p.id) } } })
+  assert.equal(rows.filter((r) => r.promoSent).length, 3) // 결과 모름은 보낸 것으로 닫는다(같은 광고 두 번을 피한다)
+  assert.ok(rows.filter((r) => !r.promoSent).every((r) => !r.promoClaimedAt))
+})
+
+// --- R10: 결과를 모르는 자동 홍보도 같은 방문의 다른 결제를 닫는다 ----------------------------------------
+
+testSerial('자동 홍보: 결과를 모르는 실패(시간 초과)도 성공처럼 같은 번호의 곧 차례가 올 결제를 닫고, 30일 뒤의 결제는 남긴다', async () => {
+  if (!isDaytimeKst()) return
+  const { sendDuePromotions } = require('../server')
+  const store = await createStore('auto-unknown-sibling')
+  const main = await duePayment(store, '01020320001')
+  const soon = await duePayment(store, '01020320001', { promoAt: new Date(Date.now() + 5 * DAY) })
+  const later = await duePayment(store, '01020320001', { promoAt: new Date(Date.now() + 60 * DAY) })
+  failNext = 'timeout'
+  await sendDuePromotions()
+  const mainRow = await prisma.payment.findUnique({ where: { id: main.id } })
+  assert.equal(mainRow.promoSent, true)
+  const soonRow = await prisma.payment.findUnique({ where: { id: soon.id } })
+  assert.equal(soonRow.promoSent, true)
+  assert.equal(soonRow.promoSentAt, null)
+  assert.equal((await prisma.payment.findUnique({ where: { id: later.id } })).promoSent, false)
+  assert.equal((await prisma.promoSend.findFirst({ where: { storeId: store.id } })).status, 'unknown')
 })
 
 testSerial('자동 홍보: 야간에는 아무것도 잡지 않고 끝낸다(야간에 실행될 때만 확인)', async () => {

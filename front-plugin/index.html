@@ -51,7 +51,7 @@
       let orphanNoticePending = false
 
       // 지난번 결제·취소가 보고 없이 끝났으면(결제 도중 재시작 등) 마무리한다. 확인이 안 끝난 건('pending'·'auth')이 하나라도 있으면
-      // 'pending'. 결제와 취소를 따로 돌린다 -- 한쪽이 멈춰도(SDK 호출은 시간 제한이 없다) 다른 쪽은 진행되게.
+      // 'pending'. 결제와 취소를 따로 돌린다 -- 한쪽이 늦어져도 다른 쪽은 진행되게(SDK 확인 호출은 erp-front-pay.js가 10초로 자른다).
       // '알렸습니다' 토스트는 서버가 실제로 기록했을 때('paid'·'refunded')만 띄운다. 거절된 보고('orphan')는 성공이 아니다.
       async function runRecovery(pay, token) {
         const paid = pay.recoverInflight(token).then((r) => {
@@ -120,9 +120,12 @@
             }
             const { ok, body } = await pay.listCarts(token)
             // 쉬는 주문과, 승인됐는데 전산이 받지 않은 결제가 걸린 주문(이중결제 위험)은 결제창을 자동으로 띄우지 않는다.
+            // 지난 기록 확인이 안 끝나 결제 화면이 쉬게 한 주문(holdStuck)도 넘기지 않는다 -- 예전엔 그 주문을 보자마자 결제 화면으로
+            // 넘겼고, 결제 화면은 확인하지 못해 곧바로 돌려보내 두 화면을 쉬지 않고 오갔다. 쉬는 동안에도 뒤 복구(recoverInBackground)가
+            // 그 기록을 계속 확인하고, 정리되면 쉬기가 풀려 다음 폴링에서 넘어간다. 다른 주문·취소는 그대로 넘긴다.
             const carts = ok ? await pay.filterStartableCarts(body.carts) : []
-            // 정비 대기열에서 요청한 결제 취소도 같은 화면(erp-pay.html)에서 처리한다.
-            const refunds = ok ? (body.refunds || []).filter((r) => !pay.isSnoozed(pay.refundSnoozeKey(r))) : []
+            // 정비 대기열에서 요청한 결제 취소도 같은 화면(erp-pay.html)에서 처리한다(쉬는 건은 같은 기준으로 뺀다).
+            const refunds = ok ? pay.filterStartableRefunds(body.refunds) : []
             if (carts.length || refunds.length) {
               stopped = true
               location.href = './erp-pay.html'

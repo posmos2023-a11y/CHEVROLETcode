@@ -193,6 +193,9 @@ model ErpCart {
   // POS 탭앱이 담기(consume)를 요청할 때 실어 보낸 시도 구분자. 응답을 못 받아 재시도한 탭앱이 "이미 loaded"를 받았을 때
   // 그게 자기 첫 요청이 성공한 것인지 다른 단말기가 먼저 담은 것인지 가리는 데 쓴다(ownAttempt).
   consumeAttemptId String?
+  // [담기 취소]로 되돌린 담기 시도(consumeAttemptId)의 목록(묘비). 되돌린 뒤에 늦게 도착한 같은 시도의 담기 보고가 주문을 다시
+  // 담김으로 만들지 못하게 한다(품목도 기록도 없는데 서버만 담김이 된다). frontReleasedKey처럼 최근 10개를 쉼표로 이은 목록이다.
+  consumeReleasedAttemptId String?
 
   // 전산이 보낸 차량번호. memo에도 같은 값이 들어가지만 그건 사람이 POS 화면에서 읽는 자유
   // 문자열이라 기계가 확실히 못 읽는다. 예약 손님과 잇는 데는 이 필드를 쓴다.
@@ -230,6 +233,13 @@ model ErpCart {
   frontPaymentJson String?
   // 프론트 결제의 승인번호. 토스 결제 웹훅과 맞춰보는 열쇠라 JSON과 별도로 둔다(인덱스).
   frontApprovalNo  String?
+  // 프론트에서 승인됐지만 주문에 반영하지 못한 결제의 흔적(/result가 PAID_AFTER_RELEASE로 거절한 승인 보고). 직원이 [결제 중 풀기]
+  // 뒤 POS로 되돌렸거나 지운 주문에 늦은 승인이 오면 생긴다. 남기지 않으면 POS 화면에 평범한 주문으로 보여 같은 주문을 또 결제한다.
+  // 탭앱·관리자 웹이 경고로 보여주고, 직원이 확인한 뒤 지운다(POST /api/pos/erp-carts/:id/clear-front-orphan).
+  // errorMessage에 두지 않는 이유: 다른 전이가 errorMessage를 덮어쓰거나 지운다.
+  frontOrphanAt         DateTime?
+  frontOrphanApprovalNo String?
+  frontOrphanAmount     Int?
 
   // 토스 결제내역 매핑. 토스 웹훅(payment.payment.approved.v1)으로 같은 결제가 들어온 것을 확인한
   // 시각. tossPaymentId(위)가 토스 결제 ID다. null이면 "우리는 결제됐다고 알지만 토스 쪽 기록은

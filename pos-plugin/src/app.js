@@ -507,11 +507,13 @@ let lastSnapshot = ''
 function snapshotOf(body) {
   try {
     const q = (body.reservations || []).map((r) => `${r.id}:${r.status}`).join(',')
-    const c = (body.erpCarts || []).map((x) => x.id).join(',')
+    // 프론트 승인 경고(frontOrphan)가 생기거나 지워지는 것도 직원이 바로 봐야 하는 변화다.
+    const o = (x) => (x.frontOrphan ? 1 : 0)
+    const c = (body.erpCarts || []).map((x) => `${x.id}:${o(x)}`).join(',')
     // 프론트 결제(손님이 결제 중인지)와 최근 결제(결제됨·취소됨·영수증·숨김)도 직원이 지켜보는 값이다.
     // 이게 빠져 있으면 대기열과 전산 주문이 그대로인 동안 이 값들이 바뀌어도 폴링이 15초까지 느려졌다.
-    const f = (body.frontCarts || []).map((x) => `${x.id}:${x.status}`).join(',')
-    const s = (body.settledCarts || []).map((x) => `${x.id}:${x.status}:${x.receiptStatus || ''}:${x.hidden ? 1 : 0}`).join(',')
+    const f = (body.frontCarts || []).map((x) => `${x.id}:${x.status}:${o(x)}`).join(',')
+    const s = (body.settledCarts || []).map((x) => `${x.id}:${x.status}:${x.receiptStatus || ''}:${x.hidden ? 1 : 0}:${o(x)}`).join(',')
     return `${q}|${c}|${f}|${s}`
   } catch {
     return String(Date.now()) // 비교 불가면 항상 "바뀜"으로 취급한다(느려지지 않는 쪽이 안전)
