@@ -19,6 +19,7 @@
       // 대기화면(index.html)이 결제할 주문이 생긴 걸 보고 이 화면으로 넘어오며, 주문이 한 건이면
       // 곧바로 통합결제창(결제수단 선택)을 띄운다. 여러 건일 때만 차량을 고르는 화면을 먼저 보여준다.
       const pay = window.ErpFrontPay
+      let storeName = '' // 영수증 추가 문구용(서버 목록 응답의 storeName)
 
       function goHome() {
         location.href = './index.html'
@@ -94,6 +95,7 @@
           return
         }
         const { ok, status, body } = await pay.listCarts(token)
+        if (ok) storeName = body.storeName || ''
         if (!ok) {
           showMessage('error', status === 401 ? '매장 토큰이 올바르지 않습니다' : '주문을 불러오지 못했습니다', body.error)
           return
@@ -174,7 +176,7 @@
           console.error('[erp-pay] requestPayment 예외', err)
           const recovered = await pay.recoverInflight(token)
           if (recovered === 'paid') {
-            showPaid(cart, null)
+            showPaid(cart, paymentKey)
           } else if (recovered === 'released') {
             showRetryChoice(token, cart, '결제가 완료되지 않았습니다')
           } else {
@@ -194,7 +196,7 @@
             await pay.clearInflight()
           }
           // 보고가 끝내 실패하면(네트워크) 기록을 남겨두고, 다음에 대기화면이 켜질 때 다시 보고한다.
-          showPaid(cart, res.ok ? res.body : null)
+          showPaid(cart, paymentKey)
           return
         }
 
@@ -211,13 +213,53 @@
         showRetryChoice(token, cart, failed ? '결제에 실패했습니다' : '결제가 취소되었습니다')
       }
 
-      function showPaid(cart) {
+      // 결제가 끝나면 영수증을 기본으로 출력한다(프론트에 연결된 프린터, sdk.printer.printReceipt). 전산 주문의 품목·단가를
+      // 넣어 뽑고, 품목 합계가 결제 금액보다 크면 차액을 '할인'으로 넣어 맞춘다(작으면 품목 없이 결제 영수증만).
+      // 품목을 넣은 출력이 실패하면 결제 영수증만 한 번 더 시도한다. 프린터가 없거나 끝내 실패해도 결제에는 영향이 없다.
+      function receiptOrderInfo(cart) {
+        const items = (cart.items || []).filter((i) => i && i.name)
+        if (!items.length) return null
+        const orderItems = items.map((i) => ({
+          count: Math.max(1, Number(i.quantity) || 1),
+          menu: { title: String(i.name).slice(0, 40), originPrice: Math.max(0, Number(i.unitPrice) || 0), selectOptions: [] },
+          discounts: [],
+        }))
+        const sum = orderItems.reduce((acc, o) => acc + o.count * o.menu.originPrice, 0)
+        const total = Number(cart.totalAmount) || 0
+        if (sum < total) return null
+        return { orderItems, discounts: sum > total ? [{ title: '할인', price: sum - total }] : [] }
+      }
+
+      async function printReceiptFor(cart, paymentKey) {
+        if (!paymentKey || typeof sdk.printer?.printReceipt !== 'function') return
+        const additionalText = [storeName, cart.carNumber ? `차량번호 ${cart.carNumber}` : ''].filter(Boolean).join(' · ')
+        const base = { paymentKey, count: 1, ...(additionalText ? { additionalText } : {}) }
+        const orderInfo = receiptOrderInfo(cart)
+        try {
+          await sdk.printer.printReceipt(orderInfo ? { ...base, orderInfo } : base)
+          return
+        } catch (e) {
+          console.warn('[erp-pay] 영수증 출력 실패', e)
+        }
+        if (orderInfo) {
+          try {
+            await sdk.printer.printReceipt(base)
+            return
+          } catch (e) {
+            console.error('[erp-pay] 결제 영수증 출력도 실패', e)
+          }
+        }
+        sdk.template.openToast?.({ message: '영수증을 출력하지 못했습니다. 프린터 연결을 확인해주세요.', icon: 'error' })
+      }
+
+      function showPaid(cart, paymentKey) {
+        printReceiptFor(cart, paymentKey).catch((e) => console.error('[erp-pay] 영수증 출력 오류', e))
         sdk.template.renderResultPage({
           type: 'text',
           text: pay.formatWon(cart.totalAmount),
           title: '결제가 완료되었습니다',
           description: `${cartTitle(cart)} 정비 결제가 끝났습니다. 감사합니다.`,
-          timerMs: 5000,
+          timerMs: 8000, // 영수증이 나오는 동안 이 화면을 둔다
           onTimeout: goHome,
           localeCode: 'ko',
         })
