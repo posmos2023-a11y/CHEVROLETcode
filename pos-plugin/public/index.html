@@ -123,6 +123,17 @@
     box-shadow: 0 0 0 3px #fff5dc;
   }
 
+  .connection-banner {
+    margin: 0 16px 12px;
+    padding: 12px 16px;
+    border-radius: 12px;
+    background: var(--red-soft);
+    color: var(--red);
+    font-size: 14px;
+    font-weight: 700;
+    line-height: 1.5;
+  }
+
   .connection-dot.error {
     background: var(--red);
     box-shadow: 0 0 0 3px var(--red-soft);
@@ -454,6 +465,8 @@
   .settled-status.pending { background: #fff5dc; color: #8a6100; }
   .settled-status.paying { background: #f3ecff; color: #6b3fd4; }
   .settled-status.refunded { background: var(--red-soft); color: var(--red); }
+  /* 프론트에서 취소 중이 10분 넘게 풀리지 않는 건(settledCarts.js [취소 중 풀기]) */
+  .settled-status.stuck { background: var(--red-soft); color: var(--red); }
 
   .settled-verified {
     display: inline-flex;
@@ -487,6 +500,10 @@
   .settled-action.danger { color: var(--red); }
   .settled-action:disabled { opacity: 0.5; cursor: wait; }
   .settled-action.confirming { border-color: var(--red); background: var(--red); color: #fff; }
+  /* 확인 문구가 긴 버튼(담기 취소·취소 중 풀기): 한 줄에 안 들어가면 줄바꿈하고 위아래를 띄운다 */
+  .settled-action.wrap { padding-top: 8px; padding-bottom: 8px; line-height: 1.35; }
+  /* SDK 시간 초과처럼 결과를 모르는 상태의 안내 */
+  .settled-warn { color: #8a6100; font-weight: 700; }
   /* 정리 버튼 줄(영수증·숨기기·삭제). 결제 취소 줄보다 작게 해 실수로 누르지 않게 한다. */
   .settled-tools .settled-action { min-height: 40px; font-size: 12px; color: var(--sub); }
   .settled-tools .settled-action.danger { color: var(--red); }
@@ -1384,6 +1401,9 @@
           <span id="store-name">매장 확인 중</span>
         </div>
       </header>
+      <div class="connection-banner" id="connection-banner" role="alert" hidden>
+        서버에 연결되지 않습니다. 인터넷 연결을 확인해주세요. 연결될 때까지 새 예약과 전산 주문이 보이지 않습니다.
+      </div>
 
       <div class="shell">
         <!-- 좌측 메뉴. 화면이 좁으면(세로 태블릿 등) 가로 탭 줄로 바뀐다 — POS 단말기 크기가
@@ -1524,7 +1544,7 @@
                 <p>기간을 정하면 그 기간에 방문한 손님 중 광고 수신에 동의한 분께 홍보 문자를 보냅니다</p>
               </div>
             </div>
-            <div class="settings-card promo-demo-card" id="promo-demo-card">
+            <div class="settings-card promo-demo-card" id="promo-demo-card" hidden>
               <div class="promo-demo-row">
                 <div>
                   <h3 class="promo-optout-title">시연 모드</h3>

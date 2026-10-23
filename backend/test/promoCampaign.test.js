@@ -297,9 +297,12 @@ testSerial('발송: 확실한 실패는 failed로 남아 나중에 다시 보낼
   const record = await prisma.promoSend.findFirst({ where: { storeId: store.id } })
   assert.equal(record.status, 'failed')
 
-  // 30일 제한에는 들어가지 않는다(미리보기에서 다시 대상)
+  // 30일 제한에는 들어가지 않지만, 30분 동안은 "보낼 수 있음"에 세지 않고 방금 실패로 표시한다
   const retry = await preview(token, period)
-  assert.equal(retry.body.eligible, 1)
+  assert.equal(retry.body.eligible, 0)
+  assert.equal(retry.body.filterCounts.eligible, 0)
+  assert.equal(retry.body.rows[0].status, 'ok')
+  assert.equal(retry.body.rows[0].recentFailure, true)
 
   // 하지만 이어 보내기에서는 방금 실패한 번호를 다시 시도하지 않는다
   const again = await send(token, { ...period, confirmCount: 0 })
@@ -478,6 +481,7 @@ function duePayment(store, phone, overrides = {}) {
 }
 
 testSerial('자동 홍보: 보내면 PromoSend(auto)를 남겨 다른 경로의 30일 제한에 걸린다', async () => {
+  if (!isDaytimeKst()) return // 자동 홍보도 야간에는 보내지 않는다
   const { sendDuePromotions } = require('../server')
   const store = await createStore('auto-ok')
   const p = await duePayment(store, '01020200001')
@@ -492,6 +496,7 @@ testSerial('자동 홍보: 보내면 PromoSend(auto)를 남겨 다른 경로의 
 })
 
 testSerial('자동 홍보: 수신거부한 번호는 보내지 않고 "보내지 않음"으로 닫는다', async () => {
+  if (!isDaytimeKst()) return
   const { sendDuePromotions } = require('../server')
   const store = await createStore('auto-optout')
   const p = await duePayment(store, '01020210001')
@@ -505,6 +510,7 @@ testSerial('자동 홍보: 수신거부한 번호는 보내지 않고 "보내지
 })
 
 testSerial('자동 홍보: 최근 방문에서 동의하지 않았으면 보내지 않는다', async () => {
+  if (!isDaytimeKst()) return
   const { sendDuePromotions } = require('../server')
   const store = await createStore('auto-latest')
   await duePayment(store, '01020220001')
@@ -515,6 +521,7 @@ testSerial('자동 홍보: 최근 방문에서 동의하지 않았으면 보내�
 })
 
 testSerial('자동 홍보: 30일 안에 다른 경로로 받았으면 30일이 끝날 때까지 미룬다', async () => {
+  if (!isDaytimeKst()) return
   const { sendDuePromotions } = require('../server')
   const store = await createStore('auto-postpone')
   const p = await duePayment(store, '01020230001')
@@ -529,6 +536,7 @@ testSerial('자동 홍보: 30일 안에 다른 경로로 받았으면 30일이 �
 })
 
 testSerial('자동 홍보: 결과를 모르는 실패는 다시 보내지 않고, 확실한 실패는 다음에 다시 보낸다', async () => {
+  if (!isDaytimeKst()) return
   const { sendDuePromotions } = require('../server')
   const store = await createStore('auto-fail')
   const a = await duePayment(store, '01020240001')
@@ -544,6 +552,58 @@ testSerial('자동 홍보: 결과를 모르는 실패는 다시 보내지 않고
   const rowB = await prisma.payment.findUnique({ where: { id: b.id } })
   assert.equal(rowB.promoSent, false)
   assert.equal(rowB.promoClaimedAt, null)
+})
+
+testSerial('자동 홍보: 야간에는 아무것도 잡지 않고 끝낸다(야간에 실행될 때만 확인)', async () => {
+  if (isDaytimeKst()) return
+  const { sendDuePromotions } = require('../server')
+  const store = await createStore('auto-night')
+  const p = await duePayment(store, '01020250001')
+  const result = await sendDuePromotions()
+  assert.equal(result.stopped, 'night', JSON.stringify(result))
+  assert.equal(promoCalls.length, 0)
+  const row = await prisma.payment.findUnique({ where: { id: p.id } })
+  assert.equal(row.promoSent, false)
+  assert.equal(row.promoClaimedAt, null)
+})
+
+testSerial('자동 홍보: 취소된 결제에는 보내지 않는다', async () => {
+  if (!isDaytimeKst()) return
+  const { sendDuePromotions } = require('../server')
+  const store = await createStore('auto-cancelled')
+  const p = await duePayment(store, '01020260001', { status: 'cancelled' })
+  await sendDuePromotions()
+  assert.equal(promoCalls.length, 0)
+  const row = await prisma.payment.findUnique({ where: { id: p.id } })
+  assert.equal(row.promoClaimedAt, null)
+})
+
+testSerial('자동 홍보: 보낸 뒤 같은 번호의 곧 차례가 올 결제는 닫고, 30일 뒤의 결제는 남긴다', async () => {
+  if (!isDaytimeKst()) return
+  const { sendDuePromotions } = require('../server')
+  const store = await createStore('auto-sibling')
+  await duePayment(store, '01020270001')
+  const soon = await duePayment(store, '01020270001', { promoAt: new Date(Date.now() + 5 * DAY) })
+  const later = await duePayment(store, '01020270001', { promoAt: new Date(Date.now() + 60 * DAY) })
+  const result = await sendDuePromotions()
+  assert.equal(result.sent, 1, JSON.stringify(result))
+  const soonRow = await prisma.payment.findUnique({ where: { id: soon.id } })
+  assert.equal(soonRow.promoSent, true)
+  assert.equal(soonRow.promoSentAt, null)
+  const laterRow = await prisma.payment.findUnique({ where: { id: later.id } })
+  assert.equal(laterRow.promoSent, false)
+})
+
+testSerial('자동 홍보: 시연 모드여도 30일 제한을 그대로 건다', async () => {
+  if (!isDaytimeKst()) return
+  const { sendDuePromotions } = require('../server')
+  const store = await createStore('auto-demo')
+  await prisma.store.update({ where: { id: store.id }, data: { promoDemoUntil: new Date(Date.now() + 3600 * 1000) } })
+  await duePayment(store, '01020280001')
+  await prisma.promoSend.create({ data: { storeId: store.id, phone: '01020280001', sentAt: new Date(Date.now() - DAY) } })
+  const result = await sendDuePromotions()
+  assert.equal(result.skipped, 1, JSON.stringify(result))
+  assert.equal(promoCalls.length, 0)
 })
 
 testSerial('수동 홍보: 기간 발송으로 같은 번호에 보냈으면 다른 차여도 30일 동안 막는다', async () => {
@@ -659,43 +719,39 @@ function posDemo(store, enabled) {
   return request(app).post('/api/pos/promo/demo-mode').set('X-Store-Token', store.posToken).send({ enabled })
 }
 
-testSerial('시연 모드: 탭앱에서 켜면 그날 자정까지 30일 제한이 꺼져 같은 번호로 다시 보낼 수 있다', async () => {
+testSerial('시연 모드: 탭앱에서는 켤 수 없고, 본사가 켜면 그날 자정까지 차량별 수동 발송만 30일 제한이 풀린다', async () => {
   if (!isDaytimeKst()) return
   const store = await createStore('demo')
   await visit(store, { phone: '01022220009', daysAgo: 2 })
   await prisma.promoSend.create({ data: { storeId: store.id, phone: '01022220009', sentAt: new Date(Date.now() - 60 * 1000) } })
 
-  const before = await posPreview(store, { from: kstDate(-7), to: kstDate(0) })
-  assert.equal(before.body.eligible, 0)
-  assert.equal(before.body.demoMode, false)
+  const denied = await posDemo(store, true)
+  assert.equal(denied.status, 403, JSON.stringify(denied.body))
 
-  const on = await posDemo(store, true)
+  const { token } = await adminToken('hq_admin')
+  const on = await request(app).post('/api/admin/promo-demo-mode').set('Authorization', `Bearer ${token}`).send({ storeId: store.id, enabled: true })
   assert.equal(on.status, 200, JSON.stringify(on.body))
   assert.equal(on.body.demoMode, true)
   const until = new Date(on.body.demoUntil)
   assert.equal(new Date(until.getTime() + 9 * 3600 * 1000).toISOString().slice(11, 19), '00:00:00') // KST 자정
   assert.ok(until.getTime() > Date.now())
 
+  // 기간 발송은 시연 모드여도 30일 제한 그대로
   const after = await posPreview(store, { from: kstDate(-7), to: kstDate(0) })
-  assert.equal(after.body.eligible, 1)
-  assert.equal(after.body.minIntervalDays, 0)
+  assert.equal(after.body.eligible, 0)
+  assert.equal(after.body.minIntervalDays, 30)
   assert.equal(after.body.demoMode, true)
 
-  // 연달아 두 번 보낼 수 있다
-  for (let i = 0; i < 2; i += 1) {
-    const res = await posSend(store, { from: kstDate(-7), to: kstDate(0), confirmCount: 1 })
-    assert.equal(res.body.sent, 1, JSON.stringify(res.body))
-  }
-  assert.equal(promoCalls.length, 2)
-
-  // 수동(차량별) 발송도 30일 제한 없이 나간다
+  // 차량별 수동 발송은 30일 제한 없이 나간다
   const manual = await request(app).post('/api/pos/promo/send').set('X-Store-Token', store.posToken).send({ carNumber: '12가3456' })
   assert.equal(manual.status, 200, JSON.stringify(manual.body))
 
+  // 탭앱에서 끌 수는 있다. 끄면 수동 발송도 다시 막힌다
   const off = await posDemo(store, false)
+  assert.equal(off.status, 200, JSON.stringify(off.body))
   assert.equal(off.body.demoMode, false)
-  const back = await posPreview(store, { from: kstDate(-7), to: kstDate(0) })
-  assert.equal(back.body.eligible, 0)
+  const blocked = await request(app).post('/api/pos/promo/send').set('X-Store-Token', store.posToken).send({ carNumber: '12가3456' })
+  assert.notEqual(blocked.status, 200, JSON.stringify(blocked.body))
 })
 
 testSerial('시연 모드: 끝나는 시각이 지나면 저절로 꺼진다', async () => {
@@ -714,24 +770,32 @@ testSerial('시연 모드: 수신거부·미동의는 시연 모드에서도 빠
   await visit(store, { phone: '01022220011', daysAgo: 2 })
   await visit(store, { phone: '01022220012', daysAgo: 2, marketing: false })
   await posOptOut(store, '01022220011')
-  await posDemo(store, true)
+  await prisma.store.update({ where: { id: store.id }, data: { promoDemoUntil: new Date(Date.now() + 3600 * 1000) } })
   const res = await posPreview(store, { from: kstDate(-7), to: kstDate(0) })
   assert.equal(res.body.eligible, 0)
   assert.equal(res.body.excluded.optedOut, 1)
   assert.equal(res.body.excluded.noConsent, 1)
 })
 
-testSerial('시연 모드: 잘못된 값은 400, 토큰 없으면 401, 관리자 웹은 매장 관리자면 자기 매장만', async () => {
+testSerial('시연 모드: 잘못된 값은 400, 토큰 없으면 401, 매장 관리자는 켤 수 없고 자기 매장만 끈다', async () => {
   const store = await createStore('demo-auth')
   const other = await createStore('demo-auth-other')
   assert.equal((await request(app).post('/api/pos/promo/demo-mode').set('X-Store-Token', store.posToken).send({ enabled: 'yes' })).status, 400)
   assert.equal((await request(app).post('/api/pos/promo/demo-mode').send({ enabled: true })).status, 401)
 
   const { token } = await adminToken('store_admin', store)
-  const res = await request(app).post('/api/admin/promo-demo-mode').set('Authorization', `Bearer ${token}`).send({ storeId: other.id, enabled: true })
-  assert.equal(res.status, 200, JSON.stringify(res.body))
-  assert.ok((await prisma.store.findUnique({ where: { id: store.id } })).promoDemoUntil)
-  assert.equal((await prisma.store.findUnique({ where: { id: other.id } })).promoDemoUntil, null)
+  const denied = await request(app).post('/api/admin/promo-demo-mode').set('Authorization', `Bearer ${token}`).send({ storeId: store.id, enabled: true })
+  assert.equal(denied.status, 403, JSON.stringify(denied.body))
+  assert.equal((await prisma.store.findUnique({ where: { id: store.id } })).promoDemoUntil, null)
+
+  const soon = new Date(Date.now() + 3600 * 1000)
+  await prisma.store.update({ where: { id: store.id }, data: { promoDemoUntil: soon } })
+  await prisma.store.update({ where: { id: other.id }, data: { promoDemoUntil: soon } })
+  // storeId에 다른 매장을 넣어도 매장 관리자는 자기 매장만 바뀐다
+  const off = await request(app).post('/api/admin/promo-demo-mode').set('Authorization', `Bearer ${token}`).send({ storeId: other.id, enabled: false })
+  assert.equal(off.status, 200, JSON.stringify(off.body))
+  assert.equal((await prisma.store.findUnique({ where: { id: store.id } })).promoDemoUntil, null)
+  assert.ok((await prisma.store.findUnique({ where: { id: other.id } })).promoDemoUntil)
   assert.equal((await request(app).post('/api/admin/promo-demo-mode').send({ storeId: store.id, enabled: true })).status, 401)
 })
 

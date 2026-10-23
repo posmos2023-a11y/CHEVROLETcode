@@ -114,6 +114,17 @@ function kstDateRangeUtc(dateStr) {
 // 항상 제외한다. peopleAhead 계산과 POS 대기열 조회가 이 규칙을 공유한다.
 const CLOSED_RESERVATION_STATUSES = ['completed', 'cancelled']
 
+// 전산 주문을 예약과 이을 때 "오늘 접수분" 말고 함께 보는 이월 예약의 범위. 호출까지 끝났지만 다음 날로 넘어온 건
+// (POS 대기열이 이월 건으로 보여주는 상태와 같다)만 대상이고, 어제 waiting은 노쇼로 보고 제외한다.
+const CARRYOVER_RESERVATION_STATUSES = ['called', 'notify_failed']
+const CARRYOVER_LOOKBACK_DAYS = 2
+
+// KST 'YYYY-MM-DD' 문자열에서 days일 전 날짜 문자열. serviceDate가 문자열 컬럼이라 날짜 비교도 문자열로 한다
+// (같은 자리수의 ISO 날짜라 사전순 = 시간순).
+function kstDateBefore(dateStr, days) {
+  return kstDateString(new Date(kstDayStartUtc(dateStr).getTime() - days * 24 * 60 * 60 * 1000))
+}
+
 // Plan SC: FR-07 — 최초 부팅 시 본사(hq_admin) 계정이 하나도 없으면 자동 생성한다.
 // 비밀번호는 ADMIN_BOOTSTRAP_PASSWORD가 있으면 그 값을, 없으면 무작위로 생성해 콘솔에 한 번만 출력한다.
 async function ensureDefaultHqAdmin() {
@@ -511,7 +522,9 @@ async function listPaymentsPage({ storeId, dateStart, dateEnd, statuses, q, limi
   const where = {
     ...(storeId ? { storeId } : {}),
     ...(dateStart && dateEnd ? { createdAt: { gte: dateStart, lt: dateEnd } } : {}),
-    ...(statuses && statuses.length ? { status: { in: statuses } } : {}),
+    // erp_linked: 웹훅이 먼저 와서 만든 백업 행인데 전산 주문과 이어진 것이다. 같은 돈이 전산 주문 쪽에 이미 있으므로
+    // 상태를 직접 고르지 않는 한 목록에서 뺀다(요약 집계와 같은 기준).
+    ...(statuses && statuses.length ? { status: { in: statuses } } : { status: { not: 'erp_linked' } }),
     ...(buildSearchOr(q) || {}),
   }
   const [total, items] = await Promise.all([
@@ -793,6 +806,8 @@ async function claimDuePromotions(limit = 100) {
     where: {
       promoSent: false,
       promoAt: { lte: now },
+      // 취소된 결제는 방문이 없던 것으로 본다 -- 결제를 취소한 손님에게 3개월 뒤 광고가 가면 안 된다.
+      status: { not: 'cancelled' },
       phone: { not: null, notIn: [''] },
       marketingConsentAt: { not: null },
       OR: [{ promoClaimedAt: null }, { promoClaimedAt: { lt: staleBefore } }],
@@ -835,10 +850,14 @@ async function markPromoSent(id) {
   }
 }
 
-async function releasePromoClaim(id) {
+// claimedAt: claimDuePromotions가 잡은 시각(payment.promoClaimedAt). 주면 그 claim이 아직 내 것일 때만 바꾼다 --
+// 실행이 10분 넘게 걸려 다른 실행이 다시 잡은 건을 옛 실행이 풀거나 미루면 같은 결제의 광고가 또 나갈 수 있다.
+const ownedClaim = (claimedAt) => (claimedAt ? { promoClaimedAt: claimedAt } : {})
+
+async function releasePromoClaim(id, claimedAt) {
   try {
     await prisma.payment.updateMany({
-      where: { id, promoSent: false },
+      where: { id, promoSent: false, ...ownedClaim(claimedAt) },
       data: { promoClaimedAt: null },
     })
   } catch {
@@ -848,10 +867,10 @@ async function releasePromoClaim(id) {
 
 // 자동 홍보를 보내지 않고 끝낸다(수신거부·최근 방문에서 미동의·동의 2년 경과). promoSent는 true로
 // 두되 promoSentAt은 비워 "처리했지만 보내지 않음"을 남긴다 -- 다시 claim되지 않게 하려는 것이다.
-async function skipDuePromotion(id) {
+async function skipDuePromotion(id, claimedAt) {
   try {
     await prisma.payment.updateMany({
-      where: { id, promoSent: false },
+      where: { id, promoSent: false, ...ownedClaim(claimedAt) },
       data: { promoSent: true, promoClaimedAt: null },
     })
   } catch {
@@ -860,14 +879,36 @@ async function skipDuePromotion(id) {
 }
 
 // 30일 안에 다른 경로로 광고를 받은 번호면 자동 홍보를 그 30일이 끝날 때까지 미룬다.
-async function postponeDuePromotion(id, until) {
+async function postponeDuePromotion(id, until, claimedAt) {
   try {
     await prisma.payment.updateMany({
-      where: { id, promoSent: false },
+      where: { id, promoSent: false, ...ownedClaim(claimedAt) },
       data: { promoAt: until, promoClaimedAt: null },
     })
   } catch {
     // releasePromoClaim과 같은 이유로 삼킨다.
+  }
+}
+
+// 자동 홍보를 한 번 보낸 뒤, 같은 매장·같은 번호의 다른 결제(분할 결제, 취소 후 재결제 등 같은 방문)가 곧
+// 차례가 오면 닫는다. 안 닫으면 그 결제가 30일 제한에 걸려 미뤄졌다가 30일 뒤 같은 방문 광고가 또 나간다.
+// horizonDays 안에 차례가 오는 것만 닫는다 -- 그보다 뒤의 결제는 다른 방문이라 그때 따로 보낸다.
+async function closeSiblingDuePromotions(storeId, phone, exceptId, horizonDays) {
+  try {
+    const result = await prisma.payment.updateMany({
+      where: {
+        storeId,
+        phone,
+        id: { not: exceptId },
+        promoSent: false,
+        promoAt: { lte: new Date(Date.now() + horizonDays * 24 * 60 * 60 * 1000) },
+      },
+      data: { promoSent: true, promoClaimedAt: null },
+    })
+    return result.count
+  } catch {
+    // 못 닫으면 그 결제가 30일 제한에 걸려 미뤄진다(지금까지와 같은 동작).
+    return 0
   }
 }
 
@@ -1004,6 +1045,18 @@ function createErpCart({ storeId, referenceId, itemsJson, totalAmount, memo, aut
     refundRequestedAt: null,
     refundedAt: null,
     refundNote: null,
+    // 같은 referenceId로 행을 다시 쓰는 재전송이라, 이전 주문이 남긴 정리·시도 흔적도 함께 지운다. 안 지우면 예전에
+    // 숨긴/삭제한 주문이 새 주문인데도 탭앱에서 안 보이고, 옛 시도 구분자가 새 주문의 늦은 요청 판정을 흐린다.
+    hiddenAt: null,
+    deletedAt: null,
+    receiptStatus: null,
+    frontReleasedKey: null,
+    refundAttemptId: null,
+    refundReleasedAttemptId: null,
+    refundStartedAt: null,
+    consumeAttemptId: null,
+    // 프론트의 "2분 쉬기" 열쇠. 프론트 결제로 처음부터 들어온 건은 이 시각이 곧 "프론트로 보낸 시각"이다.
+    frontSentAt: payTarget === 'front' ? new Date() : null,
   }
   return prisma.erpCart.upsert({
     where: { referenceId },
@@ -1065,10 +1118,56 @@ function listFrontErpCartsForPos(storeId, limit) {
 // 프론트가 결제창을 띄우기 직전에 이 주문을 "결제 중"으로 잡는다. pending -> paying 전이가
 // 원자적이라 프론트가 두 대여도 한 대만 잡는다(나머지는 count 0을 받는다).
 // paymentKey를 함께 박아두고, 이후 결과 보고는 이 값이 맞을 때만 받는다.
+// frontReleasedKey가 이 키와 같으면 거절한다 -- 프론트가 이미 "이 키는 포기"라고 알린 /start가 늦게 도착한 경우다.
+// OR로 쓴 이유: { not: paymentKey }만 쓰면 SQL에서 NULL <> 'x'가 NULL이라 묘비가 없는(NULL) 행이 통째로 빠져
+// 평범한 /start가 전부 거절된다.
 async function markErpCartFrontPaying(id, storeId, paymentKey) {
   const result = await prisma.erpCart.updateMany({
-    where: { id, storeId, payTarget: 'front', status: 'pending' },
+    where: {
+      id, storeId, payTarget: 'front', status: 'pending',
+      OR: [{ frontReleasedKey: null }, { frontReleasedKey: { not: paymentKey } }],
+    },
     data: { status: 'paying', frontPaymentKey: paymentKey, frontPayingAt: new Date(), errorMessage: null },
+  })
+  return result.count > 0
+}
+
+// /start보다 먼저 도착한 cancelled/failed 보고를 기록한다(묘비). pending일 때만 -- 이미 paying이 됐다면 호출부가
+// releaseErpCartFrontPaying으로 정상 해제해야 한다. 반환: 기록됐는지.
+async function tombstoneErpCartFrontKey(id, paymentKey) {
+  const result = await prisma.erpCart.updateMany({
+    where: { id, status: 'pending' },
+    data: { frontReleasedKey: paymentKey },
+  })
+  return result.count > 0
+}
+
+// 직원이 10분 넘게 갇힌 결제 중/취소 중을 푸는 비상구(POST /api/pos/erp-carts/:id/force-release)가 쓰는 기준 시간.
+// 정상 결제·취소는 카드 단말 조작을 포함해도 몇 분 안에 끝난다. 이보다 짧으면 지금 막 결제하는 손님의 주문을 직원이
+// 풀어 이중결제가 날 수 있고, 너무 길면 갇힌 매장이 영업 중에 기다려야 한다.
+const FORCE_RELEASE_AFTER_MS = 10 * 60 * 1000
+
+// 갇힌 프론트 결제 중(paying)을 pending으로 푼다. 옛 paymentKey를 frontReleasedKey에 남겨 그 키의 늦은 /start·/result가
+// 다시 이 주문을 잡거나 덮지 못하게 한다. 늦은 'paid' 보고는 markErpCartFrontPaid가 거절하고 호출부가 대사 필요로 남긴다.
+// frontPaymentKey까지 where에 넣어, 읽은 뒤 다른 시도가 끼어든 경우를 건드리지 않는다.
+async function forceReleaseErpCartFrontPaying(id, storeId, paymentKey, note) {
+  const result = await prisma.erpCart.updateMany({
+    where: { id, storeId, status: 'paying', frontPaymentKey: paymentKey },
+    data: { status: 'pending', frontPaymentKey: null, frontPayingAt: null, frontReleasedKey: paymentKey, errorMessage: note },
+  })
+  return result.count > 0
+}
+
+// 갇힌 프론트 취소 중(refunding)을 paid로 푼다. 옛 attemptId를 refundReleasedAttemptId에 남겨 그 시도의 늦은 refund-start가
+// 다시 잡지 못하게 한다. (이미 카드 취소가 끝났다면 토스 취소 웹훅이 refunded로 맞춘다.)
+async function forceReleaseErpCartRefunding(id, storeId, attemptId, note) {
+  const result = await prisma.erpCart.updateMany({
+    where: { id, storeId, status: 'refunding', refundAttemptId: attemptId ?? null },
+    data: {
+      status: 'paid', refundRequestedAt: null, refundStartedAt: null, errorMessage: note,
+      // 옛 프론트가 잡은 취소(attemptId 없음)면 이전에 접은 시도의 기록을 지우지 않는다.
+      ...(attemptId ? { refundReleasedAttemptId: attemptId } : {}),
+    },
   })
   return result.count > 0
 }
@@ -1085,10 +1184,12 @@ async function releaseErpCartFrontPaying(id, paymentKey, errorMessage) {
 }
 
 // 프론트에서 승인이 끝났다는 보고. paying + 같은 paymentKey일 때만 paid로 넘긴다.
+// deletedAt을 함께 비우는 이유: 결제 전(담김·결제 중)에 정비 이력 삭제로 숨겨진 주문이라도 실제로 돈이 나갔다면
+// 탭앱·집계에 다시 보여야 한다(안 보이면 아무도 모르는 결제가 된다). 호출부가 되살렸다는 로그를 남긴다.
 async function markErpCartFrontPaid(id, paymentKey, paymentJson, approvalNo) {
   const result = await prisma.erpCart.updateMany({
     where: { id, status: 'paying', frontPaymentKey: paymentKey },
-    data: { status: 'paid', paidAt: new Date(), frontPaymentJson: paymentJson ?? null, frontApprovalNo: approvalNo ?? null },
+    data: { status: 'paid', paidAt: new Date(), frontPaymentJson: paymentJson ?? null, frontApprovalNo: approvalNo ?? null, deletedAt: null },
   })
   return result.count > 0
 }
@@ -1126,11 +1227,34 @@ async function recordTossPayment(payment, storeId) {
     approvedAt: toDateOrNull(payment.approvedAt),
     cancelledAt: toDateOrNull(payment.cancelledAt),
   }
+  const id = String(payment.id)
+  // 이미 취소된 결제는 state·cancelledAt을 지키고 나머지만 갱신한다. 토스가 늦게 재전송한 '승인' 웹훅이 upsert로
+  // CANCELLED를 APPROVED로 되돌리면, 취소된 결제를 이은 주문이 승인된 결제로 보이고 이후 보고에서도 취소를 놓친다.
+  // 읽고 쓰는 두 단계 대신 조건부 UPDATE 한 번으로 해서 취소 웹훅과 겹쳐도 되돌려지지 않게 한다.
+  const { state, cancelledAt, ...withoutCancel } = data
+  const keptCancelled = await prisma.tossPayment.updateMany({
+    where: { id, OR: [{ state: 'CANCELLED' }, { cancelledAt: { not: null } }] },
+    data: withoutCancel,
+  })
+  if (keptCancelled.count) return prisma.tossPayment.findUnique({ where: { id } })
   return prisma.tossPayment.upsert({
-    where: { id: String(payment.id) },
-    create: { id: String(payment.id), ...data },
+    where: { id },
+    create: { id, ...data },
     update: data,
   })
+}
+
+// 웹훅이 먼저 와서 전산 주문과 못 이은 채 Payment '백업 기록'(phone 없음, paymentKey = 토스 orderId)이 만들어졌는데
+// 나중에 POS 결제 통보·프론트 결과 보고로 같은 토스 결제가 전산 주문과 이어지면, 같은 돈이 Payment와 ErpCart 양쪽에서
+// 한 번씩 집계된다. 그 백업 기록을 'erp_linked'로 바꿔 관리자 요약(getDailySummary)에서 뺀다. 행은 지우지 않는다.
+// 손님이 직접 낸 결제는 phone이 있으므로 이 조건에 걸리지 않는다. 반환: 바꾼 행 수.
+async function markBackupPaymentErpLinked(tossPayment) {
+  if (!tossPayment?.orderId || !tossPayment.storeId) return 0
+  const result = await prisma.payment.updateMany({
+    where: { storeId: tossPayment.storeId, paymentKey: tossPayment.orderId, phone: null, status: { not: 'erp_linked' } },
+    data: { status: 'erp_linked' },
+  })
+  return result.count
 }
 
 // 토스 결제 하나에 이어질 전산 주문들을 찾아 잇는다. 이어진(또는 이미 이어져 있던) 주문 목록을 돌려준다.
@@ -1263,19 +1387,43 @@ async function withdrawErpCartRefund(id, storeId) {
 }
 
 // 프론트가 취소창을 띄우기 직전에 잡는다(두 대가 동시에 취소하지 않게).
-async function markErpCartRefunding(id, storeId) {
+// attemptId(옛 프론트는 없음)와 시작 시각을 함께 남긴다 -- 시작 시각은 직원이 갇힌 취소 중을 풀 수 있는 기준이고,
+// attemptId는 이후 refund-result가 "지금 쥐고 있는 시도"의 보고인지 가리는 열쇠다.
+async function markErpCartRefunding(id, storeId, attemptId) {
   const result = await prisma.erpCart.updateMany({
     where: { id, storeId, payTarget: 'front', status: 'refund_requested' },
-    data: { status: 'refunding' },
+    data: { status: 'refunding', refundAttemptId: attemptId ?? null, refundStartedAt: new Date() },
   })
   return result.count > 0
 }
 
-// 프론트 취소가 안 됐다(손님이 취소창을 닫음/카드 오류) -- 다시 요청 상태로.
-async function releaseErpCartRefunding(id, errorMessage) {
+// 프론트 취소가 안 됐다(손님이 취소창을 닫음/카드 오류/프론트 재시작) -- 돈은 그대로 나간 채이므로 paid로 돌린다.
+// 예전에는 refund_requested로 되돌렸는데, 그러면 프론트가 같은 취소를 계속 다시 가져가 취소창을 반복해 띄우고
+// 그 사이 결제 주문 처리까지 막혔다("갇힘"). paid로 두면 탭앱에서 직원이 다시 [프론트에서 취소]를 눌러야 새
+// refundRequestedAt으로 요청이 다시 뜬다. 사유는 errorMessage에 남아 탭앱에 보인다.
+// attemptId가 주어지면 다른 시도가 쥐고 있는 취소는 풀지 않고(호출부가 먼저 409로 거르지만 그 사이 끼어든 경우를 위해
+// where에도 둔다), 푼 시도를 refundReleasedAttemptId에 남겨 같은 시도의 늦은 refund-start 재시도가 다시 잡지 못하게 한다.
+async function releaseErpCartRefunding(id, errorMessage, attemptId) {
   const result = await prisma.erpCart.updateMany({
-    where: { id, status: 'refunding' },
-    data: { status: 'refund_requested', errorMessage: errorMessage ?? null },
+    where: {
+      id, status: 'refunding',
+      ...(attemptId ? { OR: [{ refundAttemptId: null }, { refundAttemptId: attemptId }] } : {}),
+    },
+    data: {
+      status: 'paid', refundRequestedAt: null, refundStartedAt: null,
+      errorMessage: errorMessage || '프론트 취소 중단',
+      ...(attemptId ? { refundReleasedAttemptId: attemptId } : {}),
+    },
+  })
+  return result.count > 0
+}
+
+// refunding이 아닌 상태(요청됨·결제 완료)에서 "이 시도는 접었다"는 보고가 먼저 도착했다. 같은 시도의 refund-start가
+// 시간 초과로 늦게 처리될 수 있어서, 시도를 기록해 두었다가 그 start를 거절한다.
+async function markErpCartRefundAttemptReleased(id, attemptId) {
+  const result = await prisma.erpCart.updateMany({
+    where: { id, status: { in: ['refund_requested', 'paid'] } },
+    data: { refundReleasedAttemptId: attemptId },
   })
   return result.count > 0
 }
@@ -1293,18 +1441,41 @@ async function markErpCartRefunded(id, storeId, fromStatuses, note) {
 // POS 탭앱 "오늘 결제" 목록: 결제 완료·취소 진행·취소된 전산 주문. 결제 취소 버튼을 여기서 누른다.
 // POS에 담았지만 아직 결제 전(loaded)인 주문도 함께 준다. 담는 순간 [전산 주문] 목록에서 빠지는데 결제 전까지
 // 탭앱 어디에도 안 보이면 직원이 "방금 담은 주문이 어디 갔지?" 하게 된다. 결제 전 건이 맨 위에 온다.
-function listSettledErpCartsForPos(storeId, since, limit) {
-  return prisma.erpCart.findMany({
-    where: {
-      storeId,
-      deletedAt: null,
-      OR: [
-        { status: { in: [...PAID_LIKE_STATUSES, 'refunded'] }, paidAt: { gte: since } },
-        { status: 'loaded', loadedAt: { gte: since } },
-      ],
-    },
-    orderBy: [{ paidAt: { sort: 'desc', nulls: 'first' } }, { loadedAt: 'desc' }],
-    take: limit,
+// 진행 중인 취소는 결제한 지 7일이 지났어도 늘 보인다. 기간 밖이라 목록에서 사라지면 직원이 "취소가 어떻게 됐지?"를
+// 확인할 곳도, 갇혔을 때 풀 곳(force-release)도 없어진다. 한 쿼리에 넣으면 paidAt이 오래된 그 건이 정렬 끝으로 가
+// take(limit)에 잘리므로 따로 가져와 합친다.
+async function listSettledErpCartsForPos(storeId, since, limit) {
+  const orderBy = [{ paidAt: { sort: 'desc', nulls: 'first' } }, { loadedAt: 'desc' }]
+  const [inProgress, recent] = await Promise.all([
+    prisma.erpCart.findMany({
+      where: { storeId, deletedAt: null, status: { in: ['refund_requested', 'refunding'] } },
+      orderBy,
+      take: limit,
+    }),
+    prisma.erpCart.findMany({
+      where: {
+        storeId,
+        deletedAt: null,
+        OR: [
+          { status: { in: [...PAID_LIKE_STATUSES, 'refunded'] }, paidAt: { gte: since } },
+          { status: 'loaded', loadedAt: { gte: since } },
+        ],
+      },
+      orderBy,
+      take: limit,
+    }),
+  ])
+  const byId = new Map([...inProgress, ...recent].map((c) => [c.id, c]))
+  const time = (d) => (d ? new Date(d).getTime() : null)
+  return [...byId.values()].sort((a, b) => {
+    const pa = time(a.paidAt)
+    const pb = time(b.paidAt)
+    if (pa === null || pb === null) {
+      if (pa !== pb) return pa === null ? -1 : 1
+      return (time(b.loadedAt) || 0) - (time(a.loadedAt) || 0)
+    }
+    if (pa !== pb) return pb - pa
+    return (time(b.loadedAt) || 0) - (time(a.loadedAt) || 0)
   })
 }
 
@@ -1313,10 +1484,24 @@ function listSettledErpCartsForPos(storeId, since, limit) {
 // 동시에 consume할 수 있어서, findUnique 후 update 2단계로 짜면 경쟁 조건이 생긴다(둘 다 pending을
 // 보고 둘 다 "내가 처리했다"고 응답할 수 있음). 이 원자적 updateMany 자체가 낙관적 잠금 역할을 해서
 // 딱 한쪽만 count:1을 받는다.
-async function markErpCartLoaded(id) {
+// attemptId(탭앱이 요청마다 만든 구분자, 옛 탭앱은 없음)를 함께 남겨, 응답을 못 받아 재시도한 탭앱이 "이미 loaded"를 받았을 때
+// 자기 첫 요청이 성공한 것인지 다른 단말기가 먼저 담은 것인지 가릴 수 있게 한다.
+async function markErpCartLoaded(id, attemptId) {
   const result = await prisma.erpCart.updateMany({
     where: { id, status: 'pending' },
-    data: { status: 'loaded', loadedAt: new Date() },
+    data: { status: 'loaded', loadedAt: new Date(), consumeAttemptId: attemptId ?? null },
+  })
+  return result.count > 0
+}
+
+// POS에 담은 주문(loaded)을 담기 전(pending)으로 되돌린다. 잘못 담았거나 POS 장바구니를 비운 경우 탭앱에서 다시 담을 수
+// 있게 한다. 결제 통보(paidAt)가 이미 있는 주문, 프론트 결제 건은 되돌리지 않는다.
+// 한계: POS 쪽에서 실제로는 결제를 마쳤는데 통보만 못 온 주문을 되돌리면 같은 주문이 한 번 더 결제될 수 있다 -- 그 경우
+// 늦게 도착한 결제 통보를 pending도 받게 해 두었다(markErpCartPaid).
+async function markErpCartUnloaded(id, storeId) {
+  const result = await prisma.erpCart.updateMany({
+    where: { id, storeId, status: 'loaded', payTarget: 'pos', paidAt: null },
+    data: { status: 'pending', loadedAt: null, consumeAttemptId: null },
   })
   return result.count > 0
 }
@@ -1339,6 +1524,9 @@ async function markErpCartFailed(id, errorMessage) {
 // 범위를 좁히는 조건들:
 //   - 같은 매장 (다른 매장에 같은 차가 있어도 무관하다)
 //   - 오늘 접수분 (serviceDate) — 같은 차가 며칠 뒤 또 와도 옛 예약에 붙지 않는다
+//     다만 밤새 맡긴 차처럼 어제·그제 접수해 아직 호출 이후 단계(called/notify_failed)에 있는 이월 예약은 오늘 접수분과
+//     같이 후보로 본다(POS 대기열도 이런 이월 건을 함께 보여준다). 안 보면 정비를 받은 차의 주문이 예약과 안 이어져
+//     결제해도 대기열에서 안 사라지고 영수증도 안 간다. 이월은 최근 2일로 한정해 오래 방치된 예약에 붙지 않게 한다.
 //   - 아직 끝나지 않은 건 (completed/cancelled 제외) — 이미 끝난 정비에 새 주문이 붙으면 안 된다
 // 표기 흔들림(공백·하이픈)은 호출부가 정규화해서 넘긴다.
 async function findOpenReservationByCarNumber(storeId, carNumber, serviceDate) {
@@ -1347,8 +1535,10 @@ async function findOpenReservationByCarNumber(storeId, carNumber, serviceDate) {
     where: {
       storeId,
       carNumber,
-      serviceDate,
-      status: { notIn: CLOSED_RESERVATION_STATUSES },
+      OR: [
+        { serviceDate, status: { notIn: CLOSED_RESERVATION_STATUSES } },
+        { serviceDate: { gte: kstDateBefore(serviceDate, CARRYOVER_LOOKBACK_DAYS), lt: serviceDate }, status: { in: CARRYOVER_RESERVATION_STATUSES } },
+      ],
     },
     orderBy: { createdAt: 'desc' },
     take: 2, // 2건만 가져오면 "정확히 1건인가"를 판정하기에 충분하다
@@ -1358,12 +1548,13 @@ async function findOpenReservationByCarNumber(storeId, carNumber, serviceDate) {
 
 // --- 탭앱 정리(숨기기·삭제) ---------------------------------------------------------------
 // 결제가 끝난(또는 취소된) 전산 주문만 대상이다. 결제 취소가 진행 중(refund_requested/refunding)인 건은
-// 삭제하면 프론트가 취소를 끝내도 화면에서 확인할 곳이 없어지므로 막는다(숨기기는 된다).
+// 삭제는 물론 숨기기도 막는다 -- 숨기면 프론트가 취소를 끝내도(또는 갇혀도) 화면에서 확인하고 풀 곳이 없어진다.
+// (예전에는 숨기기만 허용했는데, 숨긴 채 갇힌 취소를 아무도 못 찾았다.)
 const CLEANUP_STATUSES = ['paid', 'refunded']
 
 async function setErpCartHidden(storeId, id, hidden) {
   const result = await prisma.erpCart.updateMany({
-    where: { id, storeId, deletedAt: null, status: { in: [...CLEANUP_STATUSES, 'refund_requested', 'refunding'] } },
+    where: { id, storeId, deletedAt: null, status: { in: CLEANUP_STATUSES } },
     data: { hiddenAt: hidden ? new Date() : null },
   })
   return result.count > 0
@@ -1378,25 +1569,30 @@ async function softDeleteErpCart(storeId, id) {
 }
 
 // 정비 이력에서 한 방문을 숨긴다. 예약 방문이면 그 예약과 거기 이어진 전산 주문을 함께 숨긴다.
+// 주문은 결제가 끝난(paid/refunded) 것만 숨긴다 -- 결제 전·진행 중 주문까지 숨기면 탭앱 [최근 결제]에서 사라져
+// 직원이 그 주문을 끝낼(결제·취소 확인) 곳을 잃는다. 숨기기는 되돌릴 수 있어도 사라진 줄 모르면 못 되돌린다.
 async function hideHistoryVisit(storeId, { reservationId, cartId }) {
   let count = 0
   if (reservationId) {
     const r = await prisma.reservation.updateMany({ where: { id: reservationId, storeId }, data: { historyHiddenAt: new Date() } })
     count += r.count
-    if (r.count) await prisma.erpCart.updateMany({ where: { storeId, reservationId, hiddenAt: null }, data: { hiddenAt: new Date() } })
+    if (r.count) await prisma.erpCart.updateMany({ where: { storeId, reservationId, hiddenAt: null, status: { in: CLEANUP_STATUSES } }, data: { hiddenAt: new Date() } })
   }
   if (cartId) {
-    const c = await prisma.erpCart.updateMany({ where: { id: cartId, storeId }, data: { hiddenAt: new Date() } })
+    const c = await prisma.erpCart.updateMany({ where: { id: cartId, storeId, status: { in: CLEANUP_STATUSES } }, data: { hiddenAt: new Date() } })
     count += c.count
   }
   return count > 0
 }
 
-// 정비 이력에서 한 방문을 삭제한다. 예약 방문이면 그 예약을 이력에서 빼고, 거기 이어진 전산 주문(담김·결제·취소됨)도
+// 정비 이력에서 한 방문을 삭제한다. 예약 방문이면 그 예약을 이력에서 빼고, 거기 이어진 전산 주문(결제·취소됨)도
 // 함께 삭제한다(최근 결제·오늘 현황·관리자 목록에서도 빠진다). 주문만 있는 방문이면 그 주문을 삭제한다.
-// 결제 취소가 진행 중인 주문이 섞여 있으면 아무것도 바꾸지 않는다(취소 결과를 확인할 곳이 없어진다).
+// 아직 결제가 끝나지 않았거나(pending/loaded/paying) 결제 취소가 진행 중인 주문이 섞여 있으면 아무것도 바꾸지 않는다
+// (결제·취소 결과를 확인할 곳이 없어진다). 'loaded'를 삭제 대상에서 뺀 이유: 담기만 하고 결제 전인 주문을 지우면
+// 그 뒤에 도착한 결제 통보가 집계에서 빠진 채 돈만 나간 주문이 된다.
 // 행은 지우지 않는다(softDeleteErpCart와 같은 이유). 반환: 'ok' | 'not_found' | 'refund_in_progress'
-const HISTORY_DELETABLE_CART_STATUSES = ['loaded', 'paid', 'refunded']
+const HISTORY_DELETABLE_CART_STATUSES = ['paid', 'refunded']
+const HISTORY_BUSY_CART_STATUSES = ['pending', 'loaded', 'paying', 'refund_requested', 'refunding']
 
 async function deleteHistoryVisit(storeId, { reservationId, cartId }) {
   return prisma.$transaction(async (tx) => {
@@ -1404,7 +1600,7 @@ async function deleteHistoryVisit(storeId, { reservationId, cartId }) {
     if (reservationId) {
       const reservation = await tx.reservation.findFirst({ where: { id: reservationId, storeId } })
       if (!reservation) return 'not_found'
-      const busy = await tx.erpCart.count({ where: { storeId, reservationId, status: { in: ['refund_requested', 'refunding', 'paying'] }, deletedAt: null } })
+      const busy = await tx.erpCart.count({ where: { storeId, reservationId, status: { in: HISTORY_BUSY_CART_STATUSES }, deletedAt: null } })
       if (busy) return 'refund_in_progress'
       await tx.reservation.update({ where: { id: reservationId }, data: { historyHiddenAt: now } })
       await tx.erpCart.updateMany({ where: { storeId, reservationId, deletedAt: null, status: { in: HISTORY_DELETABLE_CART_STATUSES } }, data: { deletedAt: now } })
@@ -1423,10 +1619,19 @@ async function deleteHistoryVisit(storeId, { reservationId, cartId }) {
 // 흐름이 가장 흔한데, 그때는 안 끝난 예약이 없어서 영수증 번호를 못 찾았다.
 // 애매하면 잇지 않는 원칙은 같다: 안 끝난 예약이 정확히 1건이면 그것, 안 끝난 예약이 없고 오늘 끝난 예약이
 // 정확히 1건이면 그것, 그 밖(같은 차가 오늘 두 번 온 경우 등)은 null. 취소된 예약은 보지 않는다.
+// 접수 때와 같이, 최근 2일 안에 접수해 아직 called/notify_failed인 이월 예약도 후보다(안 끝난 예약으로 센다).
+// 이월분은 끝난 예약을 후보로 삼지 않는다 -- 며칠 전에 끝난 정비에 오늘 주문이 붙으면 안 된다.
 async function findReservationForPaymentByCarNumber(storeId, carNumber, serviceDate) {
   if (!carNumber) return null
   const rows = await prisma.reservation.findMany({
-    where: { storeId, carNumber, serviceDate, status: { not: 'cancelled' } },
+    where: {
+      storeId,
+      carNumber,
+      OR: [
+        { serviceDate, status: { not: 'cancelled' } },
+        { serviceDate: { gte: kstDateBefore(serviceDate, CARRYOVER_LOOKBACK_DAYS), lt: serviceDate }, status: { in: CARRYOVER_RESERVATION_STATUSES } },
+      ],
+    },
     orderBy: { createdAt: 'desc' },
     take: 5,
   })
@@ -1451,18 +1656,28 @@ async function completeReservationAfterPayment(id) {
   return result.count > 0
 }
 
-// POS에서 결제가 끝났다는 통보. loaded인 건만 paid로 넘긴다 — 담기지도 않은 건이 결제됐다고
-// 기록되면 안 된다. 다른 전이와 같은 이유로 원자적 updateMany를 쓴다.
+// POS에서 결제가 끝났다는 통보. POS 결제 건(payTarget 'pos')의 pending·loaded만 paid로 넘긴다.
+// pending도 받는 이유: 돈은 이미 POS에서 나갔는데 통보가 담기(consume) 응답보다 먼저 오거나, 직원이 담김을 되돌린
+// (unload) 뒤에 늦게 도착한 경우 "담기지 않았다"며 거절하면 결제된 주문이 집계에 없는 채로 남는다. 반대로 payTarget 조건은
+// 필수다 -- pending을 받는 순간 프론트에서 결제 대기 중인 주문(front)에 POS가 "결제됐다"고 쓸 수 있게 되기 때문이다.
+// 담기 단계를 건너뛴 건은 loadedAt이 비어 있어 결제 시각으로 채운다(최근 결제 목록이 loadedAt으로도 정렬한다).
+// deletedAt도 비운다 -- 삭제해 숨긴 주문이라도 실제로 결제됐다면 다시 보여야 한다(호출부가 되살렸다는 로그를 남긴다).
+// 다른 전이와 같은 이유로 원자적 updateMany를 쓴다.
 async function markErpCartPaid(id, { paymentId, orderId }) {
+  const now = new Date()
   const result = await prisma.erpCart.updateMany({
-    where: { id, status: 'loaded' },
+    where: { id, payTarget: 'pos', status: { in: ['pending', 'loaded'] } },
     data: {
       status: 'paid',
-      paidAt: new Date(),
+      paidAt: now,
       tossPaymentId: paymentId ? String(paymentId).slice(0, 200) : null,
       tossOrderId: orderId ? String(orderId).slice(0, 200) : null,
+      deletedAt: null,
     },
   })
+  if (result.count > 0) {
+    await prisma.erpCart.updateMany({ where: { id, loadedAt: null }, data: { loadedAt: now } })
+  }
   return result.count > 0
 }
 
@@ -1550,15 +1765,17 @@ function setPromoDemoUntil(storeId, until) {
 }
 
 // db: prisma 또는 트랜잭션 클라이언트. 트랜잭션 안에서는 쿼리를 하나씩 보낸다(한 연결을 쓴다).
+// ignoreDemo: 시연 모드여도 30일 제한을 그대로 건다. 시연 모드는 직원이 차 한 대씩 보내는 수동 발송에만
+// 적용한다 -- 자동 홍보(실제 손님 3개월 뒤)와 기간 발송(수백 명)까지 풀리면 같은 손님에게 광고가 반복된다.
 // 반환: Map(phone -> { status, carNumber, lastVisitAt, consentAt, lastSentAt, recentFailure })
 //   status: ok | opted_out | no_consent | consent_expired | recently_sent
-async function assessPromoPhones(storeId, phones, db = prisma) {
+async function assessPromoPhones(storeId, phones, db = prisma, { ignoreDemo = false } = {}) {
   const list = [...new Set((phones || []).filter(Boolean))]
   const assessed = new Map()
   if (!list.length) return assessed
 
   const now = Date.now()
-  const intervalDays = await getPromoIntervalDays(storeId, db)
+  const intervalDays = ignoreDemo ? PROMO_MIN_INTERVAL_DAYS : await getPromoIntervalDays(storeId, db)
   const sentCutoff = new Date(now - intervalDays * 24 * 60 * 60 * 1000)
   // 실패 기록은 재발송 금지 기간과 따로 최근 30분을 본다(시연 모드에서 기간이 0이어도).
   const sendsSince = new Date(Math.min(sentCutoff.getTime(), now - PROMO_FAILED_RETRY_COOLDOWN_MS))
@@ -1656,7 +1873,9 @@ async function assessPromoPhones(storeId, phones, db = prisma) {
 async function claimPromoSend({ storeId, phone, carNumber, sentBy, via }) {
   return prisma.$transaction(async (tx) => {
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`promo:${storeId}:${phone}`}))`
-    const assessed = (await assessPromoPhones(storeId, [phone], tx)).get(phone)
+    // 시연 모드는 수동 발송에만(assessPromoPhones 주석). 자동('auto')·기간 발송('campaign-*')은 늘 30일.
+    const ignoreDemo = via === 'auto' || String(via || '').startsWith('campaign-')
+    const assessed = (await assessPromoPhones(storeId, [phone], tx, { ignoreDemo })).get(phone)
     if (assessed.status !== 'ok') {
       return { ok: false, status: assessed.status, lastSentAt: assessed.lastSentAt }
     }
@@ -1744,13 +1963,14 @@ async function listPromoCampaignCandidates(storeId, start, end, { skipRecentFail
   const excluded = { optedOut: 0, noConsent: 0, consentExpired: 0, recentlySent: 0, recentlyFailed: 0 }
   if (!phones.length) return { visitors: 0, recipients: [], excluded, truncated: false, all: [] }
 
-  const assessed = await assessPromoPhones(storeId, phones)
+  // 기간 발송은 시연 모드여도 30일 제한을 건다(claimPromoSend와 같은 기준이어야 미리보기와 발송 수가 맞는다).
+  const assessed = await assessPromoPhones(storeId, phones, prisma, { ignoreDemo: true })
   const recipients = []
   const all = []
   for (const phone of phones) {
     const a = assessed.get(phone)
     if (a.status === 'staff_excluded') continue // 위에서 뺐지만 그 사이 삭제된 경우
-    all.push({ phone, carNumber: a.carNumber, lastVisitAt: a.lastVisitAt, status: a.status, lastSentAt: a.lastSentAt })
+    all.push({ phone, carNumber: a.carNumber, lastVisitAt: a.lastVisitAt, status: a.status, lastSentAt: a.lastSentAt, recentFailure: a.recentFailure })
     if (a.status === 'opted_out') excluded.optedOut += 1
     else if (a.status === 'no_consent') excluded.noConsent += 1
     else if (a.status === 'consent_expired') excluded.consentExpired += 1
@@ -2198,6 +2418,9 @@ async function getDailySummary({ storeId, date, dateStart, dateEnd }) {
   const paymentWhere = {
     ...(storeId ? { storeId } : {}),
     ...(dateStart && dateEnd ? { createdAt: { gte: dateStart, lt: dateEnd } } : {}),
+    // 웹훅이 먼저 와서 생긴 백업 기록이 나중에 전산 주문과 이어지면 같은 돈이 아래 erpCarts에서 또 집계된다.
+    // 이어진 백업 기록은 결제 건수·금액에서 뺀다(markBackupPaymentErpLinked). status는 null이 아니라 not이 안전하다.
+    status: { not: 'erp_linked' },
   }
 
   // 전산 주문은 접수 시각(createdAt) 기준으로 그날 것을 센다 — Payment와 같은 기준이다.
@@ -2331,16 +2554,22 @@ module.exports = {
   findErpCartByReference,
   listPendingErpCarts,
   markErpCartLoaded,
+  markErpCartUnloaded,
   markErpCartFailed,
   markErpCartDismissed,
   markErpCartPaid,
   markErpCartFrontPaying,
   releaseErpCartFrontPaying,
+  tombstoneErpCartFrontKey,
+  forceReleaseErpCartFrontPaying,
+  forceReleaseErpCartRefunding,
+  FORCE_RELEASE_AFTER_MS,
   markErpCartFrontPaid,
   sendErpCartToFront,
   returnErpCartToPos,
   listFrontErpCartsForPos,
   recordTossPayment,
+  markBackupPaymentErpLinked,
   linkErpCartsToTossPayment,
   linkFrontCartToRecordedTossPayment,
   markErpCartsRefundedByToss,
@@ -2348,6 +2577,7 @@ module.exports = {
   withdrawErpCartRefund,
   markErpCartRefunding,
   releaseErpCartRefunding,
+  markErpCartRefundAttemptReleased,
   markErpCartRefunded,
   listSettledErpCartsForPos,
   listErpCarts,
@@ -2370,6 +2600,7 @@ module.exports = {
   registerPromoExclusion,
   skipDuePromotion,
   postponeDuePromotion,
+  closeSiblingDuePromotions,
   listPromoCampaignCandidates,
   completeReservationAfterPayment,
   findOpenReservationByCarNumber,

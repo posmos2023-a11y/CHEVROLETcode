@@ -23,6 +23,11 @@ const promoEl = () => document.getElementById('history-promo')
 // 지금 화면에 띄워둔 차량번호. 홍보 발송이 어느 차에 대한 것인지 헷갈리지 않게 들고 있는다.
 let shownCarNumber = ''
 
+// 홍보 확인(refreshPromo) 응답의 순번. 차를 바꿔 조회했는데 이전 차의 확인 응답이 늦게 도착하면, 지금 차 화면에
+// 이전 차의 [홍보 메시지 보내기] 버튼이 뜬다 -- 직원이 그대로 누르면 엉뚱한 손님에게 광고가 나간다(되돌릴 수 없다).
+// 새 조회·목록 전환·새 확인이 시작될 때마다 올려서 그 전에 날아간 응답을 모두 무효로 만든다.
+let promoSeq = 0
+
 export function initHistory(injected) {
   // 최근 목록의 줄을 누르면 그 차량번호로 상세 조회한다. 목록은 다시 그려지므로 위임으로 받는다.
   const bodyHost = document.getElementById('history-body')
@@ -70,6 +75,7 @@ export function openHistoryFor(carNumber) {
     return
   }
   bodyEl().innerHTML = '<div class="empty"><div class="empty-copy">차량번호나 전화번호를 입력하면 지난 정비 내역을 보여드립니다.</div></div>'
+  promoSeq += 1
   const promo = promoEl()
   if (promo) promo.hidden = true
   input.focus()
@@ -221,6 +227,11 @@ async function runVisitTool(key, tool, id) {
     }
     if (!res.ok) {
       if (res.status === 401) return deps.onUnauthorized(res.body.error)
+      // 409: 결제 전(POS에 담김)이거나 취소가 진행 중인 주문이 이어진 방문이라 지울 수 없다. 서버가 어느 쪽인지
+      // 문구로 알려 주므로 그대로 보여준다 -- 일반 오류 문구로 바꾸면 직원이 왜 안 지워지는지 알 수 없다.
+      if (res.status === 409 && tool !== 'done') {
+        return deps.notify('error', res.body.error || '결제 전이거나 취소가 진행 중인 주문이 이어진 방문은 삭제할 수 없습니다.')
+      }
       return deps.notify('error', res.body.error || '처리하지 못했습니다.')
     }
     if (tool === 'done') return deps.notify('success', '손님께 정비 완료 문자를 보냈습니다.')
@@ -237,6 +248,7 @@ async function runVisitTool(key, tool, id) {
 // 검색을 풀고 최근 목록으로 돌아간다. 차량 화면에 띄워 둔 홍보 발송 칸도 함께 닫는다.
 function showRecentList() {
   shownCarNumber = ''
+  promoSeq += 1
   const promo = promoEl()
   if (promo) promo.hidden = true
   loadRecentHistory()
@@ -253,6 +265,7 @@ export async function loadRecentHistory() {
     search(input.value)
     return
   }
+  promoSeq += 1
   const promo = promoEl()
   if (promo) promo.hidden = true
   body.innerHTML = '<div class="empty"><div class="empty-copy">불러오는 중...</div></div>'
@@ -312,7 +325,7 @@ function renderRecent(visits) {
 
 // 입력이 숫자(하이픈·공백 허용)로만 된 010 번호면 전화번호로 찾는다.
 function asPhone(raw) {
-  const digits = String(raw || '').replace(/[s-]/g, '')
+  const digits = String(raw || '').replace(/[\s-]/g, '')
   return /^01[0-9]{8,9}$/.test(digits) ? digits : null
 }
 
@@ -342,6 +355,7 @@ function renderCarChoices(res) {
 
 async function search(rawCarNumber) {
   const isLatest = claimRender()
+  promoSeq += 1
   const carNumber = String(rawCarNumber || '').trim()
   const body = bodyEl()
   if (!carNumber) {
@@ -357,15 +371,18 @@ async function search(rawCarNumber) {
   try {
     const query = phone ? `phone=${encodeURIComponent(phone)}` : `carNumber=${encodeURIComponent(carNumber)}`
     const { ok, status, body: res } = await deps.apiGet(`/api/pos/history?${query}`)
+    // 로그인 만료는 어느 요청이든 알려야 하므로 최신 여부보다 먼저 본다.
+    if (!ok && status === 401) {
+      deps.onUnauthorized(res.error)
+      return
+    }
+    // 오류 응답도 최신 요청일 때만 화면에 쓴다. 성공 응답만 확인하던 때는, 먼저 보낸 검색이 늦게 실패하면 그 사이에
+    // 띄운 다른 차의 이력 위에 "이력을 불러오지 못했습니다"가 덮였다.
+    if (!isLatest()) return
     if (!ok) {
-      if (status === 401) {
-        deps.onUnauthorized(res.error)
-        return
-      }
       body.innerHTML = `<div class="empty"><div class="empty-copy">${deps.escapeHtml(res.error || '이력을 불러오지 못했습니다.')}</div></div>`
       return
     }
-    if (!isLatest()) return
     if (!res.carNumber) {
       renderCarChoices(res)
       return
@@ -374,6 +391,7 @@ async function search(rawCarNumber) {
     renderVisits(res.carNumber, res.visits || [], res)
     refreshPromo(res.carNumber)
   } catch {
+    if (!isLatest()) return
     body.innerHTML = '<div class="empty"><div class="empty-copy">네트워크 연결을 확인한 뒤 다시 시도해주세요.</div></div>'
   }
 }
@@ -385,11 +403,17 @@ async function search(rawCarNumber) {
 async function refreshPromo(carNumber) {
   const promo = promoEl()
   if (!promo) return
+  // 이미 다른 차로 넘어간 뒤에 부른 것(발송 응답이 늦게 와서 부른 갱신 등)이면 지금 차의 홍보 칸을 건드리지 않는다.
+  if (carNumber !== shownCarNumber) return
+  promoSeq += 1
+  const seq = promoSeq
   promo.hidden = false
   promo.innerHTML = '<div class="history-promo-note">확인 중...</div>'
 
   try {
     const { ok, body } = await deps.apiGet(`/api/pos/promo/eligibility?carNumber=${encodeURIComponent(carNumber)}`)
+    // 그 사이 다른 차를 조회했거나 목록으로 나갔으면 이 응답은 버린다(promoSeq 설명 참고).
+    if (seq !== promoSeq || carNumber !== shownCarNumber) return
     if (!ok) {
       promo.hidden = true
       return
@@ -406,11 +430,18 @@ async function refreshPromo(carNumber) {
     // 못 보내는 이유를 그대로 보여준다. "왜 버튼이 없지?"를 묻게 두면 안 된다.
     promo.innerHTML = `<div class="history-promo-note blocked">${deps.escapeHtml(body.message || '지금은 보낼 수 없습니다.')}</div>`
   } catch {
+    if (seq !== promoSeq || carNumber !== shownCarNumber) return
     promo.hidden = true
   }
 }
 
 async function sendPromo(carNumber, btn) {
+  // 화면의 차가 이 버튼을 만든 차와 다르면 보내지 않는다. 확인 응답이 늦게 와서 남은 옛 버튼이나 발송 도중 차가
+  // 바뀐 경우에도 문자는 지금 화면에 보이는 손님 기준이어야 한다(보낸 문자는 회수가 안 된다).
+  if (carNumber !== shownCarNumber) {
+    deps.notify('error', '화면의 차량이 바뀌었습니다. 다시 조회한 뒤 보내주세요.')
+    return
+  }
   // 되돌릴 수 없다(보낸 문자는 회수가 안 된다). 대기열의 호출·취소와 같은 방식으로 한 번 더 묻는다.
   if (btn.dataset.confirming !== 'true') {
     btn.dataset.confirming = 'true'

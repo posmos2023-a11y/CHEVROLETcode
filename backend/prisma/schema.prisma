@@ -20,6 +20,10 @@ model Store {
   // 금지"를 적용하지 않는다(시연할 때 같은 번호로 여러 번 보내 보기 위해). 수신 동의·수신거부·야간 금지는
   // 그대로다. 켜면 그날 자정(KST)까지로 잡혀 저절로 꺼진다 -- 켜 둔 채 잊어도 다음 날엔 원래대로 돌아온다.
   promoDemoUntil DateTime?
+  // 이 매장의 POS 탭앱·토스 프론트가 마지막으로 서버에 접속한 시각(폴링, 1분에 한 번만 기록).
+  // 본사가 관리자 웹에서 "단말이 꺼져 있어 새 주문이 안 보이는 매장"을 찾기 위한 값이다.
+  lastPosSeenAt   DateTime?
+  lastFrontSeenAt DateTime?
   createdAt      DateTime @default(now())
 
   reservations  Reservation[]
@@ -89,7 +93,7 @@ model Payment {
   serviceType    String?
   phone          String?
   amount         Int?
-  status         String    @default("requested") // requested | receipt_sent | receipt_failed | cancelled
+  status         String    @default("requested") // requested | receipt_sent | receipt_failed | cancelled | erp_linked(웹훅 백업 행이 전산 결제와 이어짐 -- 집계 제외)
   promoAt        DateTime
   promoSent      Boolean   @default(false)
   promoSentAt    DateTime?
@@ -186,6 +190,9 @@ model ErpCart {
   errorMessage String?
   createdAt    DateTime  @default(now())
   loadedAt     DateTime?
+  // POS 탭앱이 담기(consume)를 요청할 때 실어 보낸 시도 구분자. 응답을 못 받아 재시도한 탭앱이 "이미 loaded"를 받았을 때
+  // 그게 자기 첫 요청이 성공한 것인지 다른 단말기가 먼저 담은 것인지 가리는 데 쓴다(ownAttempt).
+  consumeAttemptId String?
 
   // 전산이 보낸 차량번호. memo에도 같은 값이 들어가지만 그건 사람이 POS 화면에서 읽는 자유
   // 문자열이라 기계가 확실히 못 읽는다. 예약 손님과 잇는 데는 이 필드를 쓴다.
@@ -210,6 +217,11 @@ model ErpCart {
   // 보고는 이 값이 맞을 때만 받는다 -- 다른 시도의 늦은 보고가 현재 시도를 덮어쓰지 못하게 한다.
   frontPaymentKey  String?   @unique
   frontPayingAt    DateTime?
+  // 프론트가 "이 paymentKey로는 결제하지 않는다(cancelled/failed)"고 먼저 알려온 키(묘비). 프론트는 /start가 시간 초과면
+  // 같은 키로 /result cancelled를 보내는데, 그게 늦게 처리될 /start보다 먼저 도착하면 그때는 pending이라 되돌릴 게 없다 --
+  // 그냥 200으로 끝내면 뒤늦게 처리된 /start가 paying으로 잡아 영구히 갇힌다. 그래서 키를 남겨 그 키의 /start를 거절한다.
+  // 직원이 갇힌 결제 중을 풀 때(force-release)도 옛 키를 여기 남겨 늦은 결과 보고가 현재 시도를 덮지 못하게 한다.
+  frontReleasedKey String?
   // 탭앱이 [프론트 결제]로 마지막으로 넘긴 시각. 프론트의 "2분 쉬기"(snooze) 열쇠에 섞어, 직원이 되돌렸다가 다시
   // 보낸 주문은 쉬는 중이어도 바로 뜨게 한다.
   frontSentAt      DateTime?
@@ -230,6 +242,14 @@ model ErpCart {
   // 쓰지 않음. 페이스페이를 카드 취소 화면으로 띄우는 실험(2026-10-22)에 썼다가 실패해 코드를 뺐다. 배포 중 옛 인스턴스가
   // 이 컬럼을 읽을 수 있어 바로 지우지 않았다 -- 다음 정리 때 DROP COLUMN 해도 된다.
   refundMode        String?
+  // 프론트 취소 시도 구분. 프론트가 취소창을 띄울 때마다 새로 만든 attemptId를 refund-start에 실어 보내고 refund-result에
+  // 같은 값을 돌려보낸다. refundAttemptId는 지금 취소를 쥐고 있는 시도, refundStartedAt은 그 시작 시각(직원이 10분 넘게
+  // 갇힌 취소 중을 풀 수 있는 기준). refundReleasedAttemptId는 "이 시도는 접었다"고 기록된 값 -- 시간 초과로 refund-start가
+  // 늦게 도착해도 이미 접은 시도면 거절해서, 프론트는 포기했는데 서버만 취소 중으로 갇히는 일을 막는다.
+  // attemptId를 안 보내는 옛 프론트는 세 컬럼 모두 null이고 예전처럼 동작한다.
+  refundAttemptId         String?
+  refundReleasedAttemptId String?
+  refundStartedAt         DateTime?
 
   // 결제 후 전자영수증 알림톡 결과. sent | failed | no_reservation(예약과 이어지지 않아 번호를 모름) |
   // no_phone. 관리자 웹 전산 주문 이력에 보여 "영수증이 안 왔어요"의 원인을 바로 알 수 있게 한다.

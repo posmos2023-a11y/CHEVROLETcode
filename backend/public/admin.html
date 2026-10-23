@@ -217,6 +217,7 @@
   .erp-code-set { display: flex; gap: 6px; align-items: center; }
   .erp-code-input { width: 130px; }
   .muted { color: var(--muted); }
+  .device-stale { color: #d93025; font-weight: 600; }
   .erp-cart-filter { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
   /* 매장 검색창(store-mgmt-filter)도 erp-cart-filter와 같은 줄 배치를 재사용한다 -- 새 레이아웃을
      또 만들지 않고 filterbar의 검색창(input[type="search"])과 같은 크기/스타일만 가져왔다. */
@@ -466,6 +467,7 @@ const STATUS_LABEL = {
   requested: '결제접수',
   receipt_sent: '영수증발송',
   receipt_failed: '영수증실패',
+  erp_linked: '전산 결제와 연결됨', // 웹훅 백업 기록이 전산 주문과 이어져 결제 합계에서 빠진 건
 }
 
 const PAGE_LIMIT = 100 // GET 목록 API의 기본 페이지 크기(서버 클램프 1~500)와 맞춘다.
@@ -912,8 +914,12 @@ const promoResult = document.getElementById('promo-result')
 const promoOptOutPhone = document.getElementById('promo-optout-phone')
 const promoOptOutBtn = document.getElementById('promo-optout-btn')
 const promoOptOutMsg = document.getElementById('promo-optout-msg')
-let promoPreviewState = null // { storeId, from, to, eligible }
+let promoPreviewState = null // { storeId, storeName, from, to, eligible }
 let promoSending = false
+// [대상 확인]은 응답이 느릴 수 있다. 그 사이 기간·매장을 바꾸거나 다시 눌렀는데 먼저 보낸 요청의 응답이 뒤늦게 오면
+// 지금 화면의 조건과 다른 미리보기가 떠서, 그 숫자를 믿고 [보내기]를 누를 수 있다. 요청마다 번호를 매기고 조건이 바뀔 때도
+// 올려서, 도착한 응답이 최신 요청의 것이고 지금 조건과 같을 때만 그린다.
+let promoPreviewSeq = 0
 const PROMO_MAX_ROUNDS = 100
 
 function shiftKstDate(days) {
@@ -968,13 +974,18 @@ async function previewPromoCampaign() {
     return
   }
   setPromoMsg('대상을 확인하는 중...')
-  const params = new URLSearchParams({ storeId, from: promoFrom.value, to: promoTo.value })
+  const seq = (promoPreviewSeq += 1)
+  const fromValue = promoFrom.value
+  const toValue = promoTo.value
+  const params = new URLSearchParams({ storeId, from: fromValue, to: toValue })
   const { ok, body } = await promoRequest('GET', '/api/admin/promo-campaign/preview?' + params.toString())
+  // 오류 응답도 걸러낸다 -- 지난 조건의 오류 문구가 지금 화면에 남으면 안 된다.
+  if (seq !== promoPreviewSeq || storeId !== promoTargetStoreId() || promoFrom.value !== fromValue || promoTo.value !== toValue) return
   if (!ok) {
     setPromoMsg(body.error || '대상을 확인하지 못했습니다.', 'err')
     return
   }
-  promoPreviewState = { storeId, from: body.from, to: body.to, eligible: body.eligible }
+  promoPreviewState = { storeId, storeName: body.storeName || '', from: body.from, to: body.to, eligible: body.eligible }
   setPromoMsg('')
   const blocked = body.night
     ? '<p class="testform-msg err">지금은 야간이라 보낼 수 없습니다(21시~8시). 낮에 다시 보내주세요.</p>'
@@ -1023,7 +1034,9 @@ function promoSummary(t, remaining, reason) {
 async function sendPromoCampaign() {
   const state = promoPreviewState
   if (!state || !state.eligible || promoSending) return
-  const ok = window.confirm(`${state.from} ~ ${state.to} 방문 손님 ${state.eligible}명에게 홍보 문자를 보냅니다.\n보낸 뒤에는 취소할 수 없습니다. 보낼까요?`)
+  // 매장명을 넣는다: 본사 관리자가 상단에서 매장을 바꿔 둔 채 이전 미리보기로 보내는 실수를 확인창에서 한 번 더 잡는다.
+  const target = state.storeName ? `[${state.storeName}] ` : ''
+  const ok = window.confirm(`${target}${state.from} ~ ${state.to} 방문 손님 ${state.eligible}명에게 홍보 문자를 보냅니다.\n보낸 뒤에는 취소할 수 없습니다. 보낼까요?`)
   if (!ok) return
   const btn = document.getElementById('promo-send-btn')
   if (btn) btn.disabled = true
@@ -1117,6 +1130,7 @@ if (promoPanel) {
   for (const el of [promoFrom, promoTo, storeSelect]) {
     el.addEventListener('change', () => {
       if (promoSending) return
+      promoPreviewSeq += 1 // 아직 오지 않은 이전 조건의 미리보기 응답을 버리게 한다
       promoPreviewState = null
       promoResult.innerHTML = ''
       setPromoMsg('')
@@ -1167,13 +1181,31 @@ function businessNumberCell(businessNumber, editable) {
   </td>`
 }
 
+// 단말 연결 칸. POS 탭앱·토스 프론트가 마지막으로 서버에 접속한 시각(서버가 1분에 한 번 기록).
+// 영업 중에 오래 비어 있으면 그 매장은 단말이 꺼져 있거나 토큰이 빠져 새 예약·전산 주문이 안 보이는 상태다.
+const DEVICE_STALE_MS = 30 * 60 * 1000
+function deviceSeenText(label, at) {
+  if (!at) return `<div class="muted">${label}: 기록 없음</div>`
+  const ago = Date.now() - new Date(at).getTime()
+  const minutes = Math.max(0, Math.floor(ago / 60000))
+  const text = minutes < 1 ? '방금' : minutes < 60 ? `${minutes}분 전` : minutes < 1440 ? `${Math.floor(minutes / 60)}시간 전` : `${Math.floor(minutes / 1440)}일 전`
+  const stale = ago > DEVICE_STALE_MS
+  return `<div${stale ? ' class="device-stale"' : ''}>${label}: ${text}</div>`
+}
+function deviceSeenCell(seen) {
+  if (!seen) return '<td><span class="muted">-</span></td>'
+  return `<td>${deviceSeenText('POS', seen.lastPosSeenAt)}${deviceSeenText('프론트', seen.lastFrontSeenAt)}</td>`
+}
+
 // posToken: 이미 값을 아는 경우에만 채워서 넘긴다(store_admin 자기 매장, 또는 hq_admin이
 // 한 번 "보기"/"복사"로 이미 받아온 매장). hasToken: 목록 응답의 hasPosToken -- 값 자체는
 // 없지만 토큰이 있기는 한지(빈 매장과 구분)는 알아야 "(없음)"과 "불러와야 함"을 구분할 수 있다.
-function posTokenRow(storeId, name, merchantId, posToken, hasToken, canRegen, erpStoreCode, businessNumber) {
+// seen: { lastPosSeenAt, lastFrontSeenAt } (없으면 칸에 "-").
+function posTokenRow(storeId, name, merchantId, posToken, hasToken, canRegen, erpStoreCode, businessNumber, seen) {
   return `<tr data-store-id="${escapeHtml(storeId)}">
     <td>${escapeHtml(name)}</td>
     <td>${escapeHtml(merchantId)}</td>
+    ${deviceSeenCell(seen)}
     ${businessNumberCell(businessNumber, canRegen)}
     ${erpCodeCell(erpStoreCode, canRegen)}
     <td>
@@ -1206,8 +1238,8 @@ function renderPosTokens() {
       return
     }
     posTokenBody.innerHTML = `<table>
-      <thead><tr><th>매장</th><th>merchantId</th><th>사업자번호</th><th>전산 코드</th><th>POS 토큰</th><th>동작</th></tr></thead>
-      <tbody>${stores.map(s => posTokenRow(s.id, s.name, s.merchantId, s.posToken, s.hasPosToken, true, s.erpStoreCode, s.businessNumber)).join('')}</tbody>
+      <thead><tr><th>매장</th><th>merchantId</th><th>단말 연결</th><th>사업자번호</th><th>전산 코드</th><th>POS 토큰</th><th>동작</th></tr></thead>
+      <tbody>${stores.map(s => posTokenRow(s.id, s.name, s.merchantId, s.posToken, s.hasPosToken, true, s.erpStoreCode, s.businessNumber, s)).join('')}</tbody>
     </table>${storesHasMore ? '<div class="load-more-wrap"><button class="row-btn load-more" id="store-load-more" type="button">더 보기 (' + stores.length + ' / ' + storesTotal + ')</button></div>' : ''}`
   } else {
     if (!myStoreInfo) {
@@ -1218,7 +1250,7 @@ function renderPosTokens() {
     // 버튼 대신 현재 값만 보여준다. /api/admin/me가 이미 실제 토큰 값을 포함해 주므로
     // (자기 매장뿐이라 안전) hq_admin 목록처럼 따로 불러올 필요가 없다.
     posTokenBody.innerHTML = `<table>
-      <tbody>${posTokenRow(myStoreInfo.id, myStoreInfo.name, myStoreInfo.merchantId, myStoreInfo.posToken, Boolean(myStoreInfo.posToken), false, myStoreInfo.erpStoreCode, myStoreInfo.businessNumber)}</tbody>
+      <tbody>${posTokenRow(myStoreInfo.id, myStoreInfo.name, myStoreInfo.merchantId, myStoreInfo.posToken, Boolean(myStoreInfo.posToken), false, myStoreInfo.erpStoreCode, myStoreInfo.businessNumber, myStoreInfo)}</tbody>
     </table>`
   }
 }

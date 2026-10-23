@@ -1289,15 +1289,152 @@ testSerial('결제: loaded 건을 paid로 기록하고 결제 식별자를 남�
   assert.equal(erpView.body.status, 'paid')
 })
 
-testSerial('결제: 담기지 않은(pending) 건은 결제로 기록할 수 없다', async () => {
-  const store = await createStore('paid-not-loaded')
+testSerial('결제: 담기 전(pending)에 온 POS 결제 통보도 결제 완료로 기록한다(돈은 이미 나갔다)', async () => {
+  const store = await createStore('paid-pending')
   assert.equal((await postCart(validBody(store))).status, 201)
   const cartId = (await getPosCarts(store)).body.carts[0].id
 
-  const res = await markPaid(store, cartId, { paymentId: 'p' })
-  assert.equal(res.status, 409)
+  const res = await markPaid(store, cartId, { paymentId: 'p', orderId: 'o' })
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal(res.body.status, 'paid')
+  const stored = await prisma.erpCart.findUnique({ where: { id: cartId } })
+  assert.equal(stored.status, 'paid')
+  assert.equal(stored.tossPaymentId, 'p')
+  // 담기 단계를 건너뛰었으므로 loadedAt은 결제 시각으로 채운다.
+  assert.ok(stored.loadedAt)
+  assert.ok(stored.paidAt)
+  // 담기(consume) 재시도가 뒤늦게 와도 이미 처리된 것으로 끝난다.
+  const late = await consumeCart(store, cartId, { result: 'loaded' })
+  assert.equal(late.body.alreadyProcessed, true)
+  assert.equal(late.body.status, 'paid')
+})
+
+testSerial('결제: 이미 끝난(dismissed/failed/expired/cancelled) 주문에 결제 통보가 오면 409이고 대사가 필요하다는 오류 로그를 남긴다', async () => {
+  const logger = require('../src/logger')
+  for (const status of ['dismissed', 'failed', 'expired', 'cancelled']) {
+    const store = await createStore(`paid-closed-${status}`)
+    assert.equal((await postCart(validBody(store))).status, 201)
+    const cartId = (await getPosCarts(store)).body.carts[0].id
+    await prisma.erpCart.update({ where: { id: cartId }, data: { status } })
+
+    const original = logger.error
+    const calls = []
+    logger.error = (message, meta) => { calls.push({ message, meta }) }
+    let res
+    try {
+      res = await markPaid(store, cartId, { paymentId: 'pay-closed', orderId: 'ord-closed' })
+    } finally {
+      logger.error = original
+    }
+    assert.equal(res.status, 409, status)
+    assert.equal(res.body.status, status)
+    const call = calls.find((c) => c.message.includes('결제 통보가 끝난 주문에 왔습니다'))
+    assert.ok(call, `${status}: 대사 필요 로그가 남지 않았다`)
+    assert.equal(call.meta.cartId, cartId)
+    assert.equal(call.meta.paymentId, 'pay-closed')
+    assert.equal((await prisma.erpCart.findUnique({ where: { id: cartId } })).status, status)
+  }
+})
+
+testSerial('결제: 삭제 표시가 남은 담김 주문이 결제 완료로 확정되면 다시 보인다', async () => {
+  const { store, cartId } = await loadedCart('paid-revive')
+  // 예전 버전은 담기만 한 주문도 정비 이력 삭제로 deletedAt이 찍혔다(데이터가 그렇게 남아 있을 수 있다).
+  await prisma.erpCart.update({ where: { id: cartId }, data: { deletedAt: new Date() } })
+  const res = await markPaid(store, cartId, { paymentId: 'p-revive' })
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal((await prisma.erpCart.findUnique({ where: { id: cartId } })).deletedAt, null)
+  const queue = await request(app).get('/api/pos/queue').set('X-Store-Token', store.posToken)
+  assert.ok(queue.body.settledCarts.some((c) => c.id === cartId))
+})
+
+// --- 담김 되돌리기(unload) ----------------------------------------------------
+
+function unloadCart(store, cartId) {
+  return request(app).post(`/api/pos/erp-carts/${cartId}/unload`).set('X-Store-Token', store.posToken).send({})
+}
+
+testSerial('담김 되돌리기: loaded 주문이 pending으로 돌아가 POS 목록에 다시 뜨고 다시 담을 수 있다', async () => {
+  const { store, cartId } = await loadedCart('unload-basic')
+  const res = await unloadCart(store, cartId)
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal(res.body.status, 'pending')
   const stored = await prisma.erpCart.findUnique({ where: { id: cartId } })
   assert.equal(stored.status, 'pending')
+  assert.equal(stored.loadedAt, null)
+  assert.equal(stored.consumeAttemptId, null)
+  assert.equal((await getPosCarts(store)).body.carts.length, 1)
+  assert.equal((await consumeCart(store, cartId, { result: 'loaded' })).body.alreadyProcessed, false)
+})
+
+testSerial('담김 되돌리기: 담기 전·결제된 주문·프론트 결제 건은 되돌리지 않고, 다른 매장은 404', async () => {
+  const store = await createStore('unload-guard')
+  assert.equal((await postCart(validBody(store))).status, 201)
+  const cartId = (await getPosCarts(store)).body.carts[0].id
+  const pending = await unloadCart(store, cartId)
+  assert.equal(pending.status, 409)
+  assert.equal(pending.body.status, 'pending')
+
+  await consumeCart(store, cartId, { result: 'loaded' })
+  await markPaid(store, cartId, { paymentId: 'p' })
+  const paid = await unloadCart(store, cartId)
+  assert.equal(paid.status, 409)
+  assert.equal((await prisma.erpCart.findUnique({ where: { id: cartId } })).status, 'paid')
+
+  // 결제 통보(paidAt)가 있는데 상태만 loaded인 어긋난 행도 되돌리지 않는다.
+  await prisma.erpCart.update({ where: { id: cartId }, data: { status: 'loaded' } })
+  assert.equal((await unloadCart(store, cartId)).status, 409)
+
+  const front = await postCart(validBody(store, { payTarget: 'front' }))
+  await prisma.erpCart.update({ where: { id: front.body.cartId }, data: { status: 'loaded' } })
+  assert.equal((await unloadCart(store, front.body.cartId)).status, 409)
+
+  const other = await createStore('unload-other')
+  assert.equal((await unloadCart(other, cartId)).status, 404)
+})
+
+// --- 담기(consume) 시도 구분 ----------------------------------------------------
+
+testSerial('담기 시도: 재시도가 받은 alreadyProcessed가 자기 첫 성공이면 ownAttempt true, 남이 담았으면 false', async () => {
+  const store = await createStore('consume-attempt')
+  assert.equal((await postCart(validBody(store))).status, 201)
+  const cartId = (await getPosCarts(store)).body.carts[0].id
+  const mine = 'attempt-mine-0001'
+
+  const first = await consumeCart(store, cartId, { result: 'loaded', attemptId: mine })
+  assert.equal(first.status, 200, JSON.stringify(first.body))
+  assert.equal(first.body.alreadyProcessed, false)
+  assert.equal((await prisma.erpCart.findUnique({ where: { id: cartId } })).consumeAttemptId, mine)
+
+  // 응답을 못 받은 탭앱이 같은 시도로 다시 보냈다 -- 자기 첫 요청이 성공한 것이다.
+  const retry = await consumeCart(store, cartId, { result: 'loaded', attemptId: mine })
+  assert.equal(retry.body.alreadyProcessed, true)
+  assert.equal(retry.body.ownAttempt, true)
+
+  // 다른 단말기가 먼저 담았다(다른 attemptId, 또는 attemptId를 안 보내는 옛 탭앱).
+  const stranger = await consumeCart(store, cartId, { result: 'loaded', attemptId: 'attempt-other-0002' })
+  assert.equal(stranger.body.alreadyProcessed, true)
+  assert.equal(stranger.body.ownAttempt, false)
+  const legacy = await consumeCart(store, cartId, { result: 'loaded' })
+  assert.equal(legacy.body.alreadyProcessed, true)
+  assert.equal(legacy.body.ownAttempt, false)
+
+  // 담김이 아닌 상태(여기서는 failed로 끝난 다른 주문)는 같은 attemptId여도 내 성공이 아니다.
+  assert.equal((await postCart(validBody(store))).status, 201)
+  const second = (await getPosCarts(store)).body.carts[0].id
+  await consumeCart(store, second, { result: 'failed', attemptId: mine })
+  const again = await consumeCart(store, second, { result: 'loaded', attemptId: mine })
+  assert.equal(again.body.alreadyProcessed, true)
+  assert.equal(again.body.ownAttempt, false)
+})
+
+testSerial('담기 시도: attemptId 형식이 틀리면 400이고 아무것도 바뀌지 않는다', async () => {
+  const store = await createStore('consume-attempt-bad')
+  assert.equal((await postCart(validBody(store))).status, 201)
+  const cartId = (await getPosCarts(store)).body.carts[0].id
+  for (const bad of ['short', 'has space attempt', 'x'.repeat(65)]) {
+    assert.equal((await consumeCart(store, cartId, { result: 'loaded', attemptId: bad })).status, 400, bad)
+  }
+  assert.equal((await prisma.erpCart.findUnique({ where: { id: cartId } })).status, 'pending')
 })
 
 testSerial('결제: 두 번 보내도 안전하다(멱등)', async () => {
@@ -1376,6 +1513,100 @@ testSerial('예약 연결: 다른 매장 예약에는 잇지 않는다', async (
   await createReservationFor(storeA, '22나2222')
   const body = validBody(storeB, { carNumber: '22나2222' })
   assert.equal((await postCart(body)).body.linkedReservation, false)
+})
+
+// serviceDate를 오늘(KST)에서 daysAgo일 전으로 둔 예약. 밤새 맡긴 차처럼 이월된 예약을 흉내 낸다.
+async function reservationOnDay(store, carNumber, status, daysAgo) {
+  const serviceDate = new Date(Date.now() + 9 * 3600 * 1000 - daysAgo * 24 * 3600 * 1000).toISOString().slice(0, 10)
+  return prisma.reservation.create({
+    data: {
+      storeId: store.id, carNumber, phone: '01012345678', serviceType: '엔진오일',
+      queueNumber: Math.floor(Math.random() * 9000) + 1000, serviceDate, status,
+      calledAt: status === 'called' ? new Date() : null,
+    },
+  })
+}
+
+testSerial('예약 연결(이월): 어제·그제 접수해 호출까지 끝난(called/notify_failed) 예약은 오늘 들어온 전산 주문과 이어진다', async () => {
+  const store = await createStore('link-carryover')
+  const yesterday = await reservationOnDay(store, '61가6161', 'called', 1)
+  const twoDays = await reservationOnDay(store, '62가6262', 'notify_failed', 2)
+  for (const [carNumber, reservation] of [['61가6161', yesterday], ['62가6262', twoDays]]) {
+    const body = validBody(store, { carNumber })
+    const res = await postCart(body)
+    assert.equal(res.status, 201)
+    assert.equal(res.body.linkedReservation, true, carNumber)
+    assert.equal((await prisma.erpCart.findUnique({ where: { referenceId: body.referenceId } })).reservationId, reservation.id)
+  }
+})
+
+testSerial('예약 연결(이월): 어제 waiting·3일 전 called·어제 completed는 오늘 주문과 잇지 않는다', async () => {
+  const store = await createStore('link-carryover-no')
+  await reservationOnDay(store, '63가6363', 'waiting', 1) // 노쇼로 추정되는 건
+  await reservationOnDay(store, '64가6464', 'called', 3) // 이월 범위(2일) 밖
+  await reservationOnDay(store, '65가6565', 'completed', 1) // 이미 끝난 정비
+  for (const carNumber of ['63가6363', '64가6464', '65가6565']) {
+    const res = await postCart(validBody(store, { carNumber }))
+    assert.equal(res.status, 201)
+    assert.equal(res.body.linkedReservation, false, carNumber)
+  }
+})
+
+testSerial('예약 연결(이월): 오늘 접수분과 이월 건이 함께 후보면 애매하므로 잇지 않는다', async () => {
+  const store = await createStore('link-carryover-ambiguous')
+  await reservationOnDay(store, '66가6666', 'called', 1)
+  await reservationOnDay(store, '66가6666', 'waiting', 0)
+  assert.equal((await postCart(validBody(store, { carNumber: '66가6666' }))).body.linkedReservation, false)
+})
+
+testSerial('예약 연결(이월): 결제 시점에도 이월 예약을 찾아 이어 정비완료 처리한다', async () => {
+  const store = await createStore('link-carryover-paid')
+  // 전산 주문을 먼저 넣고(이어질 예약이 없었다) 그 뒤에 어제 맡긴 차의 예약 기록이 있는 경우
+  const body = validBody(store, { carNumber: '67가6767' })
+  assert.equal((await postCart(body)).body.linkedReservation, false)
+  const reservation = await reservationOnDay(store, '67가6767', 'called', 1)
+  const cartId = (await getPosCarts(store)).body.carts[0].id
+  await consumeCart(store, cartId, { result: 'loaded' })
+  const res = await markPaid(store, cartId, { paymentId: 'p-carry' })
+  assert.equal(res.body.reservationCompleted, true, JSON.stringify(res.body))
+  assert.equal((await prisma.erpCart.findUnique({ where: { id: cartId } })).reservationId, reservation.id)
+  assert.equal((await prisma.reservation.findUnique({ where: { id: reservation.id } })).status, 'completed')
+})
+
+testSerial('결제 후 예약 연결: 이어진 예약이 그 사이 취소·익명화됐으면 같은 차의 다른 예약이 정확히 1건일 때 옮겨 잇는다', async () => {
+  for (const [label, breakIt] of [
+    ['cancelled', (id) => prisma.reservation.update({ where: { id }, data: { status: 'cancelled' } })],
+    // 개인정보 파기는 차량번호·전화번호를 더미값으로 덮고 anonymizedAt을 찍는다(store.purgeExpiredReservations).
+    ['anonymized', (id) => prisma.reservation.update({ where: { id }, data: { anonymizedAt: new Date(), carNumber: '삭제됨', phone: '0100000000' } })],
+  ]) {
+    const store = await createStore(`relink-${label}`)
+    const first = await createReservationFor(store, '71가7171', 'waiting')
+    const body = validBody(store, { carNumber: '71가7171' })
+    assert.equal((await postCart(body)).body.linkedReservation, true)
+    const cartId = (await getPosCarts(store)).body.carts[0].id
+    assert.equal((await prisma.erpCart.findUnique({ where: { id: cartId } })).reservationId, first.id)
+    await consumeCart(store, cartId, { result: 'loaded' })
+
+    await breakIt(first.id)
+    const replacement = await createReservationFor(store, '71가7171', 'waiting')
+    const res = await markPaid(store, cartId, { paymentId: `p-${label}` })
+    assert.equal(res.body.reservationCompleted, true, `${label}: ${JSON.stringify(res.body)}`)
+    assert.equal((await prisma.erpCart.findUnique({ where: { id: cartId } })).reservationId, replacement.id, label)
+    assert.equal((await prisma.reservation.findUnique({ where: { id: replacement.id } })).status, 'completed')
+  }
+})
+
+testSerial('결제 후 예약 연결: 대체할 예약이 없거나 둘 이상이면 원래 연결을 그대로 둔다', async () => {
+  const store = await createStore('relink-keep')
+  const first = await createReservationFor(store, '72가7272', 'waiting')
+  assert.equal((await postCart(validBody(store, { carNumber: '72가7272' }))).body.linkedReservation, true)
+  const cartId = (await getPosCarts(store)).body.carts[0].id
+  await consumeCart(store, cartId, { result: 'loaded' })
+  await prisma.reservation.update({ where: { id: first.id }, data: { status: 'cancelled' } })
+  await createReservationFor(store, '72가7272', 'waiting')
+  await createReservationFor(store, '72가7272', 'waiting') // 후보가 둘이면 애매하다
+  await markPaid(store, cartId, { paymentId: 'p-keep' })
+  assert.equal((await prisma.erpCart.findUnique({ where: { id: cartId } })).reservationId, first.id)
 })
 
 testSerial('예약 연결: 차량번호를 안 보내도 접수는 정상 동작한다', async () => {
@@ -1667,6 +1898,28 @@ testSerial('이력: 차량번호로 지난 방문과 품목이 나온다', async
   assert.equal(visit.orders.length, 1)
   assert.equal(visit.orders[0].items[0].name, '엔진오일 5W30 (4L)')
   assert.equal(visit.orders[0].paid, true)
+})
+
+testSerial('이력: 이어진 예약이 이력에서 빠진(숨김) 주문은 주문만 있는 방문으로 남는다', async () => {
+  const store = await createStore('hist-orphan')
+  const { reservation } = await visitWithOrder(store, '29가2929', '엔진오일 교환')
+  assert.equal((await getHistory(store, '29가2929')).body.visits.length, 1)
+
+  // 예약만 이력에서 숨겼다(주문은 그대로). 예전에는 주문이 붙을 방문이 없어 정비 기록이 통째로 사라졌다.
+  await prisma.reservation.update({ where: { id: reservation.id }, data: { historyHiddenAt: new Date() } })
+  const res = await getHistory(store, '29가2929')
+  assert.equal(res.body.visits.length, 1)
+  const visit = res.body.visits[0]
+  assert.equal(visit.kind, 'order')
+  assert.equal(visit.orders.length, 1)
+  assert.equal(visit.orders[0].items[0].name, '엔진오일 5W30 (4L)')
+
+  // 예약이 이력에 보이는 정상 방문은 예약 밑에 붙는 그대로다.
+  await prisma.reservation.update({ where: { id: reservation.id }, data: { historyHiddenAt: null } })
+  const normal = (await getHistory(store, '29가2929')).body.visits
+  assert.equal(normal.length, 1)
+  assert.equal(normal[0].kind, 'reservation')
+  assert.equal(normal[0].orders.length, 1)
 })
 
 testSerial('이력: 연락처를 전체 번호로 주고, 전산 고객명을 함께 준다', async () => {
@@ -2314,8 +2567,50 @@ testSerial('정비 이력 삭제: 결제 취소가 진행 중인 주문이 있�
   assert.equal((await postCart(validBody(store, { carNumber: '27가2727' }))).status, 201)
   const lone = (await getPosCarts(store)).body.carts.find((c) => c.carNumber === '27가2727')
   await consumeCart(store, lone.id, { result: 'loaded' })
+  // 담기만 하고 결제 전인 주문은 지울 수 없다 -- 지우면 뒤늦은 결제 통보가 집계에서 빠진 채 돈만 나간 주문이 된다.
+  assert.equal((await request(app).post('/api/pos/history/delete').set('X-Store-Token', store.posToken).send({ cartId: lone.id })).status, 409)
+  assert.equal((await getHistory(store, '27가2727')).body.visits.length, 1)
+  await markPaid(store, lone.id, { paymentId: 'p-lone' })
   assert.equal((await request(app).post('/api/pos/history/delete').set('X-Store-Token', store.posToken).send({ cartId: lone.id })).status, 200)
   assert.equal((await getHistory(store, '27가2727')).body.visits.length, 0)
+})
+
+testSerial('정비 이력 삭제·숨기기: 결제 전·결제 중인 주문이 이어진 방문은 삭제할 수 없고, 숨겨도 그 주문은 남는다', async () => {
+  const store = await createStore('hist-busy')
+  const today = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10)
+  const reservation = await prisma.reservation.create({
+    data: { storeId: store.id, carNumber: '31가3131', phone: '01012345678', serviceType: '점검', queueNumber: 31, serviceDate: today, status: 'called', calledAt: new Date() },
+  })
+  const paidBody = validBody(store, { carNumber: '31가3131' })
+  assert.equal((await postCart(paidBody)).status, 201)
+  const paidCartId = (await getPosCarts(store)).body.carts[0].id
+  await consumeCart(store, paidCartId, { result: 'loaded' })
+  await markPaid(store, paidCartId, { paymentId: 'p-hist-busy' })
+  // 같은 방문에 이어진 두 번째 주문은 아직 결제 전이다.
+  await prisma.erpCart.update({ where: { id: paidCartId }, data: { reservationId: reservation.id } })
+  const second = await postCart(validBody(store, { carNumber: '31가3131' }))
+  assert.equal(second.status, 201)
+  const secondId = (await getPosCarts(store)).body.carts[0].id
+  await prisma.erpCart.update({ where: { id: secondId }, data: { reservationId: reservation.id } })
+  const del = () => request(app).post('/api/pos/history/delete').set('X-Store-Token', store.posToken).send({ reservationId: reservation.id })
+  const hide = () => request(app).post('/api/pos/history/hide').set('X-Store-Token', store.posToken).send({ reservationId: reservation.id })
+
+  for (const status of ['pending', 'loaded', 'paying']) {
+    await prisma.erpCart.update({ where: { id: secondId }, data: { status } })
+    assert.equal((await del()).status, 409, status)
+  }
+  assert.equal((await prisma.reservation.findUnique({ where: { id: reservation.id } })).historyHiddenAt, null)
+  assert.equal((await prisma.erpCart.findUnique({ where: { id: paidCartId } })).deletedAt, null)
+
+  // 숨기기는 되지만 결제가 끝난 주문만 숨겨진다. 결제 전 주문은 [최근 결제]에 계속 보여야 끝낼 수 있다.
+  await prisma.erpCart.update({ where: { id: secondId }, data: { status: 'loaded' } })
+  assert.equal((await hide()).status, 200)
+  assert.ok((await prisma.erpCart.findUnique({ where: { id: paidCartId } })).hiddenAt)
+  assert.equal((await prisma.erpCart.findUnique({ where: { id: secondId } })).hiddenAt, null)
+
+  // 주문 하나만 지정해 숨길 때도 결제 전 주문은 숨겨지지 않는다(대상이 없으면 404).
+  assert.equal((await request(app).post('/api/pos/history/hide').set('X-Store-Token', store.posToken).send({ cartId: secondId })).status, 404)
+  assert.equal((await prisma.erpCart.findUnique({ where: { id: secondId } })).hiddenAt, null)
 })
 
 testSerial('최근 결제: POS에 담았지만 결제 전인 주문도 맨 위에 loaded로 보이고, 결제하면 paid로 바뀐다', async () => {

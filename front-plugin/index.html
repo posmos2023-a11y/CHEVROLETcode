@@ -18,47 +18,123 @@
       // 대기화면. 아래 두 버튼(예약/결제)과 별개로, 매장 토큰이 설정돼 있으면 전산이 이 프론트로
       // 보낸 정비 주문이 있는지 몇 초마다 확인해서, 있으면 결제 화면(erp-pay.html)으로 넘어간다.
       const ERP_POLL_MS = 3000
+      const ERP_RECOVER_TIMEOUT_MS = 15000 // 지난 결제 복구 한 번에 기다리는 최대 시간
+      const ERP_RECOVER_RETRY_TICKS = 20 // 복구가 끝나지 않았을 때 몇 번째 폴링마다 다시 시도할지(3초 x 20 = 약 1분)
+      const ERP_RETRY_MS = 10000 // 토큰이 없거나 시작에 실패했을 때 다시 보는 간격
+      const ERP_TOKEN_TOAST_INTERVAL_MS = 60000 // 토큰 없음 안내를 다시 띄우는 최소 간격
+
+      // 토스트는 안내일 뿐이다. 거부된 Promise를 돌려주는 SDK에서도 unhandledrejection이 되지 않게 삼킨다.
+      function toast(options) {
+        try {
+          Promise.resolve(sdk.template.openToast?.(options)).catch(() => {})
+        } catch { /* 안내일 뿐 */ }
+      }
+
+      // 프론트를 초기화하면 매장 토큰이 지워지는데, 아무 안내 없이 전산 결제만 조용히 안 받아져서 직원이 원인을 한참 찾았다.
+      // 대기화면은 손님 화면이라 처음 한 번만 띄우고, 그 뒤로는 토큰이 여전히 없을 때 1분에 한 번만 다시 띄운다. 토큰이 생기면
+      // 이 경로를 더 타지 않으므로 다시 띄우지 않는다.
+      let lastTokenToastAt = 0
+      function notifyTokenMissing() {
+        const now = Date.now()
+        if (now - lastTokenToastAt < ERP_TOKEN_TOAST_INTERVAL_MS) return
+        lastTokenToastAt = now
+        toast({ message: '매장 토큰이 없어 전산 결제를 받을 수 없습니다. 플러그인 설정에서 매장 토큰을 넣어주세요.', icon: 'error' })
+      }
+
+      // 지난번 결제·취소가 보고 없이 끝났으면(결제 도중 재시작 등) 마무리한다. 'pending'(아직 확인 못 함)이 하나라도 있으면 'pending'.
+      // 결제와 취소를 따로 돌린다 -- 한쪽이 멈춰도(SDK 호출은 시간 제한이 없다) 다른 쪽은 진행되게.
+      async function runRecovery(pay, token) {
+        const paid = pay.recoverInflight(token).then((r) => {
+          if (r === 'paid') toast({ message: '지난 결제 완료를 전산에 알렸습니다.', icon: 'success' })
+          return r
+        })
+        const refunded = pay.recoverRefundInflight(token).then((r) => {
+          if (r === 'refunded') toast({ message: '지난 결제 취소 완료를 전산에 알렸습니다.', icon: 'success' })
+          return r
+        })
+        const results = await Promise.all([paid, refunded])
+        return results.includes('pending') ? 'pending' : 'done'
+      }
 
       async function watchErpCarts() {
         const pay = window.ErpFrontPay
         const token = await pay.getToken()
-        if (!token) return // 매장 토큰을 안 넣은 프론트는 기존 기능(예약/결제)만 쓴다.
-
-        // 지난번 결제가 보고 없이 끝났으면(결제 도중 재시작 등) 먼저 마무리한다.
-        const recovered = await pay.recoverInflight(token)
-        if (recovered === 'paid') {
-          sdk.template.openToast?.({ message: '지난 결제 완료를 전산에 알렸습니다.', icon: 'success' })
-        }
-        const refundRecovered = await pay.recoverRefundInflight(token)
-        if (refundRecovered === 'refunded') {
-          sdk.template.openToast?.({ message: '지난 결제 취소 완료를 전산에 알렸습니다.', icon: 'success' })
+        if (!token) {
+          // 예전엔 여기서 그냥 끝나서, 토큰을 나중에 넣어도 프론트를 다시 켜기 전까지 전산 결제를 못 받았다.
+          notifyTokenMissing()
+          setTimeout(startWatching, ERP_RETRY_MS)
+          return
         }
 
         let stopped = false
+        let ticks = 0
+        let recoveryNeeded = true
+        let recoveryRunning = false
+
+        // 복구는 폴링과 별개로 뒤에서 돈다. 예전엔 복구를 await한 뒤에야 폴링이 시작돼서, 복구 중 서버가 느리거나 SDK 호출
+        // (getPayment)이 끝나지 않으면 새 결제 주문을 영영 못 받았다. 15초 안에 안 끝나면 기다리기를 그만두고 '아직 안 끝남'으로
+        // 두어 나중에 다시 시도한다(원래 호출은 계속 돌 수 있다 -- 겹쳐 돌아도 서버가 같은 보고를 멱등하게 받는다).
+        const recoverInBackground = async () => {
+          if (recoveryRunning) return
+          recoveryRunning = true
+          let timer
+          try {
+            const outcome = await Promise.race([
+              runRecovery(pay, token),
+              new Promise((resolve) => { timer = setTimeout(() => resolve('timeout'), ERP_RECOVER_TIMEOUT_MS) }),
+            ])
+            recoveryNeeded = outcome !== 'done'
+          } catch (e) {
+            console.error('[index] 지난 결제 복구 실패', e)
+            recoveryNeeded = true
+          } finally {
+            clearTimeout(timer)
+            recoveryRunning = false
+          }
+        }
+
         const tick = async () => {
           if (stopped) return
-          const { ok, body } = await pay.listCarts(token)
-          const carts = ok ? (body.carts || []).filter((c) => !pay.isSnoozed(pay.cartSnoozeKey(c))) : []
-          // 정비 대기열에서 요청한 결제 취소도 같은 화면(erp-pay.html)에서 처리한다.
-          const refunds = ok ? (body.refunds || []).filter((r) => !pay.isSnoozed(pay.refundSnoozeKey(r))) : []
-          if (carts.length || refunds.length) {
-            stopped = true
-            location.href = './erp-pay.html'
-            return
+          ticks += 1
+          // 복구가 끝나지 않은 동안(기록이 남아 있는 동안)은 20번째 폴링마다 다시 시도한다.
+          if (recoveryNeeded && ticks % ERP_RECOVER_RETRY_TICKS === 0) recoverInBackground()
+          // 예외(SDK·저장소 오류 등)가 setTimeout 재예약을 끊으면 폴링이 영영 멈춘다 -- 잡아서 다음 폴링을 반드시 건다.
+          try {
+            const { ok, body } = await pay.listCarts(token)
+            const carts = ok ? (body.carts || []).filter((c) => !pay.isSnoozed(pay.cartSnoozeKey(c))) : []
+            // 정비 대기열에서 요청한 결제 취소도 같은 화면(erp-pay.html)에서 처리한다.
+            const refunds = ok ? (body.refunds || []).filter((r) => !pay.isSnoozed(pay.refundSnoozeKey(r))) : []
+            if (carts.length || refunds.length) {
+              stopped = true
+              location.href = './erp-pay.html'
+              return
+            }
+          } catch (e) {
+            console.error('[index] 전산 주문 확인 오류', e)
           }
           setTimeout(tick, ERP_POLL_MS)
         }
-        tick()
 
         // 손님이 예약/결제 버튼을 눌러 다른 화면으로 가는 순간 폴링을 멈춘다(페이지 이동으로 자연히
         // 멈추지만, 이동 중에 결제 화면으로 끼어드는 일을 확실히 막는다).
         window.addEventListener('pagehide', () => { stopped = true })
+
+        tick()
+        recoverInBackground()
       }
 
-      // [결제하기](금액을 직접 넣는 payment.html)는 뺐다. 정비 결제는 전산 주문이 들어오면 아래 watchErpCarts가
+      // 시작에 실패해도(토큰 읽기 오류 등) 10초 뒤 다시 시도한다. 한 번 실패로 전산 결제를 영영 못 받게 두지 않는다.
+      function startWatching() {
+        watchErpCarts().catch((e) => {
+          console.error('[index] 전산 주문 확인 실패', e)
+          setTimeout(startWatching, ERP_RETRY_MS)
+        })
+      }
+
+      // [결제하기](금액을 직접 넣는 payment.html)는 뺐다. 정비 결제는 전산 주문이 들어오면 위 watchErpCarts가
       // 결제 화면(erp-pay.html)으로 자동으로 넘기므로, 손님이 누를 버튼은 예약 하나면 된다.
       // 전산 주문 확인을 화면 그리기보다 **먼저** 시작한다 -- 대기화면 그리기에서 오류가 나도 결제 주문은 받아 가야 한다.
-      watchErpCarts().catch((e) => console.error('[index] 전산 주문 확인 실패', e))
+      startWatching()
 
       try {
         sdk.template.renderIdlePage({

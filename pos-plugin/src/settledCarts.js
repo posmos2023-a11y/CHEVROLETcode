@@ -15,6 +15,7 @@
 // 꺼낼 수 있다). [삭제]는 탭앱·오늘 현황·관리자 웹 어디에도 안 보이게 한다(서버는 행을 지우지 않는다 --
 // 실제 결제라 분쟁·대사 근거가 남아야 한다). [영수증 보내기]는 예약 손님 번호로 전자영수증을 (다시) 보낸다.
 import { posPluginSdk } from '@tossplace/pos-plugin-sdk'
+import { forgetLoadedCart, peekLoadedCartKeys } from './erpCarts.js'
 
 const listEl = document.getElementById('settled-cart-list')
 
@@ -27,6 +28,11 @@ let showHidden = false
 const ONE_TAP = new Set(['hide', 'unhide'])
 // SDK로 취소를 시도했다가 실패한 POS 결제. 이 카드에는 [POS에서 취소했어요] 버튼을 보여준다.
 const sdkCancelFailed = new Set()
+// SDK 30초 시간 제한("지연되고 있습니다")에 걸린 POS 결제. 취소가 실패한 게 아니라 결과를 모르는 상태라서
+// sdkCancelFailed와 따로 둔다 -- 그쪽에 넣으면 [결제 취소]가 사라져, 실제로는 취소 안 된 결제를 여기서 다시 못 취소한다.
+const sdkCancelTimedOut = new Set()
+// 프론트 취소(refunding)가 이 시간보다 오래 갇혀 있으면 [취소 중 풀기]를 보여준다. 서버가 같은 10분을 다시 확인한다.
+const STUCK_REFUND_MS = 10 * 60 * 1000
 
 export function initSettledCarts(injected) {
   deps = injected
@@ -36,8 +42,10 @@ export function initSettledCarts(injected) {
 export function applySettledCarts(carts) {
   if (!deps) return
   lastCarts = Array.isArray(carts) ? carts : []
-  // 진행 중인 동작이 있으면 버튼이 되살아나지 않게 다시 그리지 않는다(erpCarts.js inFlight와 같은 이유).
-  if (busy.size === 0) render()
+  // 동작이 진행 중이어도 다시 그린다. 예전에는 busy가 하나라도 있으면 그리지 않았는데, 결제 취소는 SDK 응답을
+  // 최대 30초 기다리므로 그 사이 다른 카드의 변화(프론트 취소 완료 등)가 화면에 안 떴다. 눌린 카드의 버튼은
+  // button()이 busy를 보고 disabled로 그리고, 두 번 누르기 확인(confirming)은 render와 별개로 들고 있어 유지된다.
+  render()
 }
 
 function formatWon(value) {
@@ -57,12 +65,32 @@ function formatTime(value) {
 
 const METHOD_LABEL = { CARD: '카드', CASH: '현금', BARCODE: '간편결제' }
 
+// 진행 중인 프론트 취소. 서버가 숨기기를 거부(409)하므로 숨김 상태와 관계없이 늘 목록에 보이고 [숨기기]도 없다.
+function isRefundInProgress(cart) {
+  return cart.status === 'refund_requested' || cart.status === 'refunding'
+}
+
+// 'refunding'이 10분 넘게 풀리지 않았으면 갇힌 분(分) 수, 아니면 null. 프론트 플러그인이 카드 취소 도중 꺼지면
+// 서버는 그 주문을 계속 'refunding'으로 둔다. 시작 시각은 refundStartedAt, 옛 서버에는 없어 refundRequestedAt으로 대신한다.
+function stuckRefundMinutes(cart) {
+  if (cart.status !== 'refunding') return null
+  const since = Date.parse(cart.refundStartedAt || cart.refundRequestedAt || '')
+  if (!Number.isFinite(since)) return null
+  const elapsed = Date.now() - since
+  return elapsed > STUCK_REFUND_MS ? Math.floor(elapsed / 60000) : null
+}
+
 function statusLabel(cart) {
   switch (cart.status) {
     case 'loaded': return { text: 'POS에 담김 · 결제 전', cls: 'pending' }
     case 'paid': return { text: '결제 완료', cls: 'paid' }
     case 'refund_requested': return { text: '프론트 취소 대기', cls: 'pending' }
-    case 'refunding': return { text: '프론트에서 취소 중', cls: 'paying' }
+    case 'refunding': {
+      const minutes = stuckRefundMinutes(cart)
+      return minutes === null
+        ? { text: '프론트에서 취소 중', cls: 'paying' }
+        : { text: `프론트에서 취소 중 · ${minutes}분째`, cls: 'paying stuck' }
+    }
     case 'refunded': return { text: '취소됨', cls: 'refunded' }
     default: return { text: cart.status, cls: '' }
   }
@@ -86,7 +114,12 @@ function toolsFor(cart) {
   if (cart.status === 'paid') {
     parts.push(button('receipt', cart, cart.receiptStatus === 'sent' ? '영수증 다시 보내기' : '영수증 보내기', '손님께 영수증 보낼까요?'))
   }
-  parts.push(cart.hidden ? button('unhide', cart, '다시 보이기', '') : button('hide', cart, '숨기기', ''))
+  if (isRefundInProgress(cart)) {
+    // 진행 중인 취소는 숨길 수 없다. 숨긴 채 진행 중이 된 건만 다시 보이게 할 수 있다.
+    if (cart.hidden) parts.push(button('unhide', cart, '다시 보이기', ''))
+  } else {
+    parts.push(cart.hidden ? button('unhide', cart, '다시 보이기', '') : button('hide', cart, '숨기기', ''))
+  }
   if (cart.status === 'paid' || cart.status === 'refunded') {
     parts.push(button('delete', cart, '삭제', '정말 삭제할까요?', 'danger'))
   }
@@ -94,16 +127,31 @@ function toolsFor(cart) {
 }
 
 function actionsFor(cart) {
-  if (cart.status === 'refunded' || cart.status === 'refunding' || cart.status === 'loaded') return ''
+  if (cart.status === 'refunded') return ''
+
+  // POS에 담았지만 아직 결제하지 않은 주문. 잘못 담았을 때 전산 주문 목록으로 되돌린다. 이 탭앱이 담은
+  // 품목(기록에 남은 key)은 POS [주문]에서도 함께 지운다(unloadCart).
+  if (cart.status === 'loaded') {
+    return button('unload', cart, '담기 취소(다시 대기로)', '정말 되돌릴까요? POS [주문]의 품목도 함께 지웁니다', 'wrap')
+  }
+
+  // 'refunding'은 프론트 플러그인이 카드를 취소하는 중이라 손댈 게 없다. 10분 넘게 갇힌 경우만 풀 수 있다.
+  if (cart.status === 'refunding') {
+    return stuckRefundMinutes(cart) === null
+      ? ''
+      : button('force-release', cart, '취소 중 풀기', '손님 카드가 실제로 취소되지 않았는지 확인했나요?', 'danger wrap')
+  }
 
   if (cart.payTarget === 'pos' && cart.status === 'paid') {
     const shared = cart.sharedPaymentCount > 1
     const cancelConfirm = shared ? `함께 결제된 ${cart.sharedPaymentCount}건 모두 취소?` : '정말 결제 취소할까요?'
+    const hasIds = Boolean(cart.tossPaymentId && cart.tossOrderId)
     const parts = []
-    if (cart.tossPaymentId && cart.tossOrderId && !sdkCancelFailed.has(cart.id)) {
+    if (hasIds && !sdkCancelFailed.has(cart.id)) {
       parts.push(button('pos-cancel', cart, '결제 취소', cancelConfirm, 'danger'))
     }
-    if (!cart.tossPaymentId || !cart.tossOrderId || sdkCancelFailed.has(cart.id)) {
+    // 시간 초과는 두 버튼을 함께 둔다: 취소가 됐을 수도 안 됐을 수도 있어서, 안 됐으면 다시 취소하고 됐으면 기록한다.
+    if (!hasIds || sdkCancelFailed.has(cart.id) || sdkCancelTimedOut.has(cart.id)) {
       parts.push(button('pos-recorded', cart, 'POS에서 취소했어요', '취소 완료로 기록할까요?'))
     }
     return parts.join('')
@@ -120,8 +168,10 @@ function actionsFor(cart) {
 
 function render() {
   if (!listEl) return
-  const hiddenCount = lastCarts.filter((c) => c.hidden).length
-  const visible = showHidden ? lastCarts : lastCarts.filter((c) => !c.hidden)
+  // 진행 중인 취소는 숨겨 둔 건이라도 보여준다 -- 갇혀도 [취소 중 풀기]를 누를 카드가 안 보이면 풀 방법이 없다.
+  const isHiddenAway = (c) => c.hidden && !isRefundInProgress(c)
+  const hiddenCount = lastCarts.filter(isHiddenAway).length
+  const visible = showHidden ? lastCarts : lastCarts.filter((c) => !isHiddenAway(c))
   const hiddenBar = hiddenCount
     ? `<button class="settled-hidden-toggle" type="button" data-toggle-hidden="1">${showHidden ? '숨긴 결제 감추기' : `숨긴 결제 ${hiddenCount}건 보기`}</button>`
     : ''
@@ -160,6 +210,7 @@ function render() {
           <div class="erp-cart-total">${formatWon(cart.totalAmount)}</div>
           ${cart.status === 'refunded' && cart.refundNote ? `<div class="erp-cart-memo">${deps.escapeHtml(cart.refundNote)} · ${formatTime(cart.refundedAt)}</div>` : ''}
           ${cart.errorMessage && cart.status !== 'refunded' ? `<div class="erp-cart-memo settled-error">${deps.escapeHtml(cart.errorMessage)}</div>` : ''}
+          ${sdkCancelTimedOut.has(cart.id) && cart.status === 'paid' ? '<div class="erp-cart-memo settled-warn">POS [주문]에서 이 결제가 취소됐는지 확인해주세요. 취소됐으면 [POS에서 취소했어요]를, 아니면 [결제 취소]를 다시 눌러주세요.</div>' : ''}
           ${receipt ? `<div class="erp-cart-memo">${deps.escapeHtml(receipt)}</div>` : ''}
           ${actions ? `<div class="erp-cart-actions">${actions}</div>` : ''}
           ${tools ? `<div class="erp-cart-actions settled-tools">${tools}</div>` : ''}
@@ -253,16 +304,75 @@ async function run(action, cartId) {
       markLocal([cartId], { status: 'paid' })
       return deps.notify('success', '취소 요청을 철회했습니다.')
     }
+    if (action === 'unload') return await unloadCart(cartId)
+    if (action === 'force-release') {
+      // 409(10분이 안 됐거나 이미 풀림)는 서버 문구를 그대로 보여준다.
+      const res = await post(`/api/pos/erp-carts/${cartId}/force-release`)
+      if (!res.ok) return deps.notify('error', res.body.error || '취소 중 상태를 풀지 못했습니다.')
+      markLocal([cartId], { status: 'paid', refundStartedAt: null })
+      return deps.notify('success', '취소 중 상태를 풀었습니다. 다시 취소하려면 [프론트에서 취소]를 눌러주세요.')
+    }
   } finally {
     busy.delete(cartId)
     render()
   }
 }
 
+// 서버를 먼저 되돌리고(실패하면 POS 장바구니는 그대로 둔다) 그다음 이 탭앱이 담은 품목만 지운다. 지우기 전에
+// 장바구니를 읽어 아직 남아 있는 key만 지운다 -- 직원이 이미 지웠거나 결제로 비워진 품목을 다시 건드리지 않는다.
+async function unloadCart(cartId) {
+  const keys = peekLoadedCartKeys(cartId)
+  let present = []
+  if (keys.length) {
+    try {
+      const draft = await posPluginSdk.draftOrder.get()
+      const inDraft = new Set((draft?.lineItems || []).map((li) => li && li.key).filter(Boolean))
+      present = keys.filter((key) => inDraft.has(key))
+    } catch {
+      present = []
+    }
+  }
+  const res = await post(`/api/pos/erp-carts/${cartId}/unload`)
+  // 409인데 이미 pending이면 다른 단말기가 먼저 되돌린 것이다 -- 완료로 보고 이 단말기의 품목만 정리한다.
+  const alreadyPending = res.status === 409 && res.body?.status === 'pending'
+  if (!res.ok && !alreadyPending) return deps.notify('error', res.body.error || '전산 주문 목록으로 되돌리지 못했습니다.')
+  lastCarts = lastCarts.filter((c) => c.id !== cartId)
+  // 전산 주문 목록 쪽에 남은 "POS에 담는 중/결제 대기" 기록을 지우고 목록을 새로 불러온다(erpCarts.js).
+  forgetLoadedCart(cartId)
+  let failed = 0
+  for (const key of present) {
+    try {
+      await posPluginSdk.draftOrder.deleteLineItem(key)
+    } catch {
+      failed += 1
+    }
+  }
+  if (!present.length) {
+    return deps.notify('success', '전산 주문 목록으로 되돌렸습니다. POS [주문]에 이 품목이 남아 있으면 지워주세요.')
+  }
+  if (failed) {
+    return deps.notify('error', `전산 주문 목록으로 되돌렸지만 POS 품목 ${failed}개를 지우지 못했습니다. POS [주문]에서 직접 지워주세요.`)
+  }
+  return deps.notify('success', 'POS [주문]에서 품목을 지우고 전산 주문 목록으로 되돌렸습니다.')
+}
+
 async function cancelOnPos(cart) {
+  sdkCancelTimedOut.delete(cart.id)
   try {
     await posPluginSdk.payment.cancel({ id: cart.tossOrderId }, { id: cart.tossPaymentId })
   } catch (e) {
+    // SDK는 30초 안에 응답이 없으면 "지연되고 있습니다"라는 오류를 던진다. 취소가 거절된 게 아니라 결과를 모르는
+    // 것이다 -- 실제로는 취소됐을 수 있다. 이걸 "탭앱에서 취소가 안 되는 결제"(아래)로 취급하면 [결제 취소]가 사라져
+    // 취소 안 된 결제를 다시 못 취소하고, 반대로 [POS에서 취소했어요]만 보이면 확인 없이 취소 완료로 기록하기 쉽다.
+    // 그래서 두 버튼을 모두 보여주고 POS [주문]에서 먼저 확인하게 한다.
+    if (String(e?.message || e).includes('지연되고 있습니다')) {
+      sdkCancelTimedOut.add(cart.id)
+      deps.notify(
+        'error',
+        `POS [주문]에서 이 결제가 취소됐는지 확인해주세요. 취소됐으면 [POS에서 취소했어요]를 눌러주세요. (${e?.message || e})`
+      )
+      return
+    }
     // 탭앱에서 바로 취소가 안 되는 결제다. 직원이 POS에서 직접 취소하고 기록하게 한다.
     sdkCancelFailed.add(cart.id)
     deps.notify(

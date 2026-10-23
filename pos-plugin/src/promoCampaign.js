@@ -117,6 +117,30 @@ function lockForm(locked) {
     .forEach((node) => { node.disabled = locked })
 }
 
+// 기간 입력의 기본값(최근 30일 ~ 오늘)을 마지막으로 코드가 넣은 값. 탭앱은 POS에 며칠씩 켜 둔 채 쓰므로 앱을 처음 연
+// 날로 고정해 두면 며칠 뒤에는 "오늘"이 기간 밖이라 오늘 방문한 손님이 목록에 안 나온다. 화면에 들어올 때마다
+// 입력값이 이 값과 같으면(직원이 손대지 않았으면) 오늘 기준으로 다시 계산한다. 직원이 고른 기간은 건드리지 않는다.
+let autoFrom = ''
+let autoTo = ''
+
+function applyDefaultDates() {
+  const from = el('promo-campaign-from')
+  const to = el('promo-campaign-to')
+  if (!from || !to) return
+  const today = kstDate(0)
+  from.max = to.max = today
+  // 발송 중에는 입력이 잠겨 있고 발송이 끝나면 그 기간으로 다시 불러온다 -- 값을 바꾸지 않는다.
+  if (sending) return
+  if (from.value === autoFrom) {
+    autoFrom = kstDate(-30)
+    from.value = autoFrom
+  }
+  if (to.value === autoTo) {
+    autoTo = today
+    to.value = autoTo
+  }
+}
+
 export function initPromoCampaign(injected) {
   deps = injected
   const from = el('promo-campaign-from')
@@ -124,9 +148,11 @@ export function initPromoCampaign(injected) {
   const form = el('promo-campaign-form')
   if (!from || !to || !form) return
 
-  from.value = kstDate(-30)
-  to.value = kstDate(0)
-  from.max = to.max = kstDate(0)
+  autoFrom = kstDate(-30)
+  autoTo = kstDate(0)
+  from.value = autoFrom
+  to.value = autoTo
+  from.max = to.max = autoTo
 
   // 폼 submit(버튼 라벨은 '새로고침')은 같은 기간을 처음부터 다시 불러온다.
   form.addEventListener('submit', (e) => {
@@ -175,9 +201,9 @@ export function initPromoCampaign(injected) {
 
 // --- 시연 모드 ---------------------------------------------------------------------
 // 켜면 그날 자정까지 이 매장의 "같은 번호 30일 내 재발송 금지"가 꺼진다(서버가 자정에 저절로 끈다).
-// 수신 동의·수신거부·야간 금지는 그대로다. 켜는 건 안전장치를 끄는 일이라 두 번 눌러야 켜진다.
+// 수신 동의·수신거부·야간 금지는 그대로다. 시연이 끝나 실매장에서는 탭앱으로 켜지 않는다 -- 같은 손님에게
+// 광고 문자가 반복해서 나갈 수 있다. 본사가 관리자 웹에서 켠 경우에만 카드가 보이고, 여기서는 끄기만 된다.
 let demoMode = false
-let demoConfirmTimer = null
 
 function formatTime(value) {
   return new Intl.DateTimeFormat('ko-KR', { month: 'numeric', day: 'numeric', hour: 'numeric', minute: '2-digit' }).format(new Date(value))
@@ -189,6 +215,7 @@ function renderDemo(body) {
   const status = el('promo-demo-status')
   const btn = el('promo-demo-toggle')
   if (!card || !status || !btn) return
+  card.hidden = !demoMode
   card.classList.toggle('is-on', demoMode)
   status.textContent = demoMode
     ? `켜짐 — 같은 번호로 바로 다시 보낼 수 있습니다. ${formatTime(body.demoUntil)}에 저절로 꺼집니다.`
@@ -204,8 +231,6 @@ export async function loadPromoDemo() {
   const { ok, status, body } = await deps.apiGet('/api/pos/promo/demo-mode')
   if (!ok) {
     if (status === 401) deps.onUnauthorized(body.error)
-    const s = el('promo-demo-status')
-    if (s) s.textContent = '시연 모드 상태를 확인하지 못했습니다.'
     return
   }
   renderDemo(body)
@@ -215,6 +240,7 @@ export async function loadPromoDemo() {
 // 발송 중에 다시 들어오면 목록은 건드리지 않는다(발송이 끝나면 스스로 다시 불러온다).
 export async function loadPromoView() {
   if (!deps) return
+  applyDefaultDates()
   const demo = loadPromoDemo()
   const list = sending ? Promise.resolve() : startLoad()
   await Promise.all([demo, list])
@@ -222,20 +248,9 @@ export async function loadPromoView() {
 
 async function handleDemoToggle() {
   const btn = el('promo-demo-toggle')
-  if (!btn || btn.disabled) return
-  const enabling = !demoMode
-  if (enabling && !demoConfirmTimer) {
-    btn.classList.add('confirming')
-    btn.textContent = '한 번 더 누르면 켜짐'
-    demoConfirmTimer = setTimeout(() => {
-      demoConfirmTimer = null
-      btn.classList.remove('confirming')
-      btn.textContent = '켜기'
-    }, 3000)
-    return
-  }
-  if (demoConfirmTimer) clearTimeout(demoConfirmTimer)
-  demoConfirmTimer = null
+  // 탭앱에서는 끄기만 한다(위 주석).
+  if (!btn || btn.disabled || !demoMode) return
+  const enabling = false
   btn.disabled = true
   let res
   try {
@@ -381,6 +396,9 @@ async function loadList({ append = false, quiet = false } = {}) {
 
 function renderBadge(row) {
   const e = deps.escapeHtml
+  // 방금 확실히 실패한 번호(서버가 잠시 보내기 목록에서 빼 둔다). 영영 못 보내는 게 아니라 시간이 지나면 다시 대상이
+  // 되므로 '제외' 사유 라벨 대신 언제 다시 되는지를 알려준다.
+  if (row.recentFailure) return '<span class="promo-campaign-badge">방금 실패 · 30분 뒤 재시도</span>'
   if (row.status === 'recently_sent') {
     const day = formatMonthDay(row.lastSentAt)
     return `<span class="promo-campaign-badge">${e(day ? `최근 받음 ${day}` : '최근 받음')}</span>`
@@ -484,6 +502,9 @@ async function deleteRow(phone) {
     startLoad({ append: false })
   } finally {
     rowDeleting.delete(phone)
+    // 시작할 때 [삭제]를 잠근 채 다시 그렸다. 실패하면(서버 오류·네트워크) 목록을 다시 불러오지 않으므로 여기서 그려
+    // 풀어주지 않으면 그 버튼이 영영 잠긴 채 남는다. 성공이면 곧 새 목록이 와서 덮어쓴다.
+    if (listState) renderList()
   }
 }
 
@@ -535,6 +556,10 @@ async function send(btn) {
   let remaining = state.eligible
   let stopReason = ''
   let errorText = ''
+  // 서버가 이번 발송 루프에 붙여 준 시작 시각. 첫 응답에서 받아 같은 루프의 다음 요청에 그대로 돌려보낸다(서버가
+  // "방금 실패한 번호"를 이 시각 기준으로 가려, 한 루프 안에서 같은 번호를 두 번 시도하지 않게 한다). 지역 변수라
+  // 새 발송을 시작하면 자동으로 비워진다 -- 지난 발송의 시각을 새 발송에 붙이면 안 된다.
+  let runStartedAt = ''
   try {
     for (let round = 0; round < MAX_ROUNDS; round += 1) {
       const processed = t.sent + t.failed + t.uncertain + t.skipped
@@ -542,7 +567,10 @@ async function send(btn) {
       let res
       try {
         res = await deps.apiPost('/api/pos/promo-campaign/send', {
-          from: state.from, to: state.to, confirmCount: Math.max(0, state.eligible - processed),
+          from: state.from,
+          to: state.to,
+          confirmCount: Math.max(0, state.eligible - processed),
+          ...(runStartedAt ? { runStartedAt } : {}),
         })
       } catch {
         res = { ok: false, status: 0, body: { error: '서버에 연결하지 못했습니다.' } }
@@ -557,6 +585,7 @@ async function send(btn) {
         break
       }
       for (const k of Object.keys(t)) t[k] += res.body[k] || 0
+      if (res.body.runStartedAt) runStartedAt = res.body.runStartedAt
       remaining = res.body.remaining
       const progressed = (res.body.sent || 0) + (res.body.failed || 0) + (res.body.uncertain || 0) + (res.body.skipped || 0)
       if (res.body.stopped === 'night') {
@@ -571,6 +600,14 @@ async function send(btn) {
       const text = `${errorText} (${summary(t, 0)}) 아래 목록에서 남은 대상을 다시 확인하세요.`
       setMessage(text, 'error')
       deps.notify('error', text)
+      return
+    }
+    // 한 건도 처리하지 못했고 남은 것도 없다: 목록을 본 뒤 그 사이 대상이 빠졌다(방금 실패한 번호는 서버가 30분 동안
+    // 보내기에서 뺀다). "보냄 0건"을 성공 문구로 보여주면 보낸 줄 안다.
+    if (!t.sent && !t.failed && !t.uncertain && !t.skipped && !remaining && !stopReason) {
+      const text = '지금 보낼 대상이 없습니다(방금 실패한 번호는 30분 뒤 다시 보낼 수 있습니다)'
+      setMessage(text, 'error')
+      deps.notify('error', `홍보 문자: ${text}`)
       return
     }
     const clean = !t.failed && !t.uncertain && !remaining

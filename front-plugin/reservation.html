@@ -31,7 +31,29 @@
         { value: 'etc', title: '기타 수리·상담' },
       ]
 
+      // 무입력 제한. 손님이 입력·선택 화면에서 그냥 떠나면 다음 손님이 이전 손님의 차량번호가 남은 화면을 보게 되고, 프론트가
+      // 대기화면(전산 결제 주문을 받는 화면)으로 돌아가지 못해 결제 주문도 못 받는다. 화면을 새로 그릴 때마다 90초를 처음부터 센다.
+      // 예약을 서버에 보내는 동안(submitReservation)과 자체 타이머가 있는 결과 화면에서는 걸지 않는다 -- 요청 도중 화면을 옮기면
+      // 접수가 됐는지 손님이 알 수 없다.
+      const IDLE_TIMEOUT_MS = 90000
+      let idleTimer = null
+
+      function goIdle() {
+        location.href = './index.html'
+      }
+
+      function armIdleTimer() {
+        clearTimeout(idleTimer)
+        idleTimer = setTimeout(goIdle, IDLE_TIMEOUT_MS)
+      }
+
+      function disarmIdleTimer() {
+        clearTimeout(idleTimer)
+        idleTimer = null
+      }
+
       function showCarNumberInput(errorText) {
+        armIdleTimer()
         sdk.template.renderInputPage({
           type: 'text',
           top: {
@@ -51,13 +73,12 @@
             }
             showServiceTypeSelect(carNumber)
           },
-          onBack: () => {
-            location.href = './index.html'
-          },
+          onBack: goIdle,
         })
       }
 
       function showServiceTypeSelect(carNumber) {
+        armIdleTimer()
         sdk.template.renderSelectPage({
           title: '어떤 정비가 필요하신가요?',
           subtitle: '차량번호 ' + carNumber,
@@ -95,6 +116,7 @@
       // 바꿀 수 없어서(토스 Template API만 허용) 줄 길이를 비슷하게 맞춰 한쪽으로 쏠려 보이지 않게 한다.
       // 목적에 "정비 완료·결제 안내"를 넣었다 -- [완료] 안내 문자와 결제 영수증을 이 번호로 보낸다.
       function showConsent(carNumber, serviceType) {
+        armIdleTimer()
         sdk.template.renderSelectPage({
           title: '알림 안내를 위해\n동의가 필요해요',
           subtitle:
@@ -117,9 +139,7 @@
               onClick: () => showConsentDeclined(),
             },
           ],
-          onBack: () => {
-            location.href = './index.html'
-          },
+          onBack: goIdle,
         })
       }
 
@@ -128,15 +148,14 @@
       // 부정적 문구 대신, 정비는 받을 수 있음을 안내하고 직원 문의로 이어준다(사장님 방침: 동의 안 해도
       // 점검은 받을 수 있게).
       function showConsentDeclined() {
+        disarmIdleTimer() // 이 화면은 자체 타이머(6초)로 대기화면에 돌아간다 -- 앞 화면의 무입력 타이머가 남아 끼어들지 않게 끈다
         sdk.template.renderResultPage({
           type: 'text',
           text: '직원에게 문의해주세요',
           title: '동의 없이도 정비는 받으실 수 있어요',
           description: '예약 순서를 알림톡으로 안내받으시려면 동의가 필요해요. 동의를 원하지 않으시면 매장 직원에게 말씀해주시면 도와드리겠습니다.',
           timerMs: 6000,
-          onTimeout: () => {
-            location.href = './index.html'
-          },
+          onTimeout: goIdle,
           localeCode: 'ko',
         })
       }
@@ -148,6 +167,7 @@
       // 접수 시도이므로 굳이 바꿀 이유가 없다. 진짜 위험한 지점은 submitReservation의 catch였다
       // (아래 showNetworkErrorRetry 주석 참고) — 거기서 새 키를 만들면서 재접수가 새 예약으로 처리됐다.
       function showPhoneInput(carNumber, serviceType, consent, errorText, idempotencyKey = crypto.randomUUID()) {
+        armIdleTimer()
         sdk.template.renderInputPage({
           type: 'phone',
           top: {
@@ -171,6 +191,7 @@
       }
 
       async function submitReservation(carNumber, phone, serviceType, consent, idempotencyKey) {
+        disarmIdleTimer() // 서버에 보내는 동안은 걸지 않는다. 결과·오류 화면은 자체 타이머가 있고, 다시 입력 화면을 그리면 다시 건다
         try {
           // App API(https://docs.tossplace.com/reference/plugin-sdk/front/app.html)의 비동기 함수.
           // 실제 단말기에서는 토스프론트가 그 단말기에 온보딩된 실제 가맹점 정보를 반환하고,
@@ -220,9 +241,7 @@
             title: json.duplicate ? '이미 접수되어 있어요' : '예약이 접수되었습니다',
             description: `${json.serviceType || ''} · 순서가 되면 알림톡으로 안내드려요`,
             timerMs: 5000,
-            onTimeout: () => {
-              location.href = './index.html'
-            },
+            onTimeout: goIdle,
             localeCode: 'ko',
           })
         } catch (err) {
@@ -248,6 +267,7 @@
       // 중복을 걸러주고, "처음부터 새로 접수"를 고를 때만 새 키가 발급되는 흐름(showCarNumberInput)
       // 으로 넘어간다. 뒤로가기(onBack)도 데이터를 잃지 않도록 "다시 시도"와 동일하게 처리한다.
       function showNetworkErrorRetry(carNumber, phone, serviceType, consent, idempotencyKey) {
+        armIdleTimer() // 선택 화면이라 손님이 떠나면 그대로 남는다
         sdk.template.renderSelectPage({
           title: '네트워크 오류가 발생했습니다',
           subtitle:

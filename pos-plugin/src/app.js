@@ -5,7 +5,7 @@ installCrashGuard()
 import { posPluginSdk } from '@tossplace/pos-plugin-sdk'
 // 전산(ERP)이 담아둔 장바구니를 POS로 옮기는 화면. 대기열 폴링/토큰 화면과 관심사가 달라
 // 별도 파일로 뒀다 — app.js에서는 초기화와 "같은 폴링 타이머에서 같이 불러오기"만 담당한다.
-import { initErpCarts, refreshErpCarts, applyErpCarts, applyFrontCarts } from './erpCarts.js'
+import { initErpCarts, refreshErpCarts, applyErpCarts, applyFrontCarts, getErpGeneration, forgetLoadedCart } from './erpCarts.js'
 // 오늘 결제된 전산 주문과 결제 취소. 같은 대기열 폴링 응답(settledCarts)으로 갱신한다.
 import { initSettledCarts, applySettledCarts } from './settledCarts.js'
 // [홍보 문자] 화면: 기간을 정해 방문 손님에게 홍보 문자를 한 번에 보낸다.
@@ -15,7 +15,7 @@ import { initPromoCampaign, loadPromoView } from './promoCampaign.js'
 import { initHistory, openHistoryFor, loadRecentHistory } from './history.js'
 // 좌측 메뉴와 화면 전환. 화면을 나누면 전산 주문이 메뉴 뒤로 숨는데, 그때 새 주문을
 // 놓치지 않게 배지와 토스트로 알리는 것도 이 모듈이 맡는다.
-import { initNav, switchTo, registerViewLoader, updateBadges, notifyNewErpCarts } from './nav.js'
+import { initNav, switchTo, registerViewLoader, updateBadges, notifyNewErpCarts, notifyNewReservations } from './nav.js'
 
 // 실제 토스POS 단말기 밖(로컬 브라우저)에서 미리 볼 때는 posPluginSdk가 부모 프레임(POS 앱)과
 // 통신하지 못해 응답이 오지 않는다. 백엔드가 제공하는 미리보기에서는 같은 origin을 사용하고,
@@ -74,6 +74,7 @@ const waitingCountEl = document.getElementById('waiting-count')
 const nextNumberEl = document.getElementById('next-number')
 const lastUpdatedEl = document.getElementById('last-updated')
 const connectionDotEl = document.getElementById('connection-dot')
+const connectionBannerEl = document.getElementById('connection-banner')
 const refreshButtonEl = document.getElementById('refresh-button')
 const pageStatusEl = document.getElementById('page-status')
 const tokenScreenEl = document.getElementById('token-screen')
@@ -108,9 +109,17 @@ function notify(kind, message) {
   pageStatusEl.textContent = message
 }
 
+// 오른쪽 위 점 하나만으로는 연결이 끊긴 걸 아무도 모른다 -- 그동안 새 예약·전산 주문이 안 보이는데 직원은
+// "오늘 한가하네"로 받아들인다. 연속으로 3번 실패하면(15~45초) 화면 위에 띠를 띄운다. 한 번 실패는 흔해서 띄우지 않는다.
+const CONNECTION_BANNER_AFTER = 3
+let connectionErrors = 0
+
 function setConnection(state) {
   connectionDotEl.className = `connection-dot ${state === 'online' ? '' : state}`.trim()
   connectionDotEl.title = state === 'online' ? '서버 연결됨' : state === 'checking' ? '서버 확인 중' : '서버 연결 오류'
+  if (state === 'online') connectionErrors = 0
+  else if (state === 'error') connectionErrors += 1
+  if (connectionBannerEl) connectionBannerEl.hidden = connectionErrors < CONNECTION_BANNER_AFTER
 }
 
 function updateSummary(reservations) {
@@ -393,6 +402,7 @@ function applyQueueResponse(body) {
   if (body.storeName) storeNameEl.textContent = body.storeName
   todayServiceDate = body.serviceDate || todayServiceDate
   render(body.reservations || [])
+  notifyNewReservations(body.reservations)
 }
 
 // setInterval(아래 startPolling)은 콜백이 끝났는지 신경 쓰지 않고 다음 콜백을 그대로 실행한다.
@@ -422,6 +432,10 @@ async function loadQueue({ manual = false, bypassGuard = false } = {}) {
   if (!skipGuard) queueLoadInFlight = true
   if (manual || !lastReservations.length) setConnection('checking')
   try {
+    // 이 요청이 출발한 시점의 전산 주문 세대. 응답을 기다리는 사이 [POS로 되돌리기]·[프론트 결제]·[지우기] 같은
+    // 상태 변경이 성공하면 세대가 올라간다. 그러면 이 응답의 전산 주문·프론트 결제 목록은 변경 전에 만들어진
+    // 옛 상태라서, 반영하면 방금 되돌린 카드가 사라지거나 방금 넘긴 카드가 되살아난다(erpCarts.js erpGeneration).
+    const erpGeneration = getErpGeneration()
     const { ok, status, body } = await apiGet('/api/pos/queue')
     if (!ok) {
       if (status === 401) {
@@ -438,13 +452,18 @@ async function loadQueue({ manual = false, bypassGuard = false } = {}) {
     // 예전에는 경로를 따로 한 번 더 호출해서 매장당 폴링 요청이 두 배였다.
     // 아직 그 필드를 안 주는 서버(배포 과도기)일 수도 있으므로, 없을 때만 옛 경로를 부른다.
     if (Array.isArray(body.erpCarts)) {
+      // 위 erpGeneration 주석 참고. 옛 응답이면 두 목록과 배지·새 주문 알림을 건너뛴다(다음 폴링이 채운다).
+      // 최근 결제(settledCarts)는 이 세대 규칙의 대상이 아니다(그쪽은 자기 요청 뒤 로컬에서 따로 고쳐 쓴다).
+      const freshErp = erpGeneration === getErpGeneration()
       // 프론트 결제 대기 목록을 먼저 반영한다 -- 방금 프론트로 넘긴 카드를 기억하는 목록(sentToFront)이
       // 여기서 정리되므로, 그 뒤에 그려야 POS 목록이 최신 기준으로 걸러진다.
-      applyFrontCarts(body.frontCarts)
+      if (freshErp) applyFrontCarts(body.frontCarts)
       applySettledCarts(body.settledCarts)
-      applyErpCarts(body.erpCarts)
-      updateBadges({ erpCarts: body.erpCarts.length })
-      notifyNewErpCarts(body.erpCarts)
+      if (freshErp) {
+        applyErpCarts(body.erpCarts)
+        updateBadges({ erpCarts: body.erpCarts.length })
+        notifyNewErpCarts(body.erpCarts)
+      }
     } else {
       await refreshErpCarts()
     }
@@ -489,7 +508,11 @@ function snapshotOf(body) {
   try {
     const q = (body.reservations || []).map((r) => `${r.id}:${r.status}`).join(',')
     const c = (body.erpCarts || []).map((x) => x.id).join(',')
-    return `${q}|${c}`
+    // 프론트 결제(손님이 결제 중인지)와 최근 결제(결제됨·취소됨·영수증·숨김)도 직원이 지켜보는 값이다.
+    // 이게 빠져 있으면 대기열과 전산 주문이 그대로인 동안 이 값들이 바뀌어도 폴링이 15초까지 느려졌다.
+    const f = (body.frontCarts || []).map((x) => `${x.id}:${x.status}`).join(',')
+    const s = (body.settledCarts || []).map((x) => `${x.id}:${x.status}:${x.receiptStatus || ''}:${x.hidden ? 1 : 0}`).join(',')
+    return `${q}|${c}|${f}|${s}`
   } catch {
     return String(Date.now()) // 비교 불가면 항상 "바뀜"으로 취급한다(느려지지 않는 쪽이 안전)
   }
@@ -645,8 +668,10 @@ async function main() {
 // erpCarts.js는 fetch를 직접 만들지 않고 여기(app.js)의 apiGet/apiPost/notify/escapeHtml과
 // 401 처리(handleUnauthorized)를 그대로 주입받아 쓴다 — 같은 로직이 두 파일에 따로 생기는 것을
 // 막기 위해서다.
-initErpCarts({ apiGet, apiPost, notify, escapeHtml, onUnauthorized: handleUnauthorized })
-initSettledCarts({ apiPost, notify, escapeHtml, onUnauthorized: handleUnauthorized })
+// noteActivity: 상태를 바꾸는 요청(담기 보고·지우기·프론트로 넘기기·되돌리기·결제 중 풀기)이 끝나면 폴링을 다시
+// 빠르게 되돌린다. 직원이 방금 만졌다는 뜻이고, 서버 상태가 곧 바뀌어 보일 때다.
+initErpCarts({ apiGet, apiPost, notify, escapeHtml, onUnauthorized: handleUnauthorized, noteActivity })
+initSettledCarts({ apiPost, notify, escapeHtml, onUnauthorized: handleUnauthorized, forgetLoadedCart })
 initPromoCampaign({ apiGet, apiPost, notify, escapeHtml, onUnauthorized: handleUnauthorized })
 initHistory({ apiGet, apiPost, notify, escapeHtml, onUnauthorized: handleUnauthorized })
 initNav({ notify })
@@ -704,6 +729,11 @@ function renderSettings() {
       : dot.includes('checking') ? '확인 중' : '정상'
   }
 }
+
+// 정비 대기 화면의 [정비 이력] 버튼. 대기열이 비어 있어도 이력을 볼 수 있어야 해서 카드의 [이력]과 별도로 둔다.
+// 화면에 버튼만 있고 연결이 없어서 눌러도 아무 일도 일어나지 않았다.
+const historyOpenEl = document.getElementById('history-open')
+if (historyOpenEl) historyOpenEl.addEventListener('click', () => switchTo('history'))
 
 const todayRefreshEl = document.getElementById('today-refresh')
 if (todayRefreshEl) todayRefreshEl.addEventListener('click', loadTodaySummary)

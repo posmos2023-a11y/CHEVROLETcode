@@ -796,3 +796,162 @@ testSerial('다시 보내기: POS로 되돌렸다가 다시 프론트로 보내�
   const second = (await getFrontCarts(store)).body.carts[0].frontSentAt
   assert.ok(second && second !== first)
 })
+
+// --- 늦은 /start 막기(묘비) · 갇힌 결제 중 풀기(비상구) · 전산 재전송 초기화 ---------------------------
+
+const logger = require('../src/logger')
+// logger.error 호출을 가로채 기록한다(대사가 필요하다는 로그가 실제로 남는지 확인하는 용도).
+async function captureLoggerErrors(fn) {
+  const original = logger.error
+  const calls = []
+  logger.error = (message, meta) => { calls.push({ message, meta }) }
+  try { await fn() } finally { logger.error = original }
+  return calls
+}
+
+const rowOf = (id) => prisma.erpCart.findUnique({ where: { id } })
+const forceRelease = (store, cartId) => posPost(store, `/api/pos/erp-carts/${cartId}/force-release`)
+const elevenMinutesAgo = () => new Date(Date.now() - 11 * 60 * 1000)
+
+for (const result of ['cancelled', 'failed']) {
+  testSerial(`묘비: /start보다 ${result} 보고가 먼저 도착하면 그 paymentKey의 늦은 /start는 거절한다`, async () => {
+    const { store, cartId } = await frontCart(`tombstone-${result}`)
+    const lateKey = newPaymentKey()
+    // 프론트는 /start가 시간 초과되자 같은 키로 보고를 보냈고, 그 보고가 서버에 먼저 도착했다(주문은 아직 pending).
+    const early = await reportFront(store, cartId, { result, paymentKey: lateKey })
+    assert.equal(early.status, 200, JSON.stringify(early.body))
+    assert.equal(early.body.alreadyProcessed, true)
+    assert.equal(early.body.status, 'pending')
+    assert.equal((await rowOf(cartId)).frontReleasedKey, lateKey)
+
+    // 뒤늦게 처리되는 /start -- 예전에는 이걸 paying으로 잡아 프론트는 포기했는데 서버만 영구히 결제 중으로 갇혔다.
+    const late = await startFront(store, cartId, lateKey)
+    assert.equal(late.status, 409, JSON.stringify(late.body))
+    assert.equal(late.body.stale, true)
+    const row = await rowOf(cartId)
+    assert.equal(row.status, 'pending')
+    assert.equal(row.frontPaymentKey, null)
+
+    // 묘비는 그 키에만 적용된다. 새 paymentKey로는 평소처럼 결제할 수 있다.
+    assert.equal((await startFront(store, cartId, newPaymentKey())).status, 200)
+  })
+}
+
+testSerial('묘비: 이미 paying으로 잡힌 뒤의 cancelled 보고는 예전처럼 pending으로 되돌리고 묘비를 남기지 않는다', async () => {
+  const { store, cartId } = await frontCart('tombstone-normal')
+  const key = newPaymentKey()
+  await startFront(store, cartId, key)
+  const res = await reportFront(store, cartId, { result: 'cancelled', paymentKey: key })
+  assert.equal(res.body.alreadyProcessed, false)
+  assert.equal((await rowOf(cartId)).frontReleasedKey, null)
+})
+
+testSerial('비상구(결제 중): 10분이 안 지났으면 409와 남은 시간을 주고, 지났으면 pending으로 풀어 옛 키의 늦은 보고를 막는다', async () => {
+  const { store, cartId } = await frontCart('force-paying')
+  const key = newPaymentKey()
+  await startFront(store, cartId, key)
+
+  // 탭앱이 갇힘 여부를 판단하도록 결제 시작 시각이 내려온다.
+  const queued = (await posQueue(store)).body.frontCarts.find((c) => c.id === cartId)
+  assert.equal(queued.status, 'paying')
+  assert.ok(queued.frontPayingAt)
+
+  const early = await forceRelease(store, cartId)
+  assert.equal(early.status, 409, JSON.stringify(early.body))
+  assert.ok(early.body.retryAfterSec > 0 && early.body.retryAfterSec <= 600, `retryAfterSec=${early.body.retryAfterSec}`)
+  assert.equal((await rowOf(cartId)).status, 'paying')
+
+  await prisma.erpCart.update({ where: { id: cartId }, data: { frontPayingAt: elevenMinutesAgo() } })
+  const res = await forceRelease(store, cartId)
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal(res.body.previousStatus, 'paying')
+  assert.equal(res.body.status, 'pending')
+  const row = await rowOf(cartId)
+  assert.equal(row.status, 'pending')
+  assert.equal(row.frontPaymentKey, null)
+  assert.equal(row.frontPayingAt, null)
+  assert.equal(row.frontReleasedKey, key)
+
+  // 풀린 옛 시도의 늦은 보고: 시작은 거절, 'paid'는 반영하지 않고 대사가 필요하다는 오류 로그를 남긴다.
+  assert.equal((await startFront(store, cartId, key)).status, 409)
+  const logs = await captureLoggerErrors(async () => {
+    const late = await reportFront(store, cartId, { result: 'paid', paymentKey: key, payment: SAMPLE_CARD_PAYMENT })
+    assert.equal(late.status, 409)
+  })
+  assert.ok(logs.some((l) => l.message.includes('결제 완료 보고를 반영하지 못했습니다')), '대사 필요 로그가 남지 않았다')
+  assert.equal((await rowOf(cartId)).status, 'pending')
+
+  // 풀린 뒤에는 새 키로 다시 결제할 수 있다.
+  assert.equal((await startFront(store, cartId, newPaymentKey())).status, 200)
+})
+
+testSerial('비상구: 결제 중·취소 중이 아닌 주문은 409, 다른 매장 토큰은 404', async () => {
+  const { store, cartId } = await frontCart('force-wrong')
+  const res = await forceRelease(store, cartId)
+  assert.equal(res.status, 409)
+  assert.equal(res.body.status, 'pending')
+  assert.equal(typeof res.body.retryAfterSec, 'number')
+
+  await startFront(store, cartId, newPaymentKey())
+  await prisma.erpCart.update({ where: { id: cartId }, data: { frontPayingAt: elevenMinutesAgo() } })
+  const other = await createStore('force-other')
+  assert.equal((await forceRelease(other, cartId)).status, 404)
+  assert.equal((await rowOf(cartId)).status, 'paying')
+})
+
+testSerial('정리: 취소가 진행 중인 건은 숨길 수도 없다(409)', async () => {
+  const { store, cartId } = await paidFrontCart('cleanup-hide-refunding')
+  await prisma.erpCart.update({ where: { id: cartId }, data: { status: 'refunding', refundStartedAt: new Date() } })
+  assert.equal((await posPost(store, `/api/pos/erp-carts/${cartId}/hide`, { hidden: true })).status, 409)
+  assert.equal((await rowOf(cartId)).hiddenAt, null)
+})
+
+testSerial('POS 결제 통보: 프론트 결제 대기 주문은 결제 완료로 기록할 수 없다(409)', async () => {
+  const { store, cartId } = await frontCart('pos-paid-front')
+  const res = await posPost(store, `/api/pos/erp-carts/${cartId}/paid`, { paymentId: 'p-1' })
+  assert.equal(res.status, 409)
+  assert.equal((await rowOf(cartId)).status, 'pending')
+})
+
+testSerial('삭제 되살리기: 삭제 표시된 주문이 프론트 결제 완료로 확정되면 다시 보인다', async () => {
+  const { store, cartId } = await frontCart('revive-front')
+  const key = newPaymentKey()
+  await startFront(store, cartId, key)
+  // 예전 버전은 결제 전 주문도 정비 이력 삭제로 deletedAt이 찍혔다(데이터가 그렇게 남아 있을 수 있다).
+  await prisma.erpCart.update({ where: { id: cartId }, data: { deletedAt: new Date() } })
+  const res = await reportFront(store, cartId, { result: 'paid', paymentKey: key, payment: SAMPLE_CARD_PAYMENT })
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal((await rowOf(cartId)).deletedAt, null)
+  assert.ok((await settledOf(store)).some((c) => c.id === cartId))
+})
+
+testSerial('전산 재전송: 취소됐던 주문을 같은 referenceId로 다시 담으면 숨김·삭제·시도 흔적이 지워진다', async () => {
+  const store = await createStore('resend-reset')
+  const body = validBody(store, { payTarget: 'front' })
+  const created = await postCart(body)
+  assert.equal(created.status, 201)
+  const cancel = await request(app).post(`/api/erp/carts/${body.referenceId}/cancel`).set('X-ERP-Token', ERP_TOKEN)
+  assert.equal(cancel.status, 200)
+  await prisma.erpCart.update({
+    where: { id: created.body.cartId },
+    data: {
+      hiddenAt: new Date(), deletedAt: new Date(), receiptStatus: 'sent', frontReleasedKey: 'old-released-key',
+      refundAttemptId: 'old-refund-attempt', refundReleasedAttemptId: 'old-released-attempt', refundStartedAt: new Date(),
+      consumeAttemptId: 'old-consume-attempt', frontSentAt: null,
+    },
+  })
+
+  const again = await postCart(body)
+  assert.equal(again.status, 201, JSON.stringify(again.body))
+  const row = await rowOf(created.body.cartId)
+  for (const field of ['hiddenAt', 'deletedAt', 'receiptStatus', 'frontReleasedKey', 'refundAttemptId', 'refundReleasedAttemptId', 'refundStartedAt', 'consumeAttemptId']) {
+    assert.equal(row[field], null, `${field}가 지워지지 않았다`)
+  }
+  assert.ok(row.frontSentAt, '프론트 결제로 다시 담았으면 보낸 시각이 새로 찍혀야 한다')
+
+  // POS 결제로 다시 담으면 프론트로 보낸 시각은 비운다.
+  await request(app).post(`/api/erp/carts/${body.referenceId}/cancel`).set('X-ERP-Token', ERP_TOKEN)
+  const asPos = await postCart({ ...body, payTarget: 'pos' })
+  assert.equal(asPos.status, 201)
+  assert.equal((await rowOf(created.body.cartId)).frontSentAt, null)
+})

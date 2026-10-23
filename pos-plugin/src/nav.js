@@ -98,3 +98,15 @@ export function notifyNewErpCarts(carts) {
 }
 
 let initialised = false
+
+// 새 정비 예약도 같은 방식으로 알린다. 직원이 [전산 주문]이나 [정비 이력]을 보고 있으면 손님이 키오스크에서
+// 예약해도 배지 숫자만 바뀌어 놓치기 쉽다.
+let lastReservationIds = null
+
+export function notifyNewReservations(reservations) {
+  const ids = new Set((reservations || []).filter((r) => r.status === 'waiting').map((r) => r.id))
+  const fresh = lastReservationIds ? [...ids].filter((id) => !lastReservationIds.has(id)) : []
+  lastReservationIds = ids
+  if (!fresh.length || currentView === 'queue') return
+  deps.notify('success', `새 정비 예약이 ${fresh.length}건 들어왔습니다. [정비 대기]에서 확인하세요.`)
+}

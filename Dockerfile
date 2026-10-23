@@ -8,7 +8,8 @@
 # Cloud Build 트리거는 Dockerfile만 보고 build-arg를 넘기지 않으므로, 여기에 운영 주소를 기본값으로
 # 둔다. 다른 환경은 `docker build --build-arg CHEVROLET_API_BASE_URL=...`로 덮어쓰면 된다.
 ARG CHEVROLET_API_BASE_URL=https://chevrolet-api-813801981857.asia-northeast3.run.app
-FROM node:18-slim AS pos-plugin-build
+# Node 18·20은 보안 지원이 끝났다(18: 2025-04, 20: 2026-04). 22는 2027-04까지 LTS다.
+FROM node:22-slim AS pos-plugin-build
 ARG CHEVROLET_API_BASE_URL
 WORKDIR /app/pos-plugin
 # package-lock.json이 없으면 즉시 실패한다(npm ci는 lockfile을 강제한다) — 재현 가능한 빌드를 위해 의도된 동작.
@@ -17,7 +18,7 @@ RUN npm ci
 COPY pos-plugin/ ./
 RUN CHEVROLET_API_BASE_URL="$CHEVROLET_API_BASE_URL" npm run build
 
-FROM node:18-slim
+FROM node:22-slim
 WORKDIR /app
 
 RUN apt-get update -y && apt-get install -y openssl && rm -rf /var/lib/apt/lists/*
@@ -62,7 +63,7 @@ EXPOSE 8080
 
 WORKDIR /app/backend
 
-# node:18-slim은 uid 1000의 비root 사용자 'node'를 기본 제공한다. 백엔드는 파일시스템에
+# node:22-slim은 uid 1000의 비root 사용자 'node'를 기본 제공한다. 백엔드는 파일시스템에
 # 쓰기(로그는 stdout, DB는 Postgres)를 하지 않으므로 실행 사용자를 root에서 내려도 안전하다.
 RUN chown -R node:node /app
 USER node
