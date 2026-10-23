@@ -210,6 +210,9 @@ model ErpCart {
   // 보고는 이 값이 맞을 때만 받는다 -- 다른 시도의 늦은 보고가 현재 시도를 덮어쓰지 못하게 한다.
   frontPaymentKey  String?   @unique
   frontPayingAt    DateTime?
+  // 탭앱이 [프론트 결제]로 마지막으로 넘긴 시각. 프론트의 "2분 쉬기"(snooze) 열쇠에 섞어, 직원이 되돌렸다가 다시
+  // 보낸 주문은 쉬는 중이어도 바로 뜨게 한다.
+  frontSentAt      DateTime?
   // 승인 결과 중 나중에 취소·대사에 필요한 값만 추려 JSON으로 남긴다(승인번호, 승인시각, 결제수단 등).
   frontPaymentJson String?
   // 프론트 결제의 승인번호. 토스 결제 웹훅과 맞춰보는 열쇠라 JSON과 별도로 둔다(인덱스).

@@ -1165,6 +1165,8 @@ async function loadPendingErpCartsForResponse(storeId, payTarget = 'pos') {
       // 예약과 이어졌으면 결제 후 정비완료까지 자동으로 된다. 직원이 그 사실을 알아야
       // "왜 대기열에서 안 사라지지?"를 나중에 묻지 않는다.
       linkedReservation: Boolean(row.reservationId),
+      // 프론트의 "2분 쉬기" 열쇠용(다시 보낸 주문은 바로 뜨게) -- schema.prisma frontSentAt
+      frontSentAt: row.frontSentAt || null,
     })
   }
   return carts
@@ -3146,6 +3148,7 @@ app.get('/api/front/erp-carts', posIpFloodLimiter, posQueueReadLimiter, requireS
     carNumber: row.carNumber,
     memo: row.memo,
     totalAmount: row.totalAmount,
+    requestedAt: row.refundRequestedAt || null, // 다시 요청한 취소는 프론트가 쉬는 중이어도 바로 띄운다
     refund: frontRefundParams(row),
   }))
   return res.json({ ok: true, storeName: req.store.name, carts, refunds })

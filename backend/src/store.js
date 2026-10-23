@@ -1036,7 +1036,7 @@ function listPendingErpCarts(storeId, limit, payTarget = 'pos') {
 async function sendErpCartToFront(id, storeId) {
   const result = await prisma.erpCart.updateMany({
     where: { id, storeId, payTarget: 'pos', status: 'pending' },
-    data: { payTarget: 'front', errorMessage: null },
+    data: { payTarget: 'front', errorMessage: null, frontSentAt: new Date() },
   })
   return result.count > 0
 }

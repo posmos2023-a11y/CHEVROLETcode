@@ -38,9 +38,9 @@
         const tick = async () => {
           if (stopped) return
           const { ok, body } = await pay.listCarts(token)
-          const carts = ok ? (body.carts || []).filter((c) => !pay.isSnoozed(c.id)) : []
+          const carts = ok ? (body.carts || []).filter((c) => !pay.isSnoozed(pay.cartSnoozeKey(c))) : []
           // 정비 대기열에서 요청한 결제 취소도 같은 화면(erp-pay.html)에서 처리한다.
-          const refunds = ok ? (body.refunds || []).filter((r) => !pay.isSnoozed(`refund:${r.id}`)) : []
+          const refunds = ok ? (body.refunds || []).filter((r) => !pay.isSnoozed(pay.refundSnoozeKey(r))) : []
           if (carts.length || refunds.length) {
             stopped = true
             location.href = './erp-pay.html'

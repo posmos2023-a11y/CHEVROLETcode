@@ -310,6 +310,16 @@
     return Boolean(readSnoozes()[cartId])
   }
 
+  // 쉬기 열쇠. 같은 주문이라도 직원이 다시 보냈으면(frontSentAt) 또는 취소를 다시 요청했으면(requestedAt) 다른 열쇠가
+  // 되어 바로 뜬다. 손님이 결제창을 닫은 직후 같은 주문이 곧바로 다시 뜨는 것만 막는다.
+  function cartSnoozeKey(cart) {
+    return `${cart.id}:${cart.frontSentAt || ''}`
+  }
+
+  function refundSnoozeKey(item) {
+    return `refund:${item.id}:${item.requestedAt || ''}`
+  }
+
   function formatWon(amount) {
     return `${Number(amount || 0).toLocaleString('ko-KR')}원`
   }
@@ -333,6 +343,8 @@
     recoverRefundInflight,
     snooze,
     isSnoozed,
+    cartSnoozeKey,
+    refundSnoozeKey,
     formatWon,
   }
 })()

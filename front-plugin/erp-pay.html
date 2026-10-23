@@ -90,7 +90,7 @@
         }
         // 정비 대기열에서 요청한 결제 취소가 있으면 먼저 처리한다(손님이 환불받으러 프론트 앞에 와 있다).
         // 직원이 탭앱에서 [프론트에서 취소]를 두 번 눌러 이미 확정했으므로 여기서 다시 묻지 않고 바로 취소창을 띄운다.
-        const refunds = (body.refunds || []).filter((r) => !pay.isSnoozed(`refund:${r.id}`))
+        const refunds = (body.refunds || []).filter((r) => !pay.isSnoozed(pay.refundSnoozeKey(r)))
         if (refunds.length) {
           const isCard = ['CARD', 'BARCODE'].includes(refunds[0].refund?.paymentMethod)
           sdk.template.openToast?.({
@@ -100,7 +100,7 @@
           runRefund(token, refunds[0])
           return
         }
-        const carts = (body.carts || []).filter((c) => !pay.isSnoozed(c.id))
+        const carts = (body.carts || []).filter((c) => !pay.isSnoozed(pay.cartSnoozeKey(c)))
         if (!carts.length) {
           goHome()
           return
@@ -122,7 +122,7 @@
             onClick: () => startPayment(token, cart),
           })),
           onBack: () => {
-            carts.forEach((c) => pay.snooze(c.id))
+            carts.forEach((c) => pay.snooze(pay.cartSnoozeKey(c)))
             goHome()
           },
         })
@@ -280,7 +280,7 @@
           description: `${cartTitle(cart)} · ${pay.formatWon(cart.totalAmount)}`,
           retryLabel: '다시 결제하기',
           onRetry: () => startPayment(token, cart),
-          snoozeKey: cart.id,
+          snoozeKey: pay.cartSnoozeKey(cart),
         })
       }
 
@@ -297,7 +297,7 @@
           pay.reportRefund(token, item.id, { result: 'cancelled' }).catch(() => {})
         }
         if (!started.ok) {
-          pay.snooze(`refund:${item.id}`)
+          pay.snooze(pay.refundSnoozeKey(item))
           showMessage('error', '취소를 시작하지 못했습니다', started.body.error || '정비 대기열에서 상태를 확인해주세요.')
           return
         }
@@ -326,7 +326,7 @@
         }
 
         const failed = result.type !== 'CANCELED' && result.type !== 'TIMEOUT'
-        pay.snooze(`refund:${item.id}`)
+        pay.snooze(pay.refundSnoozeKey(item))
         const res = await pay.reportRefund(token, item.id, {
           result: failed ? 'failed' : 'cancelled',
           errorMessage: failed ? `프론트 결제 취소 실패(${result.type})` : undefined,
@@ -337,7 +337,7 @@
           description: `${cartTitle(item)} · ${pay.formatWon(item.totalAmount)}`,
           retryLabel: '다시 시도하기',
           onRetry: () => runRefund(token, item),
-          snoozeKey: `refund:${item.id}`,
+          snoozeKey: pay.refundSnoozeKey(item),
         })
       }
 

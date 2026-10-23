@@ -782,3 +782,17 @@ testSerial('영수증 다시 보내기: 탭앱에서 다시 보내면 또 한 �
   assert.equal(miss.status, 409)
   assert.equal(miss.body.receipt, 'no_reservation')
 })
+
+testSerial('다시 보내기: POS로 되돌렸다가 다시 프론트로 보내면 frontSentAt이 바뀌어 프론트가 새 주문으로 본다', async () => {
+  const store = await createStore('resend-front')
+  const created = await postCart(validBody(store))
+  const cartId = created.body.cartId
+  assert.equal((await sendToFront(store, cartId)).status, 200)
+  const first = (await getFrontCarts(store)).body.carts[0].frontSentAt
+  assert.ok(first)
+  assert.equal((await returnToPos(store, cartId)).status, 200)
+  await new Promise((r) => setTimeout(r, 15))
+  assert.equal((await sendToFront(store, cartId)).status, 200)
+  const second = (await getFrontCarts(store)).body.carts[0].frontSentAt
+  assert.ok(second && second !== first)
+})
