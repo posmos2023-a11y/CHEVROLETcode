@@ -14,6 +14,9 @@
 // 이 기능을 쓰려면 손님 동의의 이용 목적에 "정비 이력 관리"가 들어 있어야 한다
 // (front-plugin의 동의 문구). 목적 밖 이용이 되지 않도록 화면에도 최소한만 띄운다.
 
+// 홍보 문자 발송이 발송사 계정 문제로 실패했을 때의 안내는 기간 발송 화면과 같은 문구를 쓴다.
+import { PROVIDER_STOP_MESSAGE } from './promoCampaign.js'
+
 let deps = null
 
 const inputEl = () => document.getElementById('history-input')
@@ -462,7 +465,8 @@ async function sendPromo(carNumber, btn) {
   try {
     const { ok, body } = await deps.apiPost('/api/pos/promo/send', { carNumber })
     if (!ok) {
-      deps.notify('error', body.error || '보내지 못했습니다.')
+      // 발송사 계정 문제(잔액·발신번호·템플릿)는 잠시 뒤 다시 보내도 같은 실패다 -- 본사 확인이 필요하다고 분명히 알린다.
+      deps.notify('error', body && body.reason === 'send_failed_provider' ? PROVIDER_STOP_MESSAGE : (body.error || '보내지 못했습니다.'))
       refreshPromo(carNumber)
       return
     }

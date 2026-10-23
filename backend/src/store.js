@@ -1066,9 +1066,13 @@ function createErpCart({ storeId, referenceId, itemsJson, totalAmount, memo, aut
     consumeAttemptId: null,
     consumeReleasedAttemptId: null,
     // frontOrphan*(프론트 미반영 승인)은 지우지 않는다 -- 같은 referenceId의 이전 주문으로 손님이 이미 낸 돈이라, 다시 보낸 주문을
-    // 또 결제하기 전에 직원이 알아야 한다. 확인한 뒤 탭앱에서 지운다.
+    // 또 결제하기 전에 직원이 알아야 한다. 확인한 뒤 탭앱에서 확인 표시를 남긴다(frontOrphanAckAt).
     // 프론트의 "2분 쉬기" 열쇠. 프론트 결제로 처음부터 들어온 건은 이 시각이 곧 "프론트로 보낸 시각"이다.
     frontSentAt: payTarget === 'front' ? new Date() : null,
+    // 다시 보낸 주문은 새 접수다. createdAt은 @default(now())일 뿐이라 행을 다시 쓰면 첫 접수 시각이 남는데, 목록(24시간 기준)·만료 잡·
+    // 결제 중 풀기·담기 취소의 24시간 판정이 모두 이 값을 본다 -- 하루 전에 접수했다가 취소한 referenceId를 다시 보내면 201을 받고도
+    // POS·프론트 어디에도 안 뜨고 바로 만료된다.
+    createdAt: new Date(),
   }
   return prisma.erpCart.upsert({
     where: { referenceId },
@@ -1082,15 +1086,32 @@ function findErpCartByReference(referenceId) {
   return prisma.erpCart.findUnique({ where: { referenceId } })
 }
 
+// 직원이 아직 확인하지 않은 프론트 미반영 승인 흔적(frontOrphan*)이 있는 주문 / 없는 주문(where 조각). 확인 전에는 전산 취소와
+// 만료가 대기 주문을 닫지 않는다 -- 닫히면 POS 목록에서 빠져 경고가 안 보이고, 전산이 새 referenceId로 다시 보내면 손님이 한 번 더
+// 낸다(cancelErpCart·expireStaleErpCarts).
+const UNACKED_FRONT_ORPHAN = { frontOrphanAt: { not: null }, frontOrphanAckAt: null }
+const NO_UNACKED_FRONT_ORPHAN = { OR: [{ frontOrphanAt: null }, { frontOrphanAckAt: { not: null } }] }
+
+function hasUnackedFrontOrphan(row) {
+  return Boolean(row?.frontOrphanAt) && !row.frontOrphanAckAt
+}
+
 // POS 플러그인 폴링(GET /api/pos/erp-carts)과 프론트 플러그인 폴링(GET /api/front/erp-carts) 전용.
 // 오래 기다린 것부터 순서대로 최대 limit건. payTarget으로 나눠서 POS 건은 POS에만, 프론트 건은
 // 프론트에만 내려간다 -- 섞이면 같은 주문을 두 기기에서 각각 결제할 수 있다.
-function listPendingErpCarts(storeId, limit, payTarget = 'pos') {
+// includeUnackedOrphans: 24시간이 지났어도 확인하지 않은 프론트 미반영 승인(frontOrphan)이 남은 주문은 준다(POS 탭앱 목록만).
+// 그런 주문은 만료 잡도 닫지 않는데(expireStaleErpCarts), 목록에서까지 빠지면 경고를 볼 곳도 [프론트 승인으로 결제 완료 기록]을 누를
+// 곳도 없다. 프론트 단말 목록은 넣지 않는다 -- 손님 화면에 하루 지난 주문을 결제 대기로 띄우지 않는다.
+function listPendingErpCarts(storeId, limit, payTarget = 'pos', { includeUnackedOrphans = false } = {}) {
   // 만료 잡은 하루 한 번 돌므로, 그 사이에 하루가 지난 건이 화면에 남을 수 있다. 조회에서도
   // 같은 기준으로 걸러서 "어제 주문이 오늘 아침 POS에 떠 있는" 상황 자체를 막는다.
   const staleBefore = new Date(Date.now() - ERP_CART_STALE_HOURS * 60 * 60 * 1000)
+  const fresh = { createdAt: { gte: staleBefore } }
   return prisma.erpCart.findMany({
-    where: { storeId, payTarget, status: 'pending', createdAt: { gte: staleBefore } },
+    where: {
+      storeId, payTarget, status: 'pending',
+      ...(includeUnackedOrphans ? { OR: [fresh, UNACKED_FRONT_ORPHAN] } : fresh),
+    },
     orderBy: { createdAt: 'asc' },
     take: limit,
   })
@@ -1129,8 +1150,9 @@ async function listFrontErpCartsForPos(storeId, limit) {
       orderBy: { createdAt: 'asc' },
       take: limit,
     }),
+    // 확인하지 않은 프론트 미반영 승인이 남은 대기 주문은 24시간이 지나도 준다(listPendingErpCarts includeUnackedOrphans와 같은 이유).
     prisma.erpCart.findMany({
-      where: { storeId, payTarget: 'front', status: 'pending', createdAt: { gte: staleBefore } },
+      where: { storeId, payTarget: 'front', status: 'pending', OR: [{ createdAt: { gte: staleBefore } }, UNACKED_FRONT_ORPHAN] },
       orderBy: { createdAt: 'asc' },
       take: limit,
     }),
@@ -1194,9 +1216,11 @@ async function updateErpCartWithReleasedList(id, field, build) {
 // paymentKey를 함께 박아두고, 이후 결과 보고는 이 값이 맞을 때만 받는다.
 // 포기한 키 목록(frontReleasedKey)에 이 키가 있으면 거절한다 -- 프론트가 이미 "이 키는 포기"라고 알린 /start가 늦게 도착한 경우다.
 // 목록 확인은 updateErpCartWithReleasedList가 전이와 한 번에 한다(위 주석).
+// 확인 전 미반영 승인(frontOrphanAt 있고 frontOrphanAckAt 없음)이 있는 주문도 잡지 않는다 -- 손님이 이미 낸 주문이라 결제창을
+// 다시 띄우면 이중 결제다. 직원이 POS에서 기록하거나 확인하면 풀린다. 프론트도 거르지만 목록을 받은 뒤 생긴 흔적은 여기서만 막힌다.
 async function markErpCartFrontPaying(id, storeId, paymentKey) {
   return updateErpCartWithReleasedList(id, 'frontReleasedKey', (released) => (isReleasedToken(released, paymentKey) ? null : {
-    where: { storeId, payTarget: 'front', status: 'pending' },
+    where: { storeId, payTarget: 'front', status: 'pending', OR: [{ frontOrphanAt: null }, { frontOrphanAckAt: { not: null } }] },
     data: { status: 'paying', frontPaymentKey: paymentKey, frontPayingAt: new Date(), errorMessage: null },
   }))
 }
@@ -1310,33 +1334,109 @@ async function markErpCartFrontPaidAfterRelease(id, storeId, paymentKey, payment
 //
 // /result가 PAID_AFTER_RELEASE로 거절한 승인 보고를 주문 행에 남긴다. 승인번호가 같은 프론트 결제가 나중에 이 주문에
 // 반영되면(같은 결제가 결국 기록됨) 흔적을 지운다. 다른 결제로 반영됐다면 지우지 않는다 -- 그때는 같은 주문을 두 번 받은
-// 것이라 직원이 확인해야 한다. 직원이 확인한 뒤에는 탭앱에서 지운다(clearErpCartFrontOrphan, approvalNo 없이).
-// 반환: 바꿨는지
-async function recordErpCartFrontOrphan(id, storeId, { approvalNo, amount }) {
+// 것이라 직원이 확인해야 한다. 직원이 [확인했어요]를 누르면 지우지 않고 확인 시각만 남긴다(ackErpCartFrontOrphan) -- 관리자 웹의
+// 대사 근거가 남아야 한다. 직원이 그 승인을 이 주문의 결제로 기록하면(recordErpCartFrontOrphanPaid) 결제 기록으로 옮기고 지운다.
+// paymentJson(sanitizeFrontPayment 결과)·paymentKey는 그 기록 때 frontPaymentJson·frontPaymentKey로 옮겨 프론트 취소·대사에 쓴다.
+// 새 흔적은 확인 전 상태로 남긴다(전에 확인한 다른 흔적을 덮는다). 반환: 바꿨는지
+async function recordErpCartFrontOrphan(id, storeId, { approvalNo, amount, paymentJson, paymentKey }) {
   const result = await prisma.erpCart.updateMany({
     where: { id, storeId },
     data: {
       frontOrphanAt: new Date(),
       frontOrphanApprovalNo: approvalNo ? String(approvalNo).slice(0, 64) : null,
       frontOrphanAmount: Number.isSafeInteger(amount) ? amount : null,
+      frontOrphanAckAt: null,
+      frontOrphanPaymentJson: paymentJson ? String(paymentJson) : null,
+      frontOrphanPaymentKey: paymentKey ? String(paymentKey).slice(0, 64) : null,
     },
   })
   return result.count > 0
 }
 
-// approvalNo를 주면 그 승인번호의 흔적일 때만 지운다(프론트 결제 반영 때). 반환: 지웠는지
+// 흔적을 모두 비우는 값(같은 승인이 반영됐거나 그 승인으로 결제 완료를 기록했을 때)
+const CLEARED_FRONT_ORPHAN = {
+  frontOrphanAt: null, frontOrphanApprovalNo: null, frontOrphanAmount: null,
+  frontOrphanAckAt: null, frontOrphanPaymentJson: null, frontOrphanPaymentKey: null,
+}
+
+// 같은 승인번호(approvalNo)의 흔적일 때만 지운다(프론트 결제 반영 때 -- 앞서 반영하지 못한 그 승인이 결국 이 주문의 결제로 기록됐다).
+// 직원 확인으로는 지우지 않는다(ackErpCartFrontOrphan). 반환: 지웠는지
 async function clearErpCartFrontOrphan(id, storeId, { approvalNo } = {}) {
-  if (approvalNo !== undefined && !approvalNo) return false
+  if (!approvalNo) return false
   const result = await prisma.erpCart.updateMany({
     where: {
       id,
       ...(storeId ? { storeId } : {}),
       frontOrphanAt: { not: null },
-      ...(approvalNo !== undefined ? { frontOrphanApprovalNo: String(approvalNo).slice(0, 64) } : {}),
+      frontOrphanApprovalNo: String(approvalNo).slice(0, 64),
     },
-    data: { frontOrphanAt: null, frontOrphanApprovalNo: null, frontOrphanAmount: null },
+    data: CLEARED_FRONT_ORPHAN,
   })
   return result.count > 0
+}
+
+// 직원이 탭앱에서 경고를 확인했다(토스 결제내역에서 정리했음). 흔적은 그대로 두고 확인 시각만 남긴다 -- 관리자 웹은 '매장 확인함'으로
+// 계속 보여주고, 탭앱은 접어서 보여준다. orphanAt: 직원이 본 그 흔적일 때만(그 사이 새 흔적이 덮었으면 새 흔적은 확인 전으로 둔다).
+// 반환: 확인 표시를 남겼는지(이미 확인됐으면 false)
+async function ackErpCartFrontOrphan(id, storeId, orphanAt) {
+  const result = await prisma.erpCart.updateMany({
+    where: { id, storeId, frontOrphanAt: orphanAt, frontOrphanAckAt: null },
+    data: { frontOrphanAckAt: new Date() },
+  })
+  return result.count > 0
+}
+
+// 직원이 경고된 승인을 이 주문의 결제로 기록할 수 있는 상태(POST /api/pos/erp-carts/:id/record-front-orphan). 결제 전(대기·담김)이거나
+// 결제 없이 닫힌(매장이 지움·만료·전산 취소) 주문이다. 결제 중·결제 완료·취소 진행·환불된 주문은 다른 결제가 이미 붙어 있거나 붙는 중이다.
+const FRONT_ORPHAN_RECORDABLE_STATUSES = ['pending', 'loaded', 'dismissed', 'expired', 'cancelled']
+
+// 흔적의 승인을 이 주문의 프론트 결제로 기록한다(결제 완료). read: 호출부가 읽은 행 -- 읽은 흔적·금액 그대로일 때만 바꾼다(그 사이 새 흔적이
+// 덮었거나, 같은 승인이 반영돼 지워졌거나, 전산 재전송으로 금액이 바뀐 경우를 건드리지 않는다). 금액이 맞는지는 호출부가 먼저 본다.
+// paymentKey도 옮긴다(프론트 취소가 원결제 키로 취소한다). 그 키가 다른 주문에 쓰여 있으면(unique) 키 없이 기록한다.
+// deletedAt도 비운다(markErpCartFrontPaid와 같은 이유). 반환: { recorded, withPaymentKey }
+async function recordErpCartFrontOrphanPaid(id, storeId, read) {
+  const where = {
+    id, storeId,
+    status: { in: FRONT_ORPHAN_RECORDABLE_STATUSES },
+    frontOrphanAt: read.frontOrphanAt,
+    frontOrphanApprovalNo: read.frontOrphanApprovalNo ?? null,
+    frontOrphanAmount: read.frontOrphanAmount ?? null,
+    totalAmount: read.totalAmount,
+  }
+  const data = {
+    payTarget: 'front',
+    status: 'paid',
+    paidAt: new Date(),
+    frontApprovalNo: read.frontOrphanApprovalNo ?? null,
+    frontPaymentJson: read.frontOrphanPaymentJson ?? null,
+    frontPayingAt: null,
+    errorMessage: null,
+    deletedAt: null,
+    ...CLEARED_FRONT_ORPHAN,
+  }
+  if (read.frontOrphanPaymentKey) {
+    try {
+      const result = await prisma.erpCart.updateMany({ where, data: { ...data, frontPaymentKey: read.frontOrphanPaymentKey } })
+      return { recorded: result.count > 0, withPaymentKey: result.count > 0 }
+    } catch (e) {
+      if (e?.code !== 'P2002') throw e
+    }
+  }
+  const result = await prisma.erpCart.updateMany({ where, data })
+  return { recorded: result.count > 0, withPaymentKey: false }
+}
+
+// POS 탭앱 경고 목록(/api/pos/queue frontOrphans): 결제 없이 닫혀(매장이 지움·전산 취소·만료) POS 어느 목록에도 안 실리는 주문의
+// 확인하지 않은 흔적. 그 행이 닫혀도 경고가 남아야 같은 정비를 새 referenceId로 다시 결제하는 일을 막는다. since: 이보다 최근 흔적만
+// (오래된 건 관리자 웹 대사로 넘긴다). 삭제 표시와 관계없이 준다 -- 손님이 낸 돈의 흔적이다.
+const FRONT_ORPHAN_CLOSED_STATUSES = ['dismissed', 'cancelled', 'expired']
+
+function listClosedFrontOrphanCartsForPos(storeId, since, limit) {
+  return prisma.erpCart.findMany({
+    where: { storeId, frontOrphanAt: { gte: since }, frontOrphanAckAt: null, status: { in: FRONT_ORPHAN_CLOSED_STATUSES } },
+    orderBy: { frontOrphanAt: 'desc' },
+    take: limit,
+  })
 }
 
 // --- 토스 결제내역 매핑 -------------------------------------------------------------
@@ -2429,9 +2529,11 @@ async function markErpCartDismissed(id, reason, payTarget) {
 // cancelled로 전이한다 -- 이미 POS가 가져간(loaded) 뒤라면 취소해도 POS 장바구니에는 이미
 // 반영되어 있으므로 여기서 조용히 상태만 바꾸면 안 되고(호출부가 409로 알려야 함), 그 판단을
 // 위해 전이 성공 여부(boolean)를 그대로 반환한다.
+// 직원이 아직 확인하지 않은 프론트 미반영 승인이 있는 주문은 취소하지 않는다(호출부가 409 FRONT_ORPHAN으로 알린다) -- 손님이 이미 낸
+// 주문이라, 닫히면 POS 대기 목록에서 빠지고 전산이 새 referenceId로 다시 보내면 같은 정비를 또 결제한다. 확인과 전이를 한 번에 한다.
 async function cancelErpCart(referenceId) {
   const result = await prisma.erpCart.updateMany({
-    where: { referenceId, status: 'pending' },
+    where: { referenceId, status: 'pending', ...NO_UNACKED_FRONT_ORPHAN },
     data: { status: 'cancelled' },
   })
   return result.count > 0
@@ -2598,10 +2700,13 @@ const ERP_CART_STALE_HOURS = 24
 // 대기(pending)만 만료한다. 결제 중(paying)·담김(loaded)은 만료하지 않는다 -- 실제로는 승인됐거나 POS에서 결제됐을 수 있어,
 // 만료로 닫으면 받은 돈이 끝난 주문에 붙지 못한다. 그런 주문은 POS 목록이 기간과 관계없이 보여주고(listFrontErpCartsForPos·
 // listSettledErpCartsForPos) 직원이 [결제 중 풀기]·[담기 취소]·[POS에서 결제했어요]로 끝낸다.
+// 직원이 아직 확인하지 않은 프론트 미반영 승인이 있는 대기 주문도 만료하지 않는다(cancelErpCart와 같은 이유). 그런 주문은 POS 전산 주문
+// 목록이 24시간이 지나도 보여주고(listPendingErpCarts includeUnackedOrphans), 직원이 그 승인으로 결제 완료를 기록하거나 확인하면
+// 다음 만료 잡이 닫는다.
 async function expireStaleErpCarts(now) {
   const cutoff = new Date((now ? now.getTime() : Date.now()) - ERP_CART_STALE_HOURS * 60 * 60 * 1000)
   const result = await prisma.erpCart.updateMany({
-    where: { status: 'pending', createdAt: { lt: cutoff } },
+    where: { status: 'pending', createdAt: { lt: cutoff }, ...NO_UNACKED_FRONT_ORPHAN },
     data: { status: 'expired', errorMessage: `${ERP_CART_STALE_HOURS}시간 동안 처리되지 않아 만료됨` },
   })
   return result.count
@@ -2795,6 +2900,11 @@ module.exports = {
   markErpCartFrontPaidAfterRelease,
   recordErpCartFrontOrphan,
   clearErpCartFrontOrphan,
+  ackErpCartFrontOrphan,
+  recordErpCartFrontOrphanPaid,
+  FRONT_ORPHAN_RECORDABLE_STATUSES,
+  listClosedFrontOrphanCartsForPos,
+  hasUnackedFrontOrphan,
   sendErpCartToFront,
   returnErpCartToPos,
   listFrontErpCartsForPos,

@@ -181,6 +181,96 @@ test('실패 분류: failedMessageList로 거부되면 그 상태 코드를 오�
   assert.equal(solapi.classifySendFailure(nonUser), 'recipient')
 })
 
+// --- R3: 실패 로그에 SDK 오류 메시지를 그대로 남기지 않는다 ----------------------------------------------------
+
+// SOLAPI_SENDER 형식 오류 때 SDK가 내는 BadRequestError 모양(실측: message 약 46KB, 끝에 요청 전체가 붙는다)
+function fakeBadRequestError(phone) {
+  const actual = `actual {"to":"${phone}","from":"+82 2 1234","text":"(광고) 테스트매장\\n본문"}`
+  return Object.assign(new Error(`${'Expected ReadonlyArray<...> '.repeat(1500)}${actual}`), {
+    _tag: 'BadRequestError',
+    validationErrors: [
+      'from: 전화번호는 숫자 및 특수문자 - 외 문자를 포함할 수 없습니다.',
+      'from: Expected undefined, actual "+82 2 1234"',
+      `(root): Expected ReadonlyArray<{ readonly text?: string }>, ${actual}`,
+    ],
+  })
+}
+
+test('실패 로그 요약: BadRequestError는 검증에 걸린 필드 경로만, 그 밖에는 300자로 자르고 전화번호를 가린다', () => {
+  const bad = solapi.summarizeSendError(fakeBadRequestError('01012345678'))
+  assert.deepEqual(bad, { tag: 'BadRequestError', httpStatus: null, statusCode: null, error: 'validation: from,(root)' })
+
+  const long = solapi.summarizeSendError(new Error(`수신번호 010-1234-5678, 01098765432 접수 실패 ${'가'.repeat(1000)}`))
+  assert.equal(long.error.length, 300)
+  assert.ok(long.error.startsWith('수신번호 [번호], [번호] 접수 실패'), long.error)
+  assert.equal(/\d{9,}/.test(long.error.replace(/-/g, '')), false)
+  // 상태 코드(4자리)·날짜는 그대로 둔다.
+  assert.equal(solapi.summarizeSendError(new Error('1030 2061 2026-10-23')).error, '1030 2061 2026-10-23')
+
+  const notReceived = Object.assign(new Error('1개의 메시지가 접수되지 못했습니다.'), {
+    _tag: 'MessageNotReceivedError', failedMessageList: [{ statusCode: 1030, to: '01012345678' }],
+  })
+  assert.deepEqual(solapi.summarizeSendError(notReceived), { tag: 'MessageNotReceivedError', httpStatus: null, statusCode: '1030', error: '1개의 메시지가 접수되지 못했습니다.' })
+  const limited = solapi.summarizeSendError(Object.assign(new Error('TooManyRequests: 요청 한도'), { _tag: 'ClientError', httpStatus: 429 }))
+  assert.deepEqual({ tag: limited.tag, httpStatus: limited.httpStatus }, { tag: 'ClientError', httpStatus: 429 })
+  const timeout = solapi.summarizeSendError(Object.assign(new Error('Solapi 발송 시간 초과 (10초)'), { code: 'SOLAPI_TIMEOUT' }))
+  assert.equal(timeout.tag, 'SOLAPI_TIMEOUT')
+  assert.equal(solapi.summarizeSendError(null).tag, null)
+})
+
+test('실패 로그 요약: 발송 실패 로그는 요약만 남기고 오류에 logSummary를 붙여 호출부가 같은 값을 쓴다', async () => {
+  const logger = require('../src/logger')
+  const original = logger.error
+  const logs = []
+  logger.error = (message, meta) => { logs.push({ message, meta }) }
+  sendImpl = () => Promise.reject(fakeBadRequestError('01055556666'))
+  let err
+  try {
+    err = await solapi.sendPromoAlimtalk({ phone: '01055556666', storeName: '테스트매장', storeId: 's1' }).catch((e) => e)
+  } finally {
+    logger.error = original
+  }
+  assert.equal(err._tag, 'BadRequestError') // 오류 자체는 그대로 던진다(분류는 호출부가 한다)
+  assert.deepEqual(err.logSummary, { tag: 'BadRequestError', httpStatus: null, statusCode: null, error: 'validation: from,(root)' })
+  assert.equal(solapi.sendFailureLog(err), err.logSummary)
+  const log = logs.find((l) => l.message === '[solapi] 알림 발송 실패')
+  assert.ok(log)
+  assert.equal(log.meta.error, 'validation: from,(root)')
+  const dumped = JSON.stringify(logs)
+  assert.equal(dumped.includes('01055556666'), false, '로그에 손님 번호가 남았다')
+  assert.ok(dumped.length < 1000, `로그가 너무 길다(${dumped.length}자)`)
+
+  // failedMessageList로 거절된 경우는 상태 코드가 요약에 남는다.
+  logs.length = 0
+  logger.error = (message, meta) => { logs.push({ message, meta }) }
+  sendImpl = () => Promise.resolve({ failedMessageList: [{ statusCode: '1062', statusMessage: '발신번호 미등록 01011112222' }] })
+  try {
+    err = await solapi.sendPromoAlimtalk({ phone: '01011112222', storeName: '테스트매장', storeId: 's1' }).catch((e) => e)
+  } finally {
+    logger.error = original
+  }
+  assert.deepEqual({ statusCode: err.logSummary.statusCode, error: err.logSummary.error }, { statusCode: '1062', error: '발신번호 미등록 [번호]' })
+  assert.equal(JSON.stringify(logs).includes('01011112222'), false)
+})
+
+test('부팅 검사: SOLAPI_SENDER에 숫자·하이픈 말고 다른 글자가 있으면 경고한다(값은 남기지 않는다)', () => {
+  const { spawnSync } = require('node:child_process')
+  const path = require('node:path')
+  const boot = (sender) => spawnSync(process.execPath, ['-e', "require('./server'); process.exit(0)"], {
+    cwd: path.join(__dirname, '..'),
+    env: { ...process.env, NODE_ENV: 'test', JWT_SECRET: 'boot-check', SOLAPI_SENDER: sender },
+    encoding: 'utf8',
+    timeout: 30000,
+  })
+  const bad = boot('+82 2-1234-5678')
+  assert.equal(bad.status, 0, bad.stderr)
+  assert.match(bad.stdout, /\[boot\] SOLAPI_SENDER에 숫자와 하이픈/)
+  assert.equal(bad.stdout.includes('+82 2-1234-5678'), false)
+  const good = boot('02-1234-5678')
+  assert.equal(good.status, 0, good.stderr)
+  assert.equal(good.stdout.includes('[boot] SOLAPI_SENDER'), false)
+})
+
 test('홍보 문자 본문은 "(광고) 매장명"으로 시작하고 수신거부 안내로 끝난다', () => {
   const text = solapi.buildPromoText('쉐보레 테스트점')
   assert.ok(text.startsWith('(광고) 쉐보레 테스트점\n'), text)

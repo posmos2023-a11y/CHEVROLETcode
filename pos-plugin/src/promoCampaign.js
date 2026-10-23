@@ -527,6 +527,10 @@ function handleSendClick(btn) {
   send(btn).catch((err) => setMessage(err?.message || String(err), 'error'))
 }
 
+// 발송사(솔라피) 계정 쪽 문제(선불 잔액 부족·발신번호 차단·템플릿 등)로 서버가 발송을 멈췄을 때의 안내. 이때는 30분 뒤 다시 보내도
+// 똑같이 실패한다 -- "다시 보내세요"가 아니라 본사 확인이 필요하다고 알린다(서버 stopped:'provider', 수동 발송 reason 'send_failed_provider').
+export const PROVIDER_STOP_MESSAGE = '문자 발송 계정(잔액·발신번호·템플릿) 문제로 멈췄습니다. 본사 확인이 필요합니다'
+
 // 결과 문구. failed는 확실히 안 나간 것(나중에 다시 보낼 수 있다), uncertain은 결과를 모르는 것
 // (나갔을 수 있어 30일 동안 다시 보내지 않는다).
 function summary(t, remaining, reason) {
@@ -557,6 +561,8 @@ async function send(btn) {
   let remaining = state.eligible
   let stopReason = ''
   let errorText = ''
+  // 발송사 계정 문제로 서버가 멈췄다(PROVIDER_STOP_MESSAGE). 남은 대상을 더 부르지 않는다.
+  let providerStopped = false
   // 서버가 이번 발송 루프에 붙여 준 시작 시각. 첫 응답에서 받아 같은 루프의 다음 요청에 그대로 돌려보낸다(서버가
   // "방금 실패한 번호"를 이 시각 기준으로 가려, 한 루프 안에서 같은 번호를 두 번 시도하지 않게 한다). 지역 변수라
   // 새 발송을 시작하면 자동으로 비워진다 -- 지난 발송의 시각을 새 발송에 붙이면 안 된다.
@@ -582,6 +588,10 @@ async function send(btn) {
           deps.onUnauthorized(res.body.error)
           return
         }
+        if (res.body && (res.body.stopped === 'provider' || res.body.reason === 'send_failed_provider')) {
+          providerStopped = true
+          break
+        }
         errorText = res.body.error || '보내지 못했습니다.'
         break
       }
@@ -589,11 +599,28 @@ async function send(btn) {
       if (res.body.runStartedAt) runStartedAt = res.body.runStartedAt
       remaining = res.body.remaining
       const progressed = (res.body.sent || 0) + (res.body.failed || 0) + (res.body.uncertain || 0) + (res.body.skipped || 0)
+      if (res.body.stopped === 'provider') {
+        // 잔액·발신번호·템플릿 문제는 다시 불러도 같은 실패다. 남은 대상은 시도하지 않고 멈춘다.
+        providerStopped = true
+        break
+      }
       if (res.body.stopped === 'night') {
         stopReason = '밤 9시가 가까워 멈췄습니다. 내일 아침 8시 이후 이어서 보내세요.'
         break
       }
       if (!remaining || !progressed) break
+    }
+    if (providerStopped) {
+      // 이때의 실패는 "30분 뒤 다시 보낼 수 있다"가 아니다(같은 이유로 또 실패한다) -- 건수만 붙인다.
+      const parts = [`보냄 ${t.sent}건`]
+      if (t.failed) parts.push(`실패 ${t.failed}건`)
+      if (t.uncertain) parts.push(`결과 확인 안 됨 ${t.uncertain}건(이미 나갔을 수 있어 30일 동안 다시 보내지 않습니다)`)
+      if (t.skipped) parts.push(`보내기 직전 제외 ${t.skipped}건`)
+      if (remaining) parts.push(`보내지 않은 대상 ${remaining}명`)
+      const text = `${PROVIDER_STOP_MESSAGE} (${parts.join(' · ')})`
+      setMessage(text, 'error')
+      deps.notify('error', `홍보 문자: ${text}`)
+      return
     }
     // 끝나면(중간에 멈췄어도) 아래 finally에서 목록을 다시 불러온다 -- 보낸 번호가 '최근 받음'으로 바뀌어 보이고,
     // 남은 건은 지금 기준의 인원수로 다시 보낸다. 목록을 비우고 기다리면 그 사이 빈 화면이 되므로 비우지 않는다.

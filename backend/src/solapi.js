@@ -84,15 +84,75 @@ async function sendAlimtalk({ phone, text, templateId, variables, storeId, recor
     })
     return result
   } catch (error) {
+    const summary = attachLogSummary(error)
     logger.error('[solapi] 알림 발송 실패', {
       channel: useKakao ? 'alimtalk' : 'sms',
       storeId,
       recordId,
       recordType,
-      error: error.message,
+      ...summary,
     })
     throw error
   }
+}
+
+// --- 실패 로그 요약 ---------------------------------------------------------------
+//
+// 발송 실패의 error.message를 로그에 그대로 남기지 않는다. SDK의 BadRequestError(입력 검증 실패 -- 예: SOLAPI_SENDER에 공백·'+')는
+// message가 수십 KB이고 끝에 요청 전체(받는 번호·본문)가 그대로 붙는다. 그대로 남기면 건마다 손님 전화번호와 광고 본문이 Cloud
+// Logging에 쌓인다(호출부가 한 번 더 남기면 두 번). 그래서 요약값만 남긴다:
+//   tag        SDK 오류 종류(_tag) 또는 우리 오류 코드(SOLAPI_TIMEOUT)
+//   httpStatus 요청 전체를 거절한 응답의 HTTP 상태(ClientError)
+//   statusCode 솔라피 메시지 상태 코드(우리 오류의 statusCode 또는 failedMessageList[0]) -- 원인(잔액·발신번호 등)을 가리는 열쇠
+//   error      BadRequestError면 검증에 걸린 필드 경로만(값은 빼고, 예: 'from,(root)'), 그 밖에는 message를 300자로 자르고 전화번호를 가린 값
+// 호출부(server.js)도 이 값(error.logSummary)을 쓴다 -- sendFailureLog.
+const LOG_MESSAGE_MAX_LENGTH = 300
+// 국내 전화번호 모양(0 또는 +82로 시작, 국번·가운데·끝자리, 사이 하이픈·공백 허용) -- 01012345678, 010-1234-5678, 02 1234 5678,
+// +82 10-1234-5678. 다른 숫자에 붙어 있으면(긴 ID의 일부) 건드리지 않고, 상태 코드(1030)·날짜(2026-10-23)도 그대로 둔다.
+const PHONE_LIKE_RE = /(?<!\d)(?:\+?82[-\s]?0?|0)\d{1,2}[-\s]?\d{3,4}[-\s]?\d{4}(?!\d)/g
+
+function maskPhoneLike(text) {
+  return String(text ?? '').replace(PHONE_LIKE_RE, '[번호]')
+}
+
+function summarizeSendError(error) {
+  if (!error || typeof error !== 'object') {
+    return { tag: null, httpStatus: null, statusCode: null, error: maskPhoneLike(error).slice(0, LOG_MESSAGE_MAX_LENGTH) }
+  }
+  const statusCode = error.statusCode ?? error.failedMessageList?.[0]?.statusCode ?? null
+  let message
+  if (error._tag === 'BadRequestError') {
+    // validationErrors는 'from: 전화번호는 …' / '(root): Expected …, actual {"to":"010…"}' 모양이다. ':' 앞의 경로만 남긴다.
+    const paths = Array.isArray(error.validationErrors)
+      ? [...new Set(error.validationErrors.map((v) => String(v).split(':')[0].trim()).filter(Boolean))]
+      : []
+    message = paths.length ? `validation: ${paths.join(',')}`.slice(0, LOG_MESSAGE_MAX_LENGTH) : 'validation'
+  } else {
+    // 자르기 전에 가린다 -- 자른 끝에 번호 일부가 남지 않게.
+    message = maskPhoneLike(error.message).slice(0, LOG_MESSAGE_MAX_LENGTH)
+  }
+  const httpStatus = Number(error.httpStatus)
+  return {
+    tag: error._tag || error.code || null,
+    httpStatus: Number.isFinite(httpStatus) ? httpStatus : null,
+    statusCode: statusCode === null || statusCode === undefined || statusCode === '' ? null : String(statusCode),
+    error: message,
+  }
+}
+
+// 요약을 만들어 오류에 붙인다(error.logSummary). 이미 붙어 있으면 그대로 쓴다. 붙이지 못하는 값(문자열 throw 등)이면 요약만 돌려준다.
+function attachLogSummary(error) {
+  if (error && typeof error === 'object' && error.logSummary) return error.logSummary
+  const summary = summarizeSendError(error)
+  if (error && typeof error === 'object') {
+    try { error.logSummary = summary } catch { /* 얼린 객체 등 -- 요약만 돌려준다 */ }
+  }
+  return summary
+}
+
+// server.js의 발송 실패 로그용. { tag, httpStatus, statusCode, error } -- 로그 meta에 펼쳐 넣는다.
+function sendFailureLog(error) {
+  return attachLogSummary(error)
 }
 
 // Design Ref: docs/01-plan/features/multi-store-support.plan.md §7.2 (알림톡 발신 정책)
@@ -283,5 +343,7 @@ module.exports = {
   buildPromoText,
   isDefiniteSendFailure,
   classifySendFailure,
+  summarizeSendError,
+  sendFailureLog,
   DEFAULT_PROMO_OPT_OUT_TEXT,
 }

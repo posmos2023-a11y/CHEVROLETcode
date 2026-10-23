@@ -24,7 +24,10 @@
   // 그래서 "값이 없음"(value null)과 "읽기 실패"(ok false)를 나눠 돌려주고, 읽기에 실패하면 쓰지 않는다 -- 호출부는 메모리의 값을
   // 그대로 둔 채 다음 복구에서 다시 한다(updateInflightMap·updateOrphanMap).
   // 읽기에는 시간 제한을 둔다(SDK 호출은 응답이 없으면 끝나지 않는다). 쓰기에는 두지 않는다 -- 끝난 줄 알고 다음 쓰기를 했는데 늦게
-  // 끝난 앞 쓰기가 그 위를 덮으면 기록이 사라질 수 있다. 쓰기가 멈추면 뒤의 저장소 작업이 기다리고, 화면은 각자의 감시 타이머로 빠져나간다.
+  // 끝난 앞 쓰기가 그 위를 덮으면 기록이 사라질 수 있다. 쓰기가 멈추면 뒤의 저장소 작업은 줄(serialized)에서 기다린다. 화면 쪽은 기다리기만
+  // 그만둔다(줄은 그대로라 늦게 끝난 쓰기가 뒤의 새 쓰기를 덮지 못한다): 결제 화면은 결제·취소창 전 단계마다 시간 제한을 두고 실패로 보며
+  // (erp-pay.html STORAGE_STEP_TIMEOUT_MS), 보고를 기다리는 "처음 화면으로"에도 상한이 있다(goHomeWhenIdle). 대기화면은 폴링마다 시간
+  // 제한을 둬 다음 폴링을 늘 예약한다(index.html startableCarts).
   const STORAGE_READ_TIMEOUT_MS = 5000
 
   // 실단말기의 sdk.storage.get은 네이티브가 처리해서, 한 번도 쓴 적 없는 키를 읽을 때 null을 주는지 예외를 던지는지 확인되지
@@ -716,7 +719,7 @@
   //   1) 직원 안내 화면(erp-pay.html showOrphanNotice) -- 승인번호·금액으로 토스 결제내역과 맞춰 보게 한다. 한 건당 한 번 띄운다.
   //   2) 같은 주문의 결제창 자동 시작을 막는다(filterStartableCarts) -- 받은 돈을 전산이 모르는 주문을 손님에게 또 결제시키지 않게.
   //      막는 기간은 ORPHAN_BLOCK_MS다. 그 전에 직원이 주문을 다시 보내면(frontSentAt이 바뀌어 cartSnoozeKey가 달라짐) 바로 풀린다 --
-  //      직원이 확인하고 다시 보낸 것으로 본다.
+  //      직원이 확인하고 다시 보낸 것으로 본다. 그 뒤로는(다른 프론트도) 서버의 frontOrphan이 직원 확인 전까지 막는다(serverOrphanOf).
   //   3) 대사 근거. ORPHAN_KEEP_MS(7일) 동안 단말기에 남긴다.
   const ORPHAN_KEY = 'chevrolet_front_pay_orphans'
   const ORPHAN_KEEP_MS = 7 * 24 * 60 * 60 * 1000
@@ -795,10 +798,24 @@
     return blockingOrphan(cart, Object.values(map))
   }
 
+  // 서버가 알려 준 "이 주문에는 이미 승인된 결제가 있다"(GET /api/front/erp-carts의 cart.frontOrphan {at, approvalNo, amount, ackAt}).
+  // 어느 프론트에서든 승인됐는데 서버가 주문에 기록하지 못한 결제다(/result의 PAID_AFTER_RELEASE). 위의 로컬 미기록 목록은 그 승인을 받은
+  // 단말기에만 있고 30분만, 같은 frontSentAt일 때만 막는다 -- 다른 프론트, 30분 뒤, 전산이 같은 참조번호로 다시 보낸 주문은 막지 못해
+  // 이미 결제한 손님에게 결제창이 다시 떴다(2026-10-23 점검). 직원이 POS에서 확인하기 전(ackAt 없음)에는 어느 프론트도 이 주문의 결제창을
+  // 띄우지 않는다. 확인했으면(ackAt) 막지 않는다. 값의 형식이 예상과 달라도(객체가 아님) 막는다.
+  // 반환: 막는 frontOrphan 객체(형식이 다르면 {}) | null
+  function serverOrphanOf(cart) {
+    const orphan = cart?.frontOrphan
+    if (!orphan) return null
+    if (typeof orphan !== 'object') return {}
+    return orphan.ackAt ? null : orphan
+  }
+
   // 결제창을 띄워도 되는 주문만 남긴다: 손님이 방금 닫아 쉬는 주문(snooze), 지난 기록 확인이 안 끝나 쉬는 주문(holdStuck),
-  // 미기록 건이 걸린 주문을 뺀다. 미기록 목록을 읽지 못하면 하나도 남기지 않는다 -- 어느 주문이 막혀야 하는지 모른다.
+  // 서버가 확인 전 승인(frontOrphan)을 알려 온 주문, 미기록 건이 걸린 주문을 뺀다. 미기록 목록을 읽지 못하면 하나도 남기지 않는다 --
+  // 어느 주문이 막혀야 하는지 모른다.
   async function filterStartableCarts(carts) {
-    const list = (carts || []).filter((c) => !isSnoozed(cartSnoozeKey(c)) && !isHeld('payment', c.id))
+    const list = (carts || []).filter((c) => !isSnoozed(cartSnoozeKey(c)) && !isHeld('payment', c.id) && !serverOrphanOf(c))
     if (!list.length) return list
     const map = await serialized(loadOrphanMap)
     if (!map) return []
@@ -935,6 +952,7 @@
     hasOrphanNotices,
     findOrphanBlock,
     ORPHANS_UNREADABLE,
+    serverOrphanOf,
     filterStartableCarts,
     filterStartableRefunds,
     holdStuck,

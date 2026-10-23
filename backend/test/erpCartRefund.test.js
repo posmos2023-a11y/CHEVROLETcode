@@ -996,6 +996,138 @@ testSerial('취소 후 재결제: 24시간이 지난 환불, 프론트 취소·�
   assert.equal((await row(front.cartId)).status, 'refunded')
 })
 
+// --- R3: POS 취소 기록이 어느 결제의 취소인지 확인한다(PAYMENT_CHANGED) ----------------------------------------
+
+// 결제 P로 받은 주문을 POS에서 취소(환불 기록)하고 다른 카드 P2로 다시 결제해 복원한 주문
+async function restoredAfterRepay(store) {
+  const firstId = unique('640')
+  const cartId = await posPaidCart(store, firstId)
+  assert.equal((await pos(store, 'post', `/api/pos/erp-carts/${cartId}/refunded`, { method: 'pos', paymentId: firstId })).status, 200)
+  const secondId = unique('640')
+  const restored = await pos(store, 'post', `/api/pos/erp-carts/${cartId}/paid`, { paymentId: secondId, orderId: 'ORDER-2', manual: true })
+  assert.equal(restored.status, 200, JSON.stringify(restored.body))
+  assert.equal(restored.body.restored, true)
+  return { cartId, firstId, secondId }
+}
+
+testSerial('POS 취소 기록: 복원된 재결제(P2) 주문에 옛 결제(P)의 취소 기록이 오면 409 PAYMENT_CHANGED로 막고 결제 완료를 지킨다', async () => {
+  const store = await createStore('refund-payment-changed')
+  const { cartId, firstId, secondId } = await restoredAfterRepay(store)
+
+  // 탭앱이 옛 카드(P)를 보고 [POS에서 취소했어요]를 눌렀다 -- 예전에는 P2로 받은 주문이 환불로 바뀌고 되살릴 길이 없었다.
+  const stale = await pos(store, 'post', `/api/pos/erp-carts/${cartId}/refunded`, { method: 'pos', paymentId: firstId })
+  assert.equal(stale.status, 409, JSON.stringify(stale.body))
+  assert.equal(stale.body.code, 'PAYMENT_CHANGED')
+  assert.equal(stale.body.status, 'paid')
+  let cart = await row(cartId)
+  assert.equal(cart.status, 'paid')
+  assert.equal(cart.tossPaymentId, secondId)
+
+  // 지금 결제(P2)의 취소 기록은 받는다. 그 뒤 같은 기록의 재시도는 처리됨, 옛 결제 ID의 재시도는 여전히 PAYMENT_CHANGED.
+  const real = await pos(store, 'post', `/api/pos/erp-carts/${cartId}/refunded`, { method: 'pos', paymentId: secondId })
+  assert.equal(real.status, 200, JSON.stringify(real.body))
+  assert.deepEqual(real.body.refundedCartIds, [cartId])
+  cart = await row(cartId)
+  assert.equal(cart.status, 'refunded')
+  const retry = await pos(store, 'post', `/api/pos/erp-carts/${cartId}/refunded`, { method: 'pos', paymentId: secondId })
+  assert.equal(retry.status, 200)
+  assert.equal(retry.body.alreadyProcessed, true)
+  assert.equal((await pos(store, 'post', `/api/pos/erp-carts/${cartId}/refunded`, { method: 'pos', paymentId: firstId })).body.code, 'PAYMENT_CHANGED')
+
+  // paymentId를 안 보내는 옛 탭앱은 예전처럼 취소된다.
+  const legacy = await posPaidCart(store, unique('640'))
+  assert.equal((await pos(store, 'post', `/api/pos/erp-carts/${legacy}/refunded`, { method: 'pos' })).status, 200)
+  assert.equal((await row(legacy)).status, 'refunded')
+})
+
+testSerial('POS 취소 기록: 읽은 뒤 복원으로 결제 ID가 바뀌면 취소로 바꾸지 않고 409 PAYMENT_CHANGED(읽은 결제 ID를 조건에 건다)', async () => {
+  const store = await createStore('refund-payment-race')
+  const firstId = unique('640')
+  const cartId = await posPaidCart(store, firstId)
+  const secondId = unique('640')
+  // 형제 주문을 찾은 직후 다른 요청이 이 주문을 새 결제 P2로 바꿨다(취소 후 재결제 복원이 끼어든 것처럼).
+  const res = await withRaceAfterNext('findMany', async () => {
+    await prisma.erpCart.update({ where: { id: cartId }, data: { tossPaymentId: secondId, tossOrderId: 'ORDER-2' } })
+  }, () => pos(store, 'post', `/api/pos/erp-carts/${cartId}/refunded`, { method: 'pos' }))
+  assert.equal(res.status, 409, JSON.stringify(res.body))
+  assert.equal(res.body.code, 'PAYMENT_CHANGED')
+  const cart = await row(cartId)
+  assert.equal(cart.status, 'paid')
+  assert.equal(cart.tossPaymentId, secondId)
+})
+
+// --- R3: 직원이 손으로 고른 결제·취소 후 재결제의 금액 확인(AMOUNT_MISMATCH) -------------------------------------
+
+async function recordTossPaymentRow(store, id, amount) {
+  return prisma.tossPayment.create({
+    data: { id, merchantId: store.merchantId, storeId: store.id, orderId: unique('620'), state: 'APPROVED', sourceType: 'CARD', amount, approvedNo: '11112222' },
+  })
+}
+
+testSerial('금액 확인: 취소 후 재결제 복원에 고른 결제가 주문 금액보다 작으면(전산 밖 품목만 다시 결제) 409 AMOUNT_MISMATCH로 되살리지 않는다', async () => {
+  const store = await createStore('repay-amount-short')
+  const firstId = unique('640')
+  const cartId = await posPaidCart(store, firstId) // 45,000원
+  assert.equal((await pos(store, 'post', `/api/pos/erp-carts/${cartId}/refunded`, { method: 'pos', paymentId: firstId })).status, 200)
+
+  // 와이퍼만 다시 결제한 20,000원 -- 웹훅으로 토스 결제 기록이 있다.
+  const wiperId = unique('640')
+  await recordTossPaymentRow(store, wiperId, 20000)
+  for (const extra of [{ manual: true }, { orderId: 'ORDER-1' }]) { // 직원이 고른 결제, 같은 POS 주문의 결제 둘 다
+    const res = await pos(store, 'post', `/api/pos/erp-carts/${cartId}/paid`, { paymentId: wiperId, orderId: 'ORDER-1', ...extra })
+    assert.equal(res.status, 409, JSON.stringify(res.body))
+    assert.equal(res.body.code, 'AMOUNT_MISMATCH')
+    assert.equal(res.body.paymentAmount, 20000)
+    assert.equal(res.body.cartAmount, 45000)
+    assert.equal((await row(cartId)).status, 'refunded')
+  }
+
+  // 주문 금액 이상인 결제면 되살린다.
+  const fullId = unique('640')
+  await recordTossPaymentRow(store, fullId, 45000)
+  const ok = await pos(store, 'post', `/api/pos/erp-carts/${cartId}/paid`, { paymentId: fullId, orderId: 'ORDER-3', manual: true })
+  assert.equal(ok.status, 200, JSON.stringify(ok.body))
+  assert.equal(ok.body.restored, true)
+  assert.equal((await row(cartId)).tossPaymentId, fullId)
+})
+
+testSerial('금액 확인: 손으로 고른 결제로 담긴 주문을 결제 완료로 기록할 때도 금액이 작으면 409, 토스 기록이 없으면 막지 않고 경고만 남긴다', async () => {
+  const store = await createStore('manual-amount')
+  const created = await erp.post(body(store))
+  const cartId = created.body.cartId
+  await pos(store, 'post', `/api/pos/erp-carts/${cartId}/consume`, { result: 'loaded' })
+
+  const shortId = unique('640')
+  await recordTossPaymentRow(store, shortId, 30000)
+  const short = await pos(store, 'post', `/api/pos/erp-carts/${cartId}/paid`, { paymentId: shortId, orderId: 'ORDER-9', manual: true })
+  assert.equal(short.status, 409, JSON.stringify(short.body))
+  assert.equal(short.body.code, 'AMOUNT_MISMATCH')
+  assert.equal(short.body.status, 'loaded')
+  assert.equal((await row(cartId)).status, 'loaded')
+
+  // 자동으로 맞춘 결제(manual 아님)는 금액을 보지 않는다(그 POS 주문에서 찾은 결제다).
+  const auto = await erp.post(body(store))
+  await pos(store, 'post', `/api/pos/erp-carts/${auto.body.cartId}/consume`, { result: 'loaded' })
+  assert.equal((await pos(store, 'post', `/api/pos/erp-carts/${auto.body.cartId}/paid`, { paymentId: shortId, orderId: 'ORDER-9' })).status, 200)
+
+  // 토스 결제 기록이 아직 없으면(웹훅 전) 막지 않고 금액을 확인하지 못했다고 경고를 남긴다.
+  const original = logger.warn
+  const warns = []
+  logger.warn = (message, meta) => { warns.push({ message, meta }) }
+  let res
+  try {
+    res = await pos(store, 'post', `/api/pos/erp-carts/${cartId}/paid`, { paymentId: unique('640'), orderId: 'ORDER-10', manual: true })
+  } finally {
+    logger.warn = original
+  }
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal((await row(cartId)).status, 'paid')
+  const warn = warns.find((w) => w.message.includes('금액을 토스 결제 기록으로 확인하지 못했습니다'))
+  assert.ok(warn, '금액 미확인 경고가 남지 않았다')
+  assert.equal(warn.meta.cartId, cartId)
+  assert.equal(warn.meta.cartAmount, 45000)
+})
+
 // --- 웹훅이 먼저 와서 생긴 Payment 백업 기록의 이중 집계 ---------------------------------------------
 
 function summaryOf(store) {

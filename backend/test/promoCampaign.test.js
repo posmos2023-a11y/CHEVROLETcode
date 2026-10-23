@@ -35,8 +35,12 @@ let failNext = null // null | 'error'(확실한 실패) | 'timeout' | 'network'(
 const rejectedPhones = new Set()
 // 모든 발송이 같은 이유로 실패한다: 솔라피 상태 코드(예: '1030' 잔액 부족, '3104' 카카오톡 미사용자) 또는 'timeout'(결과 모름)
 let failAllWith = null
+// 발송마다 이 함수가 돌려준 오류로 실패한다(SDK 오류 모양을 그대로 흉내 낼 때). null을 돌려주면 그 건은 나간다.
+let throwWith = null
 solapi.sendPromoAlimtalk = async (payload) => {
   promoCalls.push(payload)
+  const forced = throwWith ? throwWith(payload) : null
+  if (forced) throw forced
   if (failAllWith === 'timeout') {
     const err = new Error('Solapi 발송 시간 초과 (10초)')
     err.code = 'SOLAPI_TIMEOUT'
@@ -88,6 +92,7 @@ async function resetDatabase() {
   promoCalls.length = 0
   failNext = null
   failAllWith = null
+  throwWith = null
   rejectedPhones.clear()
 }
 
@@ -1198,4 +1203,140 @@ testSerial('정비 이력 삭제: 지운 마지막 방문이 광고 거부였다
   const res = await posPreview(store, { from: kstDate(-7), to: kstDate(0) })
   assert.equal(res.body.filterCounts.eligible, 0)
   assert.equal(res.body.rows[0].status, 'no_consent')
+})
+
+// --- R3: 기간·수동 발송도 발송사 탓 실패를 가리고, 이어지면 기간 발송을 멈춘다 -----------------------------------
+
+const PROVIDER_STOP_MESSAGE = '문자 발송 계정(잔액·발신번호·템플릿) 문제로 멈췄습니다. 본사 확인이 필요합니다'
+const statusesOf = async (store) => (await prisma.promoSend.findMany({ where: { storeId: store.id } })).map((r) => r.status)
+
+testSerial('기간 발송: 잔액 부족 같은 발송사 탓 실패가 이어지면 그 묶음 뒤에 멈추고(stopped provider) 남은 대상은 시도하지 않는다', async () => {
+  if (!isDaytimeKst()) return
+  const store = await createStore('campaign-provider')
+  const { token } = await adminToken('hq_admin')
+  for (let i = 0; i < 12; i += 1) await visit(store, { phone: `010414100${String(i).padStart(2, '0')}`, daysAgo: 2 })
+  const period = { storeId: store.id, from: kstDate(-7), to: kstDate(0) }
+
+  failAllWith = '1030' // 잔액 부족
+  const res = await send(token, { ...period, confirmCount: 12 })
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal(res.body.stopped, 'provider')
+  assert.equal(res.body.message, PROVIDER_STOP_MESSAGE)
+  const { sent, failed, failedProvider, uncertain, skipped, remaining } = res.body
+  assert.deepEqual({ sent, failed, failedProvider, uncertain, skipped, remaining }, { sent: 0, failed: 5, failedProvider: 5, uncertain: 0, skipped: 0, remaining: 7 })
+  assert.equal(promoCalls.length, 5) // 동시 발송 한 묶음만 시도했다(예전에는 대상 전원)
+  assert.deepEqual(await statusesOf(store), Array(5).fill('failed_provider'))
+
+  // 발송사가 돌아오면 남은 대상부터 이어 보낸다(방금 실패한 5명은 30분 동안 건너뛴다).
+  failAllWith = null
+  const rest = await send(token, { ...period, confirmCount: 7 })
+  assert.equal(rest.status, 200, JSON.stringify(rest.body))
+  assert.deepEqual({ sent: rest.body.sent, stopped: rest.body.stopped, remaining: rest.body.remaining }, { sent: 7, stopped: null, remaining: 0 })
+  assert.equal('message' in rest.body, false)
+  // 안 나간 발송이라 30일 제한에 들어가지 않는다 -- 30분이 지나면 다시 보낼 수 있다.
+  await prisma.promoSend.updateMany({ where: { storeId: store.id, status: 'failed_provider' }, data: { sentAt: new Date(Date.now() - 31 * 60 * 1000) } })
+  const pv = await preview(token, period)
+  assert.equal(pv.body.eligible, 5)
+  assert.equal(pv.body.excluded.recentlySent, 7)
+
+  // POS 탭앱의 기간 발송도 같다.
+  const posStore = await createStore('campaign-provider-pos')
+  for (let i = 0; i < 8; i += 1) await visit(posStore, { phone: `010414200${String(i).padStart(2, '0')}`, daysAgo: 2 })
+  failAllWith = '1062' // 발신번호 미등록
+  const posRes = await posSend(posStore, { from: kstDate(-7), to: kstDate(0), confirmCount: 8 })
+  assert.equal(posRes.status, 200, JSON.stringify(posRes.body))
+  assert.deepEqual({ stopped: posRes.body.stopped, failedProvider: posRes.body.failedProvider, remaining: posRes.body.remaining }, { stopped: 'provider', failedProvider: 5, remaining: 3 })
+  assert.equal(posRes.body.message, PROVIDER_STOP_MESSAGE)
+})
+
+testSerial('기간 발송: 수신자 탓 실패(카카오톡 미사용자)는 이어져도 멈추지 않고 failed로 남기며, 발송사 탓 실패도 사이에 성공이 끼면 멈추지 않는다', async () => {
+  if (!isDaytimeKst()) return
+  const store = await createStore('campaign-recipient')
+  const { token } = await adminToken('hq_admin')
+  for (let i = 0; i < 7; i += 1) await visit(store, { phone: `010414300${String(i).padStart(2, '0')}`, daysAgo: 2 })
+  failAllWith = '3104'
+  const res = await send(token, { storeId: store.id, from: kstDate(-7), to: kstDate(0), confirmCount: 7 })
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.deepEqual({ stopped: res.body.stopped, failed: res.body.failed, failedProvider: res.body.failedProvider, remaining: res.body.remaining }, { stopped: null, failed: 7, failedProvider: 0, remaining: 0 })
+  assert.equal(promoCalls.length, 7)
+  assert.deepEqual(await statusesOf(store), Array(7).fill('failed'))
+
+  // 최근 방문순으로 보낸다: 발송사 탓 실패와 성공이 번갈아 나오면 "이어진" 실패가 아니다.
+  failAllWith = null
+  const mixed = await createStore('campaign-mixed')
+  const phones = []
+  for (let i = 0; i < 10; i += 1) {
+    phones.push(`010414400${String(i).padStart(2, '0')}`)
+    await visit(mixed, { phone: phones[i], daysAgo: 1 + i / 100 })
+  }
+  throwWith = (payload) => (phones.indexOf(payload.phone) % 2 === 0 ? Object.assign(new Error('잔액 부족(테스트)'), { definiteFailure: true, statusCode: '1030' }) : null)
+  const mixedRes = await send(token, { storeId: mixed.id, from: kstDate(-7), to: kstDate(0), confirmCount: 10 })
+  assert.equal(mixedRes.status, 200, JSON.stringify(mixedRes.body))
+  assert.deepEqual({ stopped: mixedRes.body.stopped, sent: mixedRes.body.sent, failedProvider: mixedRes.body.failedProvider, remaining: mixedRes.body.remaining }, { stopped: null, sent: 5, failedProvider: 5, remaining: 0 })
+})
+
+testSerial('차량별 수동 발송: 발송사 탓 실패는 failed_provider로 남기고 send_failed_provider로 본사 확인을 안내한다(수신자 탓 send_failed, 결과 모름 send_unknown)', async () => {
+  if (!isDaytimeKst()) return
+  const store = await createStore('manual-provider')
+  await visit(store, { phone: '01041450001', carNumber: '41가4141', daysAgo: 1 })
+  const sendManual = () => request(app).post('/api/pos/promo/send').set('X-Store-Token', store.posToken).send({ carNumber: '41가4141' })
+  const eligibility = () => request(app).get('/api/pos/promo/eligibility?carNumber=' + encodeURIComponent('41가4141')).set('X-Store-Token', store.posToken)
+  const latestStatus = async () => (await prisma.promoSend.findFirst({ where: { storeId: store.id }, orderBy: { sentAt: 'desc' } })).status
+
+  failAllWith = '1030'
+  const provider = await sendManual()
+  assert.equal(provider.status, 502, JSON.stringify(provider.body))
+  assert.equal(provider.body.reason, 'send_failed_provider')
+  assert.match(provider.body.error, /문자 발송 계정\(잔액·발신번호·템플릿\) 문제로 보내지 못했습니다\. 본사 확인이 필요합니다/)
+  assert.equal(await latestStatus(), 'failed_provider')
+  // 안 나간 발송이라 30일 제한에 넣지 않는다(다시 보낼 수 있다).
+  assert.equal((await eligibility()).body.canSend, true)
+
+  failAllWith = '3104'
+  const recipient = await sendManual()
+  assert.deepEqual({ status: recipient.status, reason: recipient.body.reason }, { status: 502, reason: 'send_failed' })
+  assert.equal(await latestStatus(), 'failed')
+  assert.equal((await eligibility()).body.canSend, true)
+
+  failAllWith = 'timeout'
+  const unknown = await sendManual()
+  assert.deepEqual({ status: unknown.status, reason: unknown.body.reason }, { status: 502, reason: 'send_unknown' })
+  assert.equal(await latestStatus(), 'unknown')
+  const after = (await eligibility()).body
+  assert.deepEqual({ canSend: after.canSend, reason: after.reason }, { canSend: false, reason: 'recently_sent' })
+})
+
+testSerial('발송 실패 로그: 기간·수동 발송은 SDK 오류 메시지(받는 번호·본문)를 그대로 남기지 않고 요약(tag·검증 경로)만 남긴다', async () => {
+  if (!isDaytimeKst()) return
+  const logger = require('../src/logger')
+  const store = await createStore('log-summary')
+  const { token } = await adminToken('hq_admin')
+  const phone = '01041460001'
+  await visit(store, { phone, carNumber: '41나4141', daysAgo: 2 })
+  // SOLAPI_SENDER 형식 오류로 SDK가 보내기 전에 거절한 BadRequestError -- message 끝에 요청 전체가 붙는다.
+  throwWith = (payload) => Object.assign(new Error(`${'x'.repeat(5000)} actual {"to":"${payload.phone}","from":"+82 2 1234","text":"(광고) 본문"}`), {
+    _tag: 'BadRequestError',
+    validationErrors: ['from: 전화번호는 숫자 및 특수문자 - 외 문자를 포함할 수 없습니다.', `(root): Expected ..., actual {"to":"${payload.phone}"}`],
+  })
+  const original = logger.error
+  const logs = []
+  logger.error = (message, meta) => { logs.push({ message, meta }) }
+  try {
+    assert.equal((await send(token, { storeId: store.id, from: kstDate(-7), to: kstDate(0), confirmCount: 1 })).body.failedProvider, 1)
+    assert.equal((await request(app).post('/api/pos/promo/send').set('X-Store-Token', store.posToken).send({ carNumber: '41나4141' })).body.reason, 'send_failed_provider')
+  } finally {
+    logger.error = original
+  }
+  for (const message of ['[promo-campaign] 발송 실패', '[promo] 수동 발송 실패']) {
+    const log = logs.find((l) => l.message === message)
+    assert.ok(log, `${message} 로그가 없다`)
+    assert.deepEqual(
+      { failure: log.meta.failure, tag: log.meta.tag, error: log.meta.error, statusCode: log.meta.statusCode, httpStatus: log.meta.httpStatus },
+      { failure: 'provider', tag: 'BadRequestError', error: 'validation: from,(root)', statusCode: null, httpStatus: null }
+    )
+  }
+  const dumped = JSON.stringify(logs)
+  assert.equal(dumped.includes(phone), false, '로그에 손님 번호가 남았다')
+  assert.equal(dumped.includes('(광고) 본문'), false, '로그에 광고 본문이 남았다')
+  assert.deepEqual(await statusesOf(store), ['failed_provider', 'failed_provider'])
 })

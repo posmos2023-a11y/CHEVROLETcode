@@ -245,6 +245,8 @@
   .erp-status.dismissed, .erp-status.cancelled { background: #eef0f2; color: var(--muted); }
   /* 프론트에서 승인됐지만 주문에 반영되지 못한 결제(frontOrphan) -- 같은 주문을 두 번 받았을 수 있어 눈에 띄게 둔다. */
   .erp-orphan { display: inline-block; margin-top: 4px; padding: 3px 7px; border-radius: 6px; background: #fff0f1; color: #d93025; font-size: 11px; font-weight: 700; }
+  /* 매장이 [확인했어요]를 누른 경고. 지우지 않고 계속 보여준다(대사 근거) -- 확인 전 경고와 구분만 한다. */
+  .erp-orphan.acked { background: #fff5dc; color: #8a6100; }
   .pos-token-input {
     width: 190px;
     padding: 6px 10px;
@@ -835,7 +837,7 @@ function renderErpCarts() {
             ${c.status === 'paid' ? `<br><button class="row-btn" type="button" data-resend-receipt="${escapeHtml(c.id)}">${c.receiptStatus === 'sent' ? '영수증 다시 보내기' : '영수증 보내기'}</button>` : ''}
             ${c.refundNote ? `<br><span class="muted">${escapeHtml(c.refundNote)}</span>` : ''}
             ${c.errorMessage ? `<br><span class="muted">${escapeHtml(c.errorMessage)}</span>` : ''}
-            ${c.frontOrphan ? `<br><span class="erp-orphan">⚠ 프론트 승인 미반영 · ${escapeHtml(formatWhen(c.frontOrphan.at))}${c.frontOrphan.approvalNo ? ` · 승인번호 ${escapeHtml(c.frontOrphan.approvalNo)}` : ''}${c.frontOrphan.amount !== null && c.frontOrphan.amount !== undefined ? ` · ${Number(c.frontOrphan.amount).toLocaleString('ko-KR')}원` : ''} · 대사 필요</span>` : ''}</td>
+            ${c.frontOrphan ? `<br><span class="erp-orphan${c.frontOrphan.ackAt ? ' acked' : ''}">⚠ 프론트 승인 미반영 · ${escapeHtml(formatWhen(c.frontOrphan.at))}${c.frontOrphan.approvalNo ? ` · 승인번호 ${escapeHtml(c.frontOrphan.approvalNo)}` : ''}${c.frontOrphan.amount !== null && c.frontOrphan.amount !== undefined ? ` · ${Number(c.frontOrphan.amount).toLocaleString('ko-KR')}원` : ''} · 대사 필요${c.frontOrphan.ackAt ? ` · 매장 확인함(${escapeHtml(formatWhen(c.frontOrphan.ackAt))})` : ''}</span>` : ''}</td>
         <td>${escapeHtml(formatWhen(c.loadedAt))}<br>
             <span class="muted">${escapeHtml(formatWhen(c.paidAt))}</span></td>
       </tr>`).join('')}</tbody>
@@ -1030,13 +1032,20 @@ async function previewPromoCampaign() {
 }
 
 // 결과 문구. failed는 확실히 안 나간 것(나중에 다시 보낼 수 있다), uncertain은 결과를 모르는 것
-// (나갔을 수 있어 30일 동안 다시 보내지 않는다).
+// (나갔을 수 있어 30일 동안 다시 보내지 않는다). failedProvider는 failed 중 발송사 계정·설정 탓(잔액·발신번호·템플릿) --
+// 다시 보내도 똑같이 실패하므로 "30분 뒤 다시"를 권하지 않는다. reason은 멈춘 이유(남은 대상이 없어도 보여준다).
+const PROMO_PROVIDER_STOP_TEXT = '문자 발송 계정(잔액·발신번호·템플릿) 문제로 멈췄습니다. 본사 확인이 필요합니다'
+
 function promoSummary(t, remaining, reason) {
   const lines = [`보냄 ${t.sent}건`]
-  if (t.failed) lines.push(`실패 ${t.failed}건(30분 뒤 [대상 확인]으로 다시 보낼 수 있습니다)`)
+  const providerFailed = t.failedProvider || 0
+  const recipientFailed = Math.max(0, (t.failed || 0) - providerFailed)
+  if (recipientFailed) lines.push(`실패 ${recipientFailed}건(30분 뒤 [대상 확인]으로 다시 보낼 수 있습니다)`)
+  if (providerFailed) lines.push(`발송 계정 문제로 안 나감 ${providerFailed}건`)
   if (t.uncertain) lines.push(`결과 확인 안 됨 ${t.uncertain}건(이미 나갔을 수 있어 30일 동안 다시 보내지 않습니다)`)
   if (t.skipped) lines.push(`보내기 직전 제외 ${t.skipped}건(다른 발송이 먼저 보냈거나 수신거부 등)`)
   if (remaining) lines.push(`아직 ${remaining}명 남음 — ${reason || '[대상 확인]을 다시 눌러 이어서 보내세요.'}`)
+  else if (reason) lines.push(reason)
   return lines.join(' · ')
 }
 
@@ -1050,7 +1059,8 @@ async function sendPromoCampaign() {
   const btn = document.getElementById('promo-send-btn')
   if (btn) btn.disabled = true
   lockPromo(true)
-  const t = { sent: 0, failed: 0, uncertain: 0, skipped: 0 }
+  // failedProvider는 failed에 이미 들어 있다(처리 수를 셀 때 따로 더하지 않는다).
+  const t = { sent: 0, failed: 0, failedProvider: 0, uncertain: 0, skipped: 0 }
   let remaining = state.eligible
   let stopReason = ''
   let errorText = ''
@@ -1069,6 +1079,8 @@ async function sendPromoCampaign() {
       remaining = body.remaining
       const progressed = (body.sent || 0) + (body.failed || 0) + (body.uncertain || 0) + (body.skipped || 0)
       if (body.stopped === 'night') { stopReason = '21시가 가까워 멈췄습니다. 내일 8시 이후 [대상 확인]으로 이어서 보내세요.'; break }
+      // 발송사 계정·설정 탓 실패가 이어져 서버가 멈췄다. 다시 불러도 남은 대상이 같은 이유로 실패하므로 여기서 끝낸다.
+      if (body.stopped === 'provider') { stopReason = PROMO_PROVIDER_STOP_TEXT; break }
       if (!remaining || !progressed) break
     }
   } catch (e) {

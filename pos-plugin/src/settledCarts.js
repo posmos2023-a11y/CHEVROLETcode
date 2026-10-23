@@ -24,19 +24,28 @@
 //   - [POS에서 다시 결제했어요]: 직원이 POS [주문]에서 결제를 취소하고 다른 카드로 다시 결제한 경우. 같은 고르기 칸으로 새 결제를
 //     골라 기록하면 서버가 결제 완료로 되살린다(restored).
 // 프론트 승인 경고(frontOrphan)가 있는 카드는 빨간 경고를 띄우고 [POS에서 결제했어요]·[POS에서 다시 결제했어요] 앞에서 한 번 더 확인받는다.
+// 담김 카드에는 [프론트 승인으로 결제 완료 기록]을 둔다(그 승인이 이 주문의 결제인 경우). 매장이 확인한 경고(ackAt)는 접어서 보여준다.
 import { posPluginSdk } from '@tossplace/pos-plugin-sdk'
 import {
+  canRecordFrontOrphan,
   clearFrontOrphan,
   forgetLoadedCart,
+  frontOrphanAckedText,
   frontOrphanText,
   hasFrontOrphan,
+  isFrontOrphanOpen,
   isRecentPosCancel,
   listUnmatchedPayments,
   noteManualPaid,
   noteRecentCarts,
   noteSelfCancel,
+  openRepayWindow,
   ORPHAN_ACK_CONFIRM,
+  ORPHAN_RECORD_LABEL,
+  orphanRecordConfirmText,
   peekLoadedRecord,
+  recordFrontOrphan,
+  removeUnmatchedPayment,
 } from './erpCarts.js'
 
 const listEl = document.getElementById('settled-cart-list')
@@ -53,19 +62,32 @@ const sdkCancelFailed = new Set()
 // SDK 30초 시간 제한("지연되고 있습니다")에 걸린 POS 결제. 취소가 실패한 게 아니라 결과를 모르는 상태라서
 // sdkCancelFailed와 따로 둔다 -- 그쪽에 넣으면 [결제 취소]가 사라져, 실제로는 취소 안 된 결제를 여기서 다시 못 취소한다.
 const sdkCancelTimedOut = new Set()
+// 두 상태의 키는 주문과 결제의 짝이다. 예전에는 주문 ID만 써서, 옛 결제의 취소가 막힌 뒤 [POS에서 다시 결제했어요]로 새 결제가 복원돼도
+// 상태가 남았다 -- 복원된 카드에 [결제 취소] 없이 [POS에서 취소했어요]만 보여, 직원이 옛 결제를 보고 누르면 받은 새 결제가 환불로 기록됐다.
+// 결제가 바뀌면 키도 바뀌어 상태가 풀린다(서버도 /refunded에 실은 결제 ID가 다르면 PAYMENT_CHANGED로 막는다).
+function cancelKey(cart) {
+  return `${cart.id}:${cart.tossPaymentId || ''}`
+}
 // 프론트 취소(refunding)가 이 시간보다 오래 갇혀 있으면 [취소 중 풀기]를 보여준다. 서버가 같은 10분을 다시 확인한다.
 const STUCK_REFUND_MS = 10 * 60 * 1000
 // [POS에서 결제했어요]·[POS에서 다시 결제했어요]로 결제를 고르는 중인 카드와 고른 결제. 폴링이 목록을 다시 그려도 고르던 상태가 남아야 한다.
 //   mode: 'loaded'(담김 주문의 결제) | 'repay'(POS에서 취소된 주문의 다시 결제)
 //   sharedArmed: 다른 주문에 이미 기록한 결제를 고르고 [이 결제로 기록]을 한 번 누른 상태(한 번 더 눌러야 보낸다)
-let paidPicker = null // { cartId, selected: paymentId | null, mode, sharedArmed }
+//   amountArmed: 고른 결제의 남은 금액이 주문 합계보다 적거나 모르는 결제를 고르고 [이 결제로 기록]을 한 번 누른 상태(두 금액을 보여 주고
+//                한 번 더 눌러야 보낸다). 할인해서 적게 받았을 수는 있지만, 다른 손님의 작은 결제를 고르면 받지 않은 정비가 결제 완료가 된다.
+let paidPicker = null // { cartId, selected: paymentId | null, mode, sharedArmed, amountArmed }
 let sharedArmTimer = null
-// 다른 주문에 이미 기록한 결제를 또 기록할 때의 확인 시간. 문구를 읽고 POS [주문]을 볼 시간을 준다.
+// 다른 주문에 이미 기록한 결제를 또 기록할 때(·금액이 모자란 결제를 기록할 때)의 확인 시간. 문구를 읽고 POS [주문]을 볼 시간을 준다.
 const SHARED_CONFIRM_MS = 10 * 1000
+// 다시 결제 후보는 원래 결제 뒤, 그리고 취소 시각보다 이만큼 앞선 때 뒤의 결제만 보여준다. 취소 웹훅이 다시 결제보다 늦게 올 수 있어
+// 여유를 둔다. 예전에는 원래 결제 시각만 봐서, 며칠 전 결제를 오늘 환불한 주문에도 그 사이의 남의 판매가 다 후보로 나왔다.
+const REPAY_LOOKBACK_MS = 30 * 60 * 1000
 // 프론트 승인 경고가 있는 카드에서 결제를 기록하기 전에 한 번 더 확인받는 동작과 그 문구(handleClick).
 const ORPHAN_GATED = new Set(['pos-paid', 'pos-repaid'])
 const ORPHAN_STAGE_LABEL = '프론트 승인 건입니다. 그래도 POS 결제를 고를까요?'
 const ORPHAN_CONFIRM_MS = 10 * 1000
+// 확인 문구를 읽을 시간이 더 필요한 동작(프론트 승인 경고의 [확인했어요]·[프론트 승인으로 결제 완료 기록]).
+const LONG_CONFIRM = new Set(['orphan-ack', 'orphan-record'])
 // 서버가 "다른 단말기에서 담은 주문"이라며 담기 취소를 거절했지만, 이제는 여기서 되돌려도 된다고(canForceAfterSec 0)
 // 답한 카드. 이 카드에만 [그래도 되돌리기]를 따로 보여준다.
 const forceUnloadAllowed = new Set()
@@ -194,6 +216,40 @@ function hintedFor(p, cartId) {
   return idsOf(p.hintCartIds).includes(cartId)
 }
 
+// 이 결제에서 아직 다른 주문에 기록하지 않은 몫(한 결제로 여러 주문을 함께 계산한 경우 이미 기록한 주문 합계를 뺀다). 금액을 모르면 null.
+function availableAmount(p) {
+  if (!p || typeof p.amount !== 'number' || !Number.isFinite(p.amount)) return null
+  return p.amount - Math.max(0, Number(p.recordedTotal) || 0)
+}
+
+function cartTotalOf(cart) {
+  const total = Number(cart && cart.totalAmount)
+  return Number.isFinite(total) ? total : null
+}
+
+// 남은 몫이 주문 합계와 꼭 같은 결제인지. 미리 고르기는 이때만 한다.
+function amountMatches(p, cart) {
+  const available = availableAmount(p)
+  const total = cartTotalOf(cart)
+  return available !== null && total !== null && available === total
+}
+
+// 기록 전에 금액을 한 번 더 확인받을 결제인지(남은 몫이 주문 합계보다 적거나 금액을 모른다).
+function amountShort(p, cart) {
+  const available = availableAmount(p)
+  const total = cartTotalOf(cart)
+  return available === null || (total !== null && available < total)
+}
+
+function amountConfirmLabel(p, cart) {
+  const available = availableAmount(p)
+  const total = formatWon(cartTotalOf(cart) || 0)
+  if (available === null) return `결제 금액을 확인할 수 없습니다(주문 합계 ${total}). POS [주문]에서 금액을 확인했으면 한 번 더 눌러주세요`
+  const recorded = Math.max(0, Number(p.recordedTotal) || 0)
+  const pay = recorded ? `이 결제에서 남은 ${formatWon(available)}(다른 주문에 ${formatWon(recorded)} 기록)` : `결제 금액 ${formatWon(available)}`
+  return `${pay}이 주문 합계 ${total}보다 적습니다. 할인 등으로 적게 받은 게 맞으면 한 번 더 눌러주세요`
+}
+
 // 이 카드를 담은 뒤 이 단말기에서 생긴, 전산 주문과 맞추지 못한 POS 결제(최근 것부터). 담은 시각을 모르면 전부 보여준다.
 // 다른 주문에 이미 기록한 결제도 넣는다(한 결제로 함께 계산한 주문). 이 주문에 이미 기록한 결제만 뺀다.
 function unmatchedAfterLoad(cart) {
@@ -203,14 +259,20 @@ function unmatchedAfterLoad(cart) {
   return after.slice().sort((a, b) => b.at - a.at)
 }
 
-// POS에서 취소된 주문을 다시 결제했을 때 고를 결제. 원래 결제 시각 뒤에 이 단말기에서 생긴 맞추지 못한 결제이고(취소 웹훅이 다시
-// 결제보다 늦게 올 수 있어 취소 시각이 아니라 결제 시각으로 가른다), 이 주문의 POS 주문에 다시 들어온 결제(hint)를 맨 앞에 둔다.
-// 이미 취소된 원래 결제와 이 주문에 이미 기록한 결제는 뺀다.
+// POS에서 취소된 주문을 다시 결제했을 때 고를 결제. 원래 결제 뒤이면서 취소 시각 30분 전 뒤에 이 단말기에서 생긴 맞추지 못한 결제이고
+// (취소 웹훅이 다시 결제보다 늦게 올 수 있어 여유를 둔다, REPAY_LOOKBACK_MS), 이 주문과 이어진 결제(hint)를 맨 앞에 둔다. 이어진 결제는
+// 시각과 관계없이 넣는다. 이미 취소된 원래 결제와 이 주문에 이미 기록한 결제는 뺀다.
 function repayOptions(cart) {
-  const since = Date.parse(cart.paidAt || '')
+  const paidAt = Date.parse(cart.paidAt || '')
+  const refundedAt = Date.parse(cart.refundedAt || '')
+  const bounds = [
+    Number.isFinite(paidAt) ? paidAt - CLOCK_SKEW_MS : null,
+    Number.isFinite(refundedAt) ? refundedAt - REPAY_LOOKBACK_MS : null,
+  ].filter((v) => v !== null)
+  const since = bounds.length ? Math.max(...bounds) : null
   return listUnmatchedPayments()
     .filter((p) => p.paymentId !== cart.tossPaymentId && !idsOf(p.recordedCartIds).includes(cart.id))
-    .filter((p) => hintedFor(p, cart.id) || !Number.isFinite(since) || p.at >= since - CLOCK_SKEW_MS)
+    .filter((p) => hintedFor(p, cart.id) || since === null || p.at >= since)
     .sort((a, b) => (Number(hintedFor(b, cart.id)) - Number(hintedFor(a, cart.id))) || b.at - a.at)
 }
 
@@ -224,9 +286,18 @@ function optionNote(p, cart) {
   if (elsewhere.length) return `이미 ${elsewhere.join(', ')}에 기록한 결제입니다. 같은 결제로 함께 계산했나요?`
   const hintRefs = (Array.isArray(p.hintRefs) ? p.hintRefs : []).map(String)
   if (p.hintKind === 'repaid') {
+    // 같은 POS 주문에 다시 들어온 결제와, 결제를 취소한 뒤 새 POS 주문으로 들어온 결제(erpCarts.js repay 창)를 가른다.
+    if (hintedFor(p, cart.id)) {
+      return p.orderId && cart.tossOrderId && String(p.orderId) === String(cart.tossOrderId)
+        ? '이 주문을 결제했던 POS 주문에 다시 들어온 결제입니다.'
+        : '이 주문의 POS 결제를 취소한 뒤 들어온 결제입니다. 금액·품목이 맞는지 확인해주세요.'
+    }
+    return `${hintRefs.join(', ')}의 POS 결제를 취소한 뒤 들어온 결제입니다.`
+  }
+  if (p.hintKind === 'match') {
     return hintedFor(p, cart.id)
-      ? '이 주문을 결제했던 POS 주문에 다시 들어온 결제입니다.'
-      : `${hintRefs.join(', ')}에 결제 완료로 알렸던 POS 주문에 다시 들어온 결제입니다.`
+      ? '이 주문의 품목이 들어 있는 결제입니다(이 단말기에 담기 기록 없음).'
+      : `${hintRefs.join(', ')}의 품목이 들어 있는 결제입니다.`
   }
   if (p.hintKind === 'lost') {
     return hintedFor(p, cart.id)
@@ -281,12 +352,13 @@ function actionsFor(cart) {
     const shared = cart.sharedPaymentCount > 1
     const cancelConfirm = shared ? `함께 결제된 ${cart.sharedPaymentCount}건 모두 취소?` : '정말 결제 취소할까요?'
     const hasIds = Boolean(cart.tossPaymentId && cart.tossOrderId)
+    const key = cancelKey(cart)
     const parts = []
-    if (hasIds && !sdkCancelFailed.has(cart.id)) {
+    if (hasIds && !sdkCancelFailed.has(key)) {
       parts.push(button('pos-cancel', cart, '결제 취소', cancelConfirm, 'danger'))
     }
     // 시간 초과는 두 버튼을 함께 둔다: 취소가 됐을 수도 안 됐을 수도 있어서, 안 됐으면 다시 취소하고 됐으면 기록한다.
-    if (!hasIds || sdkCancelFailed.has(cart.id) || sdkCancelTimedOut.has(cart.id)) {
+    if (!hasIds || sdkCancelFailed.has(key) || sdkCancelTimedOut.has(key)) {
       parts.push(button('pos-recorded', cart, 'POS에서 취소했어요', '취소 완료로 기록할까요?'))
     }
     return parts.join('')
@@ -339,18 +411,36 @@ function pickerHtml(cart) {
   const title = repay
     ? 'POS에서 취소된 뒤 이 단말기에서 전산 주문과 맞추지 못한 결제입니다. POS [주문]에서 다시 결제한 내역과 시각·금액·품목을 맞춰 보고 골라주세요.'
     : '이 단말기에서 전산 주문과 맞추지 못한 결제입니다. POS [주문]의 결제 시각·금액·품목과 맞춰 보고 이 주문의 결제를 골라주세요.'
-  const submitLabel = paidPicker.sharedArmed
-    ? '같은 결제로 함께 계산한 게 맞으면 한 번 더 눌러주세요'
-    : repay ? '이 결제로 다시 결제 기록' : '이 결제로 기록'
+  const chosen = options.find((p) => p.paymentId === paidPicker.selected) || null
+  const submitLabel = paidPicker.amountArmed && chosen
+    ? amountConfirmLabel(chosen, cart)
+    : paidPicker.sharedArmed
+      ? '같은 결제로 함께 계산한 게 맞으면 한 번 더 눌러주세요'
+      : repay ? '이 결제로 다시 결제 기록' : '이 결제로 기록'
+  const armed = paidPicker.sharedArmed || paidPicker.amountArmed
   return `
     <div class="paid-picker">
       <div class="paid-picker-title">${title}</div>
       ${rows}
       <div class="erp-cart-actions">
-        <button class="settled-action paid-pick-submit${paidPicker.sharedArmed ? ' confirming wrap' : ''}" type="button" data-cart-id="${id}" ${canSubmit ? '' : 'disabled'}>${submitLabel}</button>
+        <button class="settled-action paid-pick-submit${armed ? ' confirming wrap' : ''}" type="button" data-cart-id="${id}" ${canSubmit ? '' : 'disabled'}>${deps.escapeHtml(submitLabel)}</button>
         ${close}
       </div>
     </div>`
+}
+
+// 프론트 승인 경고. 문구는 주문 상태에 따라 다르다(결제 완료·취소 카드는 "두 번 냈을 수 있으니 한쪽을 환불하세요"). 담김 카드에는
+// [프론트 승인으로 결제 완료 기록]을 둔다(erpCarts.recordFrontOrphan). 매장이 확인한 경고는 한 줄로 접고 버튼을 두지 않는다.
+function orphanHtml(cart) {
+  if (!hasFrontOrphan(cart)) return ''
+  if (!isFrontOrphanOpen(cart)) {
+    return `<div class="erp-cart-memo front-orphan-acked">${deps.escapeHtml(frontOrphanAckedText(cart.frontOrphan))}</div>`
+  }
+  const record = canRecordFrontOrphan(cart)
+    ? button('orphan-record', cart, ORPHAN_RECORD_LABEL, deps.escapeHtml(orphanRecordConfirmText(cart.frontOrphan)), 'orphan-ack wrap')
+    : ''
+  return `<div class="erp-cart-memo front-orphan-warn">${deps.escapeHtml(frontOrphanText(cart.frontOrphan, cart.status))}</div>
+          <div class="erp-cart-actions">${record}${button('orphan-ack', cart, '확인했어요', ORPHAN_ACK_CONFIRM, 'orphan-ack wrap')}</div>`
 }
 
 function render() {
@@ -386,15 +476,12 @@ function render() {
       const tools = toolsFor(cart)
       const receipt = cart.receiptStatus ? RECEIPT_LABEL[cart.receiptStatus] || '' : ''
       // 프론트에서 이미 승인된 결제가 있다(서버가 주문에 기록하지 못함). 다시 결제하면 손님이 두 번 낸다(erpCarts.js frontOrphan 주석).
-      const orphan = hasFrontOrphan(cart)
-        ? `<div class="erp-cart-memo front-orphan-warn">${deps.escapeHtml(frontOrphanText(cart.frontOrphan))}</div>
-          <div class="erp-cart-actions">${button('orphan-ack', cart, '확인했어요', ORPHAN_ACK_CONFIRM, 'orphan-ack wrap')}</div>`
-        : ''
+      const orphan = orphanHtml(cart)
       const repayHint = isRecentPosCancel(cart) && paidPicker?.cartId !== cart.id && repayOptions(cart).length
         ? '<div class="erp-cart-memo settled-warn">POS에서 취소된 뒤 이 단말기에 전산 주문과 맞추지 못한 POS 결제가 있습니다. 다른 카드로 다시 결제했다면 [POS에서 다시 결제했어요]를 눌러주세요.</div>'
         : ''
       return `
-        <article class="erp-cart-item settled-cart-item${cart.status === 'refunded' ? ' is-refunded' : ''}${cart.hidden ? ' is-hidden' : ''}${orphan ? ' has-front-orphan' : ''}">
+        <article class="erp-cart-item settled-cart-item${cart.status === 'refunded' ? ' is-refunded' : ''}${cart.hidden ? ' is-hidden' : ''}${isFrontOrphanOpen(cart) ? ' has-front-orphan' : ''}">
           <div class="erp-cart-ref">${deps.escapeHtml(cart.referenceId || '')} · ${cart.paidAt ? `${formatTime(cart.paidAt)} 결제` : `${formatTime(cart.loadedAt)} POS에 담음`}</div>
           <div class="erp-cart-head">
             <strong class="erp-cart-car">${deps.escapeHtml(cart.carNumber || cart.memo || '-')}</strong>
@@ -406,7 +493,7 @@ function render() {
           <div class="erp-cart-total">${formatWon(cart.totalAmount)}</div>
           ${cart.status === 'refunded' && cart.refundNote ? `<div class="erp-cart-memo">${deps.escapeHtml(cart.refundNote)} · ${formatTime(cart.refundedAt)}</div>` : ''}
           ${cart.errorMessage && cart.status !== 'refunded' ? `<div class="erp-cart-memo settled-error">${deps.escapeHtml(cart.errorMessage)}</div>` : ''}
-          ${sdkCancelTimedOut.has(cart.id) && cart.status === 'paid' ? '<div class="erp-cart-memo settled-warn">POS [주문]에서 이 결제가 취소됐는지 확인해주세요. 취소됐으면 [POS에서 취소했어요]를, 아니면 [결제 취소]를 다시 눌러주세요.</div>' : ''}
+          ${sdkCancelTimedOut.has(cancelKey(cart)) && cart.status === 'paid' ? '<div class="erp-cart-memo settled-warn">POS [주문]에서 이 결제가 취소됐는지 확인해주세요. 취소됐으면 [POS에서 취소했어요]를, 아니면 [결제 취소]를 다시 눌러주세요.</div>' : ''}
           ${cart.status === 'loaded' && paidPicker?.cartId !== cart.id && unmatchedAfterLoad(cart).length ? '<div class="erp-cart-memo settled-warn">담은 뒤 이 단말기에서 전산 주문과 맞추지 못한 POS 결제가 있습니다. 이 주문을 결제했다면 [POS에서 결제했어요]를 눌러주세요.</div>' : ''}
           ${repayHint}
           ${receipt ? `<div class="erp-cart-memo">${deps.escapeHtml(receipt)}</div>` : ''}
@@ -432,7 +519,7 @@ function handleClick(e) {
     const { cartId, paymentId } = option.dataset
     if (paidPicker && paidPicker.cartId === cartId && !busy.has(cartId)) {
       disarmShared()
-      paidPicker = { ...paidPicker, selected: paymentId, sharedArmed: false }
+      paidPicker = { ...paidPicker, selected: paymentId, sharedArmed: false, amountArmed: false }
       render()
     }
     return
@@ -451,16 +538,13 @@ function handleClick(e) {
     const cart = lastCarts.find((c) => c.id === cartId)
     const payment = cart ? selectedPickerPayment(cart) : null
     // 다른 주문에 이미 기록한 결제를 고르면 한 번 더 확인받는다. 한 결제로 여러 주문을 함께 계산한 게 아니면 같은 돈이 두 주문의
-    // 결제로 기록된다.
+    // 결제로 기록된다. 남은 금액이 주문 합계보다 적거나 모르는 결제도 두 금액을 보여 주고 한 번 더 확인받는다.
     if (payment && recordedElsewhere(payment, cartId).length && !paidPicker.sharedArmed) {
-      disarmShared()
-      paidPicker = { ...paidPicker, sharedArmed: true }
-      sharedArmTimer = setTimeout(() => {
-        sharedArmTimer = null
-        if (paidPicker) paidPicker = { ...paidPicker, sharedArmed: false }
-        render()
-      }, SHARED_CONFIRM_MS)
-      render()
+      armPicker({ sharedArmed: true })
+      return
+    }
+    if (payment && amountShort(payment, cart) && !paidPicker.amountArmed) {
+      armPicker({ amountArmed: true })
       return
     }
     run('pos-paid-submit', cartId)
@@ -486,7 +570,7 @@ function handleClick(e) {
     confirming.clear()
   }
   const cart = lastCarts.find((c) => c.id === cartId)
-  if (ORPHAN_GATED.has(action) && hasFrontOrphan(cart)) {
+  if (ORPHAN_GATED.has(action) && isFrontOrphanOpen(cart)) {
     // 프론트에서 이미 승인된 결제가 있는 주문: 평소 확인 앞에 경고 확인을 한 번 더 둔다. 한 번 누르면 경고 문구, 10초 안에 한 번 더
     // 누르면 평소 확인("결제한 내역을 고를까요?")으로 넘어가고, 그다음 한 번 더 눌러야 고르기 칸이 열린다.
     const orphanKey = `orphan-${key}`
@@ -511,13 +595,25 @@ function handleClick(e) {
   confirming.set(key, setTimeout(() => {
     confirming.delete(key)
     render()
-  }, action === 'orphan-ack' ? ORPHAN_CONFIRM_MS : 3000))
+  }, LONG_CONFIRM.has(action) ? ORPHAN_CONFIRM_MS : 3000))
   render()
 }
 
 function disarmShared() {
   if (sharedArmTimer) clearTimeout(sharedArmTimer)
   sharedArmTimer = null
+}
+
+// [이 결제로 기록] 앞의 추가 확인 단계를 건다(sharedArmed·amountArmed). 10초 안에 다시 누르지 않으면 둘 다 풀린다.
+function armPicker(flags) {
+  disarmShared()
+  paidPicker = { ...paidPicker, ...flags }
+  sharedArmTimer = setTimeout(() => {
+    sharedArmTimer = null
+    if (paidPicker) paidPicker = { ...paidPicker, sharedArmed: false, amountArmed: false }
+    render()
+  }, SHARED_CONFIRM_MS)
+  render()
 }
 
 async function post(path, body) {
@@ -578,8 +674,17 @@ async function run(action, cartId) {
     if (action === 'pos-repaid') return openPaidPicker(cart, 'repay')
     if (action === 'pos-paid-submit') return await submitManualPaid(cart)
     if (action === 'orphan-ack') {
-      // 서버에 경고 지우기를 보내고 안내는 erpCarts.clearFrontOrphan이 한다(전산 주문·프론트 결제 목록도 함께 맞춘다).
-      if (await clearFrontOrphan(cartId)) markLocal([cartId], { frontOrphan: null })
+      // 서버에 매장 확인을 보내고 안내는 erpCarts.clearFrontOrphan이 한다(전산 주문·프론트 결제 목록도 함께 맞춘다). 경고는 접어서 남는다.
+      const ackAt = await clearFrontOrphan(cartId)
+      if (ackAt && hasFrontOrphan(cart)) markLocal([cartId], { frontOrphan: { ...cart.frontOrphan, ackAt } })
+      return
+    }
+    if (action === 'orphan-record') {
+      // 서버 기록·이 단말기가 담은 품목 지우기·안내는 erpCarts.recordFrontOrphan이 한다. 다음 폴링이 정확한 상태로 바꿀 때까지 결제 완료로 보여준다.
+      if (await recordFrontOrphan(cart)) {
+        if (paidPicker && paidPicker.cartId === cartId) paidPicker = null
+        markLocal([cartId], { status: 'paid', payTarget: 'front', paidAt: new Date().toISOString(), frontOrphan: null, cashWithoutReceipt: false })
+      }
       return
     }
     if (action === 'unload') return await unloadCart(cartId)
@@ -614,10 +719,12 @@ function openPaidPicker(cart, mode) {
     paidPicker = null
     return deps.notify('error', mode === 'repay' ? NO_REPAY_MESSAGE : NO_UNMATCHED_MESSAGE)
   }
-  // 하나뿐이면 미리 골라 둔다. 다시 결제는 이 주문의 POS 주문에 다시 들어온 결제가 하나면 그것을 고른다.
+  // 이 주문과 이어진 결제가 하나면 그것을, 아니면 후보가 하나뿐일 때 그것을 미리 골라 둔다. 단 남은 금액이 주문 합계와 꼭 같을 때만 --
+  // 금액이 다른 결제를 미리 골라 두면 직원이 확인 없이 누르기 쉽다(다른 손님의 작은 결제로 큰 주문이 결제 완료가 된다).
   const hinted = options.filter((p) => hintedFor(p, cart.id))
-  const preselect = options.length === 1 ? options[0] : mode === 'repay' && hinted.length === 1 ? hinted[0] : null
-  paidPicker = { cartId: cart.id, selected: preselect ? preselect.paymentId : null, mode, sharedArmed: false }
+  const candidate = hinted.length === 1 ? hinted[0] : options.length === 1 ? options[0] : null
+  const preselect = candidate && amountMatches(candidate, cart) ? candidate : null
+  paidPicker = { cartId: cart.id, selected: preselect ? preselect.paymentId : null, mode, sharedArmed: false, amountArmed: false }
 }
 
 // 고른 POS 결제로 이 주문을 결제 완료로 기록한다(/paid, manual). 서버가 이미 다른 결제로 결제된 주문이라고 하면
@@ -629,8 +736,9 @@ async function submitManualPaid(cart) {
   const payment = picker ? selectedPickerPayment(cart) : null
   if (!payment) return deps.notify('error', '기록할 결제를 먼저 골라주세요.')
   const repay = picker.mode === 'repay'
-  // 다른 주문에 이미 기록한 결제는 한 번 더 확인한 뒤에만 보낸다(handleClick의 sharedArmed).
+  // 다른 주문에 이미 기록한 결제·금액이 모자라거나 모르는 결제는 한 번 더 확인한 뒤에만 보낸다(handleClick의 sharedArmed·amountArmed).
   if (recordedElsewhere(payment, cart.id).length && !picker.sharedArmed) return
+  if (amountShort(payment, cart) && !picker.amountArmed) return
   if (!repay) {
     // 고르는 사이 이 단말기가 그 주문의 결제를 자동으로 맞췄다면 그쪽이 맞다(openPaidPicker와 같은 이유).
     const record = peekLoadedRecord(cart.id)
@@ -644,7 +752,15 @@ async function submitManualPaid(cart) {
   if (!res.ok) {
     if (res.status === 401) return
     const code = res.body && res.body.code
-    if (paidPicker) paidPicker = { ...paidPicker, sharedArmed: false }
+    if (paidPicker) paidPicker = { ...paidPicker, sharedArmed: false, amountArmed: false }
+    if (res.status === 409 && code === 'AMOUNT_MISMATCH') {
+      // 서버가 결제 금액과 주문 합계가 맞지 않는다고 거절했다(토스 결제내역의 금액 기준). 고르기 칸은 그대로 두어 다른 결제를 고르게 한다.
+      const payAmount = typeof res.body.paymentAmount === 'number' ? res.body.paymentAmount : payment.amount
+      const cartAmount = typeof res.body.cartAmount === 'number' ? res.body.cartAmount : cartTotalOf(cart)
+      return deps.notify('error',
+        `고른 결제 금액(${typeof payAmount === 'number' ? formatWon(payAmount) : '확인 불가'})이 주문 합계(${formatWon(cartAmount || 0)})와 맞지 않아 ` +
+        '기록하지 않았습니다. POS [주문]에서 이 주문의 결제가 맞는지 확인하고 다른 결제를 골라주세요. 맞는 결제라면 전산(본사)에 확인해주세요.')
+    }
     if (repay && res.status === 409) {
       // 되살릴 수 없는 주문이다(24시간이 지났거나 POS 취소가 아닌 환불, 서버가 아직 되살리기를 모름 등). 서버 문구를 그대로 보여준다.
       paidPicker = null
@@ -660,6 +776,19 @@ async function submitManualPaid(cart) {
       return deps.notify('error', `전산에서 이미 ${label} 주문이라 기록하지 않았습니다. 실제로 결제했다면 POS [주문] 내역과 전산을 대조해주세요.`)
     }
     return deps.notify('error', res.body.error || '결제 완료로 기록하지 못했습니다. 잠시 후 다시 시도해주세요.')
+  }
+  // 서버가 결제 완료가 아닌 상태로 답했다: 고른 결제가 토스에서 이미 취소된 결제라 기록 직후 다시 취소로 바뀐 경우 등. "되살렸습니다"라고
+  // 하면 직원은 끝난 줄 알지만 다음 폴링에 다시 취소됨으로 돌아가고 실제 다시 결제는 기록되지 않는다. 실제 상태를 알리고, 이 결제는 기록한
+  // 것으로 남기지 않는다(취소된 결제면 목록에서도 뺀다).
+  const status = res.body && typeof res.body.status === 'string' ? res.body.status : null
+  if (status && status !== 'paid') {
+    paidPicker = null
+    markLocal([cart.id], { status })
+    if (status === 'refunded') {
+      removeUnmatchedPayment(payment.paymentId)
+      return deps.notify('error', '고른 결제는 토스에서 이미 취소된 결제라 주문이 다시 취소됨으로 남았습니다. POS [주문]에서 실제로 살아 있는 결제를 골라주세요.')
+    }
+    return deps.notify('error', `결제 완료로 기록되지 않았습니다(지금 상태: ${statusLabel({ ...cart, status }).text}). POS [주문] 내역과 전산을 대조해주세요.`)
   }
   // 결제 목록 표시(기록한 주문)·전산에 알린 POS 주문·이 단말기의 대기 기록과 담기 표식을 정리한다.
   noteManualPaid(cart, payment)
@@ -804,22 +933,23 @@ function fullCancelMessage(amount, erpTotal) {
 }
 
 async function cancelOnPos(cart) {
-  sdkCancelTimedOut.delete(cart.id)
+  const key = cancelKey(cart)
+  sdkCancelTimedOut.delete(key)
   const payments = await readOrderPayments(cart.tossOrderId)
   const live = payments ? payments.filter((p) => p && p.state !== 'CANCELLED') : null
   if (!live) {
-    sdkCancelFailed.add(cart.id)
+    sdkCancelFailed.add(key)
     deps.notify('error', 'POS 주문의 결제 내역을 확인하지 못해 여기서 취소하지 않았습니다. POS [주문]에서 이 결제를 직접 취소한 뒤 [POS에서 취소했어요]를 눌러주세요.')
     return
   }
   if (live.length > 1) {
-    sdkCancelFailed.add(cart.id)
+    sdkCancelFailed.add(key)
     deps.notify('error', '카드 여러 장으로 나눠 결제한 건입니다. POS [주문]에서 각각 취소한 뒤 [POS에서 취소했어요]를 눌러주세요.')
     return
   }
   if (live.length === 0 || String(live[0].id) !== String(cart.tossPaymentId)) {
     // 이미 취소됐거나, 남은 결제가 전산이 아는 결제와 다르다. 여기서 엉뚱한 결제를 취소하지 않는다.
-    sdkCancelFailed.add(cart.id)
+    sdkCancelFailed.add(key)
     deps.notify('error', 'POS의 결제 내역이 전산 기록과 다릅니다(이미 취소됐을 수 있습니다). POS [주문]에서 확인하고 취소한 뒤 [POS에서 취소했어요]를 눌러주세요.')
     return
   }
@@ -832,7 +962,7 @@ async function cancelOnPos(cart) {
     ? Number(cart.sharedPaymentTotal)
     : null
   if (paymentAmount === null || erpTotal === null || paymentAmount > erpTotal) {
-    sdkCancelFailed.add(cart.id)
+    sdkCancelFailed.add(key)
     deps.notify('error', fullCancelMessage(paymentAmount, erpTotal))
     return
   }
@@ -846,7 +976,7 @@ async function cancelOnPos(cart) {
     // 취소 안 된 결제를 다시 못 취소하고, 반대로 [POS에서 취소했어요]만 보이면 확인 없이 취소 완료로 기록하기 쉽다.
     // 그래서 두 버튼을 모두 보여주고 POS [주문]에서 먼저 확인하게 한다.
     if (String(e?.message || e).includes('지연되고 있습니다')) {
-      sdkCancelTimedOut.add(cart.id)
+      sdkCancelTimedOut.add(key)
       deps.notify(
         'error',
         `POS [주문]에서 이 결제가 취소됐는지 확인해주세요. 취소됐으면 [POS에서 취소했어요]를 눌러주세요. (${e?.message || e})`
@@ -854,25 +984,58 @@ async function cancelOnPos(cart) {
       return
     }
     // 탭앱에서 바로 취소가 안 되는 결제다. 직원이 POS에서 직접 취소하고 기록하게 한다.
-    sdkCancelFailed.add(cart.id)
+    sdkCancelFailed.add(key)
     deps.notify(
       'error',
       `여기서 바로 취소하지 못했습니다. POS [주문]에서 이 결제를 직접 취소한 뒤 [POS에서 취소했어요]를 눌러주세요. (${e?.message || e})`
     )
     return
   }
-  // 결제는 이미 취소됐다. 기록이 실패해도 토스 취소 웹훅이 오면 서버가 맞춘다.
+  // 결제는 이미 취소됐다. 손님이 다른 카드로 새 POS 주문을 찍어 다시 결제할 수 있으니 다시 결제를 기다리는 창을 먼저 연다 -- 아래 기록이
+  // 실패해도 열려 있어야 한다(erpCarts.js repay 창 주석). 기록이 실패해도 토스 취소 웹훅이 오면 서버가 맞춘다.
+  openRepayWindow(sharedCartsOf(cart, [cart.id]))
   await recordRefund(cart, 'pos', '결제를 취소했습니다.')
 }
 
+// 같은 결제로 함께 기록된 주문들(서버가 돌려준 ID)의 { id, ref }. 목록에 없는 ID는 ID를 참조번호 대신 쓴다.
+function sharedCartsOf(cart, ids) {
+  return ids.map((id) => {
+    const c = id === cart.id ? cart : lastCarts.find((x) => x.id === id)
+    return { id, ref: (c && c.referenceId) || id }
+  })
+}
+
 async function recordRefund(cart, method, successMessage) {
-  const res = await post(`/api/pos/erp-carts/${cart.id}/refunded`, { method })
+  // POS 취소는 어느 결제를 취소했는지 함께 보낸다. 그 사이 [POS에서 다시 결제했어요]로 결제가 바뀌었으면 서버가 PAYMENT_CHANGED로 막는다 --
+  // 막지 않으면 옛 결제의 취소 기록이 새로 받은 결제까지 환불로 바꾼다.
+  const body = method === 'pos' && cart.tossPaymentId ? { method, paymentId: cart.tossPaymentId } : { method }
+  const res = await post(`/api/pos/erp-carts/${cart.id}/refunded`, body)
   if (!res.ok) {
+    if (res.status === 401) return
+    if (res.status === 409 && res.body && res.body.code === 'PAYMENT_CHANGED') {
+      // 카드의 결제가 낡았다. 이 상태로 [POS에서 취소했어요]를 다시 보여주면 같은 거절이 반복되니 상태를 남기지 않고 새 목록을 기다린다.
+      sdkCancelFailed.delete(cancelKey(cart))
+      sdkCancelTimedOut.delete(cancelKey(cart))
+      try {
+        if (typeof deps.noteActivity === 'function') deps.noteActivity()
+      } catch {
+        // 폴링 간격 조정이 실패해도 안내는 이어진다.
+      }
+      deps.notify('error', '결제가 바뀌었습니다(다시 결제 기록됨). 목록을 새로 불러온 뒤 다시 확인해주세요')
+      return
+    }
     deps.notify('error', res.body.error || '취소를 기록하지 못했습니다. 잠시 후 [POS에서 취소했어요]로 다시 기록해주세요.')
-    if (method === 'pos') sdkCancelFailed.add(cart.id)
+    if (method === 'pos') sdkCancelFailed.add(cancelKey(cart))
     return
   }
-  markLocal(res.body.refundedCartIds || [cart.id], { status: 'refunded', refundNote: method === 'cash' ? '현금 환불(기록만)' : 'POS에서 결제 취소', refundedAt: new Date().toISOString() })
-  const extra = (res.body.refundedCartIds || []).length > 1 ? ` 함께 결제된 ${res.body.refundedCartIds.length}건이 모두 취소로 기록됐습니다.` : ''
+  const ids = res.body.refundedCartIds || [cart.id]
+  markLocal(ids, { status: 'refunded', refundNote: method === 'cash' ? '현금 환불(기록만)' : 'POS에서 결제 취소', refundedAt: new Date().toISOString() })
+  if (method === 'pos') {
+    // POS 결제가 취소됐다: 다시 결제를 기다리는 창을 열고(새 POS 주문으로 다시 결제해도 알아보게), 결제 대조 쪽 요약도 바로 고친다 -- 탭앱이
+    // 가려지면 폴링이 멈춰 취소 전 요약이 남는다(erpCarts.noteRecentCarts).
+    openRepayWindow(sharedCartsOf(cart, ids))
+    noteRecentCarts(lastCarts)
+  }
+  const extra = ids.length > 1 ? ` 함께 결제된 ${ids.length}건이 모두 취소로 기록됐습니다.` : ''
   deps.notify('success', `${successMessage}${extra}`)
 }

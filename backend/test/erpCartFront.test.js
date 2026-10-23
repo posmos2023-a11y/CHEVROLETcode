@@ -63,7 +63,7 @@ function newPaymentKey() {
 
 async function resetDatabase() {
   await prisma.$executeRawUnsafe(
-    'TRUNCATE TABLE "ErpCart", "ErpOrder", "RateLimitHit", "WebhookEvent", "Payment", "Reservation", "QueueCounter", "AdminUser", "Store" RESTART IDENTITY CASCADE'
+    'TRUNCATE TABLE "ErpCart", "ErpOrder", "TossPayment", "RateLimitHit", "WebhookEvent", "Payment", "Reservation", "QueueCounter", "AdminUser", "Store" RESTART IDENTITY CASCADE'
   )
 }
 
@@ -912,6 +912,22 @@ testSerial('비상구(결제 중): 접수 24시간이 지난 주문은 pending �
   assert.equal((await rowOf(cartId)).status, 'paid')
 })
 
+testSerial('미반영 승인 흔적이 확인 전이면 /start는 409 FRONT_ORPHAN으로 막고, 매장이 확인하면 다시 결제할 수 있다', async () => {
+  const { store, cartId } = await frontCart('start-orphan-block')
+  await prisma.erpCart.update({
+    where: { id: cartId },
+    data: { frontOrphanAt: new Date(), frontOrphanApprovalNo: '30019999', frontOrphanAmount: 65000 },
+  })
+  const blocked = await startFront(store, cartId, newPaymentKey())
+  assert.equal(blocked.status, 409, JSON.stringify(blocked.body))
+  assert.equal(blocked.body.code, 'FRONT_ORPHAN')
+  assert.equal(blocked.body.frontOrphan.approvalNo, '30019999')
+  assert.equal((await rowOf(cartId)).status, 'pending')
+
+  await prisma.erpCart.update({ where: { id: cartId }, data: { frontOrphanAckAt: new Date() } })
+  assert.equal((await startFront(store, cartId, newPaymentKey())).status, 200)
+})
+
 // --- 풀린 결제 시도의 늦은 승인 보고(PAID_AFTER_RELEASE) ------------------------------------------
 
 const PAID_AFTER_RELEASE_LOG = '[front] 결제가 승인됐지만 주문에 반영하지 못함. 대사 필요'
@@ -1004,7 +1020,8 @@ testSerial('미반영 승인 흔적: POS로 되돌린 주문에 늦은 승인이
   assert.equal(adminList.status, 200)
   assert.equal(adminList.body.carts.find((c) => c.id === cartId).frontOrphan.amount, 64000)
 
-  // 지우기: 다른 매장 토큰은 404, 이 매장은 지우고 경고 로그를 남긴다. 다시 눌러도 성공.
+  // [확인했어요]: 다른 매장 토큰은 404, 이 매장은 지우지 않고 확인 시각만 남기며 경고 로그를 남긴다. 다시 눌러도 성공.
+  assert.equal(card.frontOrphan.ackAt, null)
   const other = await createStore('orphan-pos-other')
   assert.equal((await posPost(other, `/api/pos/erp-carts/${cartId}/clear-front-orphan`)).status, 404)
   const logger = require('../src/logger')
@@ -1019,13 +1036,24 @@ testSerial('미반영 승인 흔적: POS로 되돌린 주문에 늦은 승인이
   }
   assert.equal(cleared.status, 200, JSON.stringify(cleared.body))
   assert.equal(cleared.body.ok, true)
-  assert.ok(warns.some((w) => w.message.includes('프론트 미반영 승인 경고를 지움') && w.meta.cartId === cartId && w.meta.approvalNo === '30012345'))
+  assert.equal(cleared.body.alreadyProcessed, false)
+  assert.ok(cleared.body.frontOrphan.ackAt)
+  assert.ok(warns.some((w) => w.message.includes('프론트 미반영 승인 경고를 확인함') && w.meta.cartId === cartId && w.meta.approvalNo === '30012345'))
+  // R3: 흔적은 지우지 않는다 -- 관리자 웹의 대사 근거가 남아야 한다.
   const after = await rowOf(cartId)
-  assert.equal(after.frontOrphanAt, null)
-  assert.equal(after.frontOrphanApprovalNo, null)
-  assert.equal(after.frontOrphanAmount, null)
-  assert.equal((await posQueue(store)).body.erpCarts.find((c) => c.id === cartId).frontOrphan, null)
-  assert.equal((await posPost(store, `/api/pos/erp-carts/${cartId}/clear-front-orphan`)).status, 200)
+  assert.ok(after.frontOrphanAt)
+  assert.equal(after.frontOrphanApprovalNo, '30012345')
+  assert.equal(after.frontOrphanAmount, 64000)
+  assert.ok(after.frontOrphanAckAt)
+  const ackedCard = (await posQueue(store)).body.erpCarts.find((c) => c.id === cartId).frontOrphan
+  assert.equal(ackedCard.approvalNo, '30012345')
+  assert.ok(ackedCard.ackAt)
+  const adminAfter = await request(app).get('/api/admin/erp-carts').set('Authorization', `Bearer ${signAdminToken(admin)}`)
+  assert.ok(adminAfter.body.carts.find((c) => c.id === cartId).frontOrphan.ackAt, '관리자 웹에 매장 확인함으로 계속 보여야 한다')
+  const again = await posPost(store, `/api/pos/erp-carts/${cartId}/clear-front-orphan`)
+  assert.equal(again.status, 200)
+  assert.equal(again.body.alreadyProcessed, true)
+  assert.equal(new Date(again.body.frontOrphan.ackAt).getTime(), after.frontOrphanAckAt.getTime()) // 확인 시각은 처음 것 그대로
 })
 
 testSerial('미반영 승인 흔적: 금액이 없으면 주문 금액으로 남고 프론트 대기·최근 결제에 실린다, 다른 승인으로 결제되면 남기고 같은 승인이 반영되면 지운다', async () => {
@@ -1040,6 +1068,8 @@ testSerial('미반영 승인 흔적: 금액이 없으면 주문 금액으로 남
   assert.deepEqual({ approvalNo: frontCard.frontOrphan.approvalNo, amount: frontCard.frontOrphan.amount }, { approvalNo: '99990000', amount: 65000 })
 
   // 다른 승인으로 이 주문이 결제됐다 -- 같은 주문을 두 번 받은 것이라 흔적을 남긴다(최근 결제 카드에 실린다).
+  // 확인 전 흔적이 있으면 /start가 막히므로(FRONT_ORPHAN), 매장이 확인한 뒤 다시 결제한 경우로 둔다.
+  await prisma.erpCart.update({ where: { id: cartId }, data: { frontOrphanAckAt: new Date() } })
   const key = newPaymentKey()
   assert.equal((await startFront(store, cartId, key)).status, 200)
   assert.equal((await reportFront(store, cartId, { result: 'paid', paymentKey: key, payment: SAMPLE_CARD_PAYMENT })).status, 200)
@@ -1310,4 +1340,281 @@ testSerial('전산 재전송: 취소됐던 주문을 같은 referenceId로 다�
   const asPos = await postCart({ ...body, payTarget: 'pos' })
   assert.equal(asPos.status, 201)
   assert.equal((await rowOf(created.body.cartId)).frontSentAt, null)
+})
+
+// --- R3: 경고된 프론트 승인을 이 주문의 결제로 기록(record-front-orphan) ---------------------------------------
+
+const recordOrphan = (store, cartId) => posPost(store, `/api/pos/erp-carts/${cartId}/record-front-orphan`)
+const ackOrphan = (store, cartId) => posPost(store, `/api/pos/erp-carts/${cartId}/clear-front-orphan`)
+const SANITIZED_SAMPLE_PAYMENT = {
+  paymentMethod: 'CARD', approvalNumber: '30012345', timestamp: 1761000000000, installment: 0, vanTransactionKey: 'VAN-0001',
+  van: null, tid: 'CAT-01', isCashReceipt: null, isSelfIssuance: null, easyPayProvider: null,
+}
+
+testSerial('미반영 승인 기록: POS로 되돌린 주문에 남은 승인을 결제 완료로 기록하면 프론트 결제가 되고, 토스 기록 잇기·예약 완료·영수증까지 처리한다', async () => {
+  global.__notifications.length = 0
+  const { store, cartId, key, reservation } = await forceReleasedFrontCart('record-orphan', linkedFrontCart)
+  assert.equal((await returnToPos(store, cartId)).status, 200)
+  assert.equal((await reportFront(store, cartId, { result: 'paid', paymentKey: key, payment: SAMPLE_CARD_PAYMENT })).body.code, 'PAID_AFTER_RELEASE')
+  let row = await rowOf(cartId)
+  // 거절한 승인의 결제 정보(카드번호 등 필요 없는 값은 빼고)와 paymentKey를 흔적과 함께 남긴다.
+  assert.deepEqual(JSON.parse(row.frontOrphanPaymentJson), SANITIZED_SAMPLE_PAYMENT)
+  assert.equal(row.frontOrphanPaymentKey, key)
+
+  // 웹훅이 먼저 와서 토스 결제 기록과 결제 백업 기록(phone 없음)이 있다.
+  const tp = await prisma.tossPayment.create({
+    data: { id: unique('640'), merchantId: store.merchantId, storeId: store.id, orderId: unique('620'), state: 'APPROVED', sourceType: 'CARD', amount: 65000, approvedNo: '30012345' },
+  })
+  await prisma.payment.create({ data: { storeId: store.id, paymentKey: tp.orderId, amount: 65000, promoAt: new Date(), status: 'requested' } })
+
+  const original = logger.warn
+  const warns = []
+  logger.warn = (message, meta) => { warns.push({ message, meta }) }
+  let res
+  try {
+    res = await recordOrphan(store, cartId)
+  } finally {
+    logger.warn = original
+  }
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.deepEqual({ ok: res.body.ok, status: res.body.status, wasStatus: res.body.wasStatus }, { ok: true, status: 'paid', wasStatus: 'pending' })
+  assert.equal(res.body.reservationCompleted, true)
+  assert.equal(res.body.receipt, 'sent')
+  const log = warns.find((w) => w.message.includes('프론트 미반영 승인을 이 주문의 결제로 기록'))
+  assert.ok(log, '기록 경고 로그가 남지 않았다')
+  assert.deepEqual({ cartId: log.meta.cartId, wasStatus: log.meta.wasStatus, approvalNo: log.meta.approvalNo, amount: log.meta.amount }, { cartId, wasStatus: 'pending', approvalNo: '30012345', amount: 65000 })
+
+  row = await rowOf(cartId)
+  assert.equal(row.status, 'paid')
+  assert.equal(row.payTarget, 'front')
+  assert.ok(row.paidAt)
+  assert.equal(row.frontApprovalNo, '30012345')
+  assert.equal(row.frontPaymentKey, key)
+  assert.deepEqual(JSON.parse(row.frontPaymentJson), SANITIZED_SAMPLE_PAYMENT)
+  for (const field of ['frontOrphanAt', 'frontOrphanApprovalNo', 'frontOrphanAmount', 'frontOrphanAckAt', 'frontOrphanPaymentJson', 'frontOrphanPaymentKey']) {
+    assert.equal(row[field], null, `${field}가 지워지지 않았다`)
+  }
+  // 토스 결제와 잇고, 웹훅 백업 기록은 집계에서 뺀다.
+  assert.equal(row.tossPaymentId, tp.id)
+  assert.ok(row.tossVerifiedAt)
+  assert.equal((await prisma.payment.findFirst({ where: { paymentKey: tp.orderId } })).status, 'erp_linked')
+  assert.equal((await prisma.reservation.findUnique({ where: { id: reservation.id } })).status, 'completed')
+  assert.equal(global.__notifications.filter((n) => n.method === 'sendReceiptAlimtalk').length, 1)
+
+  // 탭앱: 전산 주문(대기)에서 빠지고 최근 결제에 프론트 결제로 뜬다. 전산 조회도 결제 완료.
+  const queue = (await posQueue(store)).body
+  assert.equal(queue.erpCarts.some((c) => c.id === cartId), false)
+  const settled = queue.settledCarts.find((c) => c.id === cartId)
+  assert.deepEqual({ status: settled.status, payTarget: settled.payTarget, frontOrphan: settled.frontOrphan }, { status: 'paid', payTarget: 'front', frontOrphan: null })
+  const erpStatus = await getCart(row.referenceId)
+  assert.equal(erpStatus.body.status, 'paid')
+  assert.equal(erpStatus.body.frontOrphan, null)
+
+  // 같은 승인의 보고가 다시 와도(프론트 재시작 복구) 처리됨이고, 흔적을 다시 남기지 않는다.
+  const again = await reportFront(store, cartId, { result: 'paid', paymentKey: key, payment: SAMPLE_CARD_PAYMENT })
+  assert.equal(again.status, 200, JSON.stringify(again.body))
+  assert.equal(again.body.alreadyProcessed, true)
+  assert.equal((await rowOf(cartId)).frontOrphanAt, null)
+  // 다시 누르면 기록할 흔적이 없다.
+  const twice = await recordOrphan(store, cartId)
+  assert.equal(twice.status, 409)
+  assert.equal(twice.body.code, 'NO_FRONT_ORPHAN')
+  assert.equal(twice.body.status, 'paid')
+
+  // 프론트에서 취소할 수 있다: 취소 정보에 원결제 paymentKey·승인번호가 실린다.
+  assert.equal((await posPost(store, `/api/pos/erp-carts/${cartId}/refund-request`)).status, 200)
+  const refund = (await getFrontCarts(store)).body.refunds.find((r) => r.id === cartId).refund
+  assert.deepEqual({ paymentKey: refund.paymentKey, approvalNumber: refund.approvalNumber, totalAmount: refund.totalAmount }, { paymentKey: key, approvalNumber: '30012345', totalAmount: 65000 })
+})
+
+testSerial('미반영 승인 경고 목록: 지운 주문·전산 취소된 주문의 확인 전 흔적은 frontOrphans로 따로 내려가고, 결제로 기록하거나 확인하면 빠진다', async () => {
+  // 직원이 [결제 중 풀기] 뒤 [지우기]를 누른 주문에 늦은 승인이 왔다 -- 이 주문은 POS 어느 목록에도 실리지 않는다.
+  const dismissed = await forceReleasedFrontCart('orphan-list-dismissed')
+  assert.equal((await posPost(dismissed.store, `/api/pos/erp-carts/${dismissed.cartId}/dismiss-front`)).status, 200)
+  assert.equal((await reportFront(dismissed.store, dismissed.cartId, { result: 'paid', paymentKey: dismissed.key, payment: SAMPLE_CARD_PAYMENT })).body.code, 'PAID_AFTER_RELEASE')
+  let queue = (await posQueue(dismissed.store)).body
+  assert.equal(queue.frontOrphans.length, 1)
+  const alert = queue.frontOrphans[0]
+  assert.deepEqual(
+    { id: alert.id, referenceId: alert.referenceId, totalAmount: alert.totalAmount, status: alert.status, payTarget: alert.payTarget },
+    { id: dismissed.cartId, referenceId: dismissed.body.referenceId, totalAmount: 65000, status: 'dismissed', payTarget: 'front' }
+  )
+  assert.equal('carNumber' in alert, true)
+  assert.deepEqual({ approvalNo: alert.frontOrphan.approvalNo, amount: alert.frontOrphan.amount, ackAt: alert.frontOrphan.ackAt }, { approvalNo: '30012345', amount: 65000, ackAt: null })
+  for (const list of ['erpCarts', 'frontCarts', 'settledCarts']) assert.equal(queue[list].some((c) => c.id === dismissed.cartId), false, list)
+
+  // 그 승인으로 결제 완료를 기록하면 경고 목록에서 빠지고 최근 결제에 뜬다.
+  const recorded = await recordOrphan(dismissed.store, dismissed.cartId)
+  assert.equal(recorded.status, 200, JSON.stringify(recorded.body))
+  assert.equal(recorded.body.wasStatus, 'dismissed')
+  queue = (await posQueue(dismissed.store)).body
+  assert.deepEqual(queue.frontOrphans, [])
+  assert.equal(queue.settledCarts.find((c) => c.id === dismissed.cartId).status, 'paid')
+
+  // 전산이 먼저 취소한 프론트 대기 주문에 늦게 보고된 승인
+  const cancelled = await frontCart('orphan-list-cancelled')
+  assert.equal((await request(app).post(`/api/erp/carts/${cancelled.body.referenceId}/cancel`).set('X-ERP-Token', ERP_TOKEN)).status, 200)
+  assert.equal((await reportFront(cancelled.store, cancelled.cartId, { result: 'paid', paymentKey: newPaymentKey(), payment: SAMPLE_CARD_PAYMENT })).body.code, 'PAID_AFTER_RELEASE')
+  assert.equal((await posQueue(cancelled.store)).body.frontOrphans[0].status, 'cancelled')
+  // 7일이 지난 흔적은 탭앱 목록에서 빼고 관리자 웹 대사로 넘긴다.
+  await prisma.erpCart.update({ where: { id: cancelled.cartId }, data: { frontOrphanAt: new Date(Date.now() - 8 * 24 * 60 * 60 * 1000) } })
+  assert.deepEqual((await posQueue(cancelled.store)).body.frontOrphans, [])
+  await prisma.erpCart.update({ where: { id: cancelled.cartId }, data: { frontOrphanAt: new Date() } })
+  // 확인하면 목록에서 빠지지만 흔적은 남는다.
+  assert.equal((await ackOrphan(cancelled.store, cancelled.cartId)).status, 200)
+  assert.deepEqual((await posQueue(cancelled.store)).body.frontOrphans, [])
+  const row = await rowOf(cancelled.cartId)
+  assert.ok(row.frontOrphanAt && row.frontOrphanAckAt)
+  // 늦은 승인이 또 오면 새 흔적은 확인 전으로 돌아가 다시 목록에 뜬다.
+  assert.equal((await reportFront(cancelled.store, cancelled.cartId, { result: 'paid', paymentKey: newPaymentKey(), payment: { ...SAMPLE_CARD_PAYMENT, approvalNumber: '30019999' } })).body.code, 'PAID_AFTER_RELEASE')
+  const again = (await posQueue(cancelled.store)).body.frontOrphans
+  assert.equal(again.length, 1)
+  assert.deepEqual({ approvalNo: again[0].frontOrphan.approvalNo, ackAt: again[0].frontOrphan.ackAt }, { approvalNo: '30019999', ackAt: null })
+})
+
+testSerial('미반영 승인 기록: 금액이 다르면 409 AMOUNT_MISMATCH, 결제 중·결제 완료 주문은 409 NOT_RECORDABLE, 흔적이 없거나 다른 매장이면 거절한다', async () => {
+  const { store, cartId, key } = await forceReleasedFrontCart('record-orphan-guard')
+  assert.equal((await returnToPos(store, cartId)).status, 200)
+  await reportFront(store, cartId, { result: 'paid', paymentKey: key, payment: { ...SAMPLE_CARD_PAYMENT, amount: 64000 } })
+  const mismatch = await recordOrphan(store, cartId)
+  assert.equal(mismatch.status, 409, JSON.stringify(mismatch.body))
+  assert.equal(mismatch.body.code, 'AMOUNT_MISMATCH')
+  assert.deepEqual({ orphanAmount: mismatch.body.orphanAmount, cartAmount: mismatch.body.cartAmount, status: mismatch.body.status }, { orphanAmount: 64000, cartAmount: 65000, status: 'pending' })
+  let row = await rowOf(cartId)
+  assert.equal(row.status, 'pending')
+  assert.ok(row.frontOrphanAt)
+  const other = await createStore('record-orphan-guard-other')
+  assert.equal((await recordOrphan(other, cartId)).status, 404)
+
+  // 묘비에 없는 키의 승인이 남은 프론트 대기 주문을 다른 키로 결제 중·결제 완료하면 기록할 수 없다(같은 주문을 두 번 받은 것).
+  const twice = await frontCart('record-orphan-paid')
+  await reportFront(twice.store, twice.cartId, { result: 'paid', paymentKey: newPaymentKey(), payment: { ...SAMPLE_CARD_PAYMENT, approvalNumber: '99990000' } })
+  // 확인 전 흔적이 있으면 /start가 막히므로 매장이 확인한 뒤 다시 결제한 경우로 둔다(확인해도 기록 대상인 흔적은 남는다).
+  await prisma.erpCart.update({ where: { id: twice.cartId }, data: { frontOrphanAckAt: new Date() } })
+  const k2 = newPaymentKey()
+  assert.equal((await startFront(twice.store, twice.cartId, k2)).status, 200)
+  const paying = await recordOrphan(twice.store, twice.cartId)
+  assert.equal(paying.status, 409)
+  assert.deepEqual({ code: paying.body.code, status: paying.body.status }, { code: 'NOT_RECORDABLE', status: 'paying' })
+  assert.equal((await reportFront(twice.store, twice.cartId, { result: 'paid', paymentKey: k2, payment: SAMPLE_CARD_PAYMENT })).status, 200)
+  const paid = await recordOrphan(twice.store, twice.cartId)
+  assert.deepEqual({ status: paid.status, code: paid.body.code, cartStatus: paid.body.status }, { status: 409, code: 'NOT_RECORDABLE', cartStatus: 'paid' })
+  row = await rowOf(twice.cartId)
+  assert.equal(row.frontPaymentKey, k2)
+  assert.ok(row.frontOrphanAt) // 이중 결제 흔적은 그대로 남는다
+
+  // 흔적이 없는 주문
+  const none = await frontCart('record-orphan-none')
+  const noOrphan = await recordOrphan(none.store, none.cartId)
+  assert.deepEqual({ status: noOrphan.status, code: noOrphan.body.code }, { status: 409, code: 'NO_FRONT_ORPHAN' })
+})
+
+testSerial('미반영 승인 기록: 읽은 뒤 프론트가 결제를 시작하면 기록하지 않는다(상태·흔적 확인과 전이가 한 번에)', async () => {
+  const { store, cartId } = await frontCart('record-orphan-race')
+  await reportFront(store, cartId, { result: 'paid', paymentKey: newPaymentKey(), payment: SAMPLE_CARD_PAYMENT })
+  // 확인 전 흔적이 있으면 /start가 막히므로, 다른 단말기에서 매장이 확인하고 프론트가 곧바로 결제를 시작한 경우로 끼워 넣는다.
+  const res = await withRaceAfterNext('findUnique', async () => {
+    await prisma.erpCart.update({ where: { id: cartId }, data: { frontOrphanAckAt: new Date() } })
+    assert.equal((await startFront(store, cartId, newPaymentKey())).status, 200)
+  }, () => recordOrphan(store, cartId))
+  assert.equal(res.status, 409, JSON.stringify(res.body))
+  assert.deepEqual({ code: res.body.code, status: res.body.status }, { code: 'CHANGED', status: 'paying' })
+  const row = await rowOf(cartId)
+  assert.equal(row.status, 'paying')
+  assert.ok(row.frontOrphanAt)
+})
+
+testSerial('전산 취소·조회: 확인 전 미반영 승인이 있는 대기 주문은 취소를 409 FRONT_ORPHAN으로 막고, 조회·취소 응답에 frontOrphan을 싣는다', async () => {
+  const { store, cartId, key, body } = await forceReleasedFrontCart('erp-cancel-orphan')
+  const cancelCart = () => request(app).post(`/api/erp/carts/${body.referenceId}/cancel`).set('X-ERP-Token', ERP_TOKEN)
+  assert.equal((await getCart(body.referenceId)).body.frontOrphan, null)
+  assert.equal((await returnToPos(store, cartId)).status, 200)
+  await reportFront(store, cartId, { result: 'paid', paymentKey: key, payment: SAMPLE_CARD_PAYMENT })
+
+  const status = await getCart(body.referenceId)
+  assert.equal(status.body.status, 'pending')
+  assert.deepEqual({ approvalNo: status.body.frontOrphan.approvalNo, amount: status.body.frontOrphan.amount, ackAt: status.body.frontOrphan.ackAt }, { approvalNo: '30012345', amount: 65000, ackAt: null })
+  assert.ok(status.body.frontOrphan.at)
+
+  const blocked = await cancelCart()
+  assert.equal(blocked.status, 409, JSON.stringify(blocked.body))
+  assert.equal(blocked.body.code, 'FRONT_ORPHAN')
+  assert.equal(blocked.body.status, 'pending')
+  assert.equal(blocked.body.frontOrphan.approvalNo, '30012345')
+  assert.equal((await rowOf(cartId)).status, 'pending')
+
+  // 매장이 확인하면 전산이 취소할 수 있다(응답에 확인된 흔적이 실린다). 끝난 주문의 취소는 예전처럼 409지만 frontOrphan을 싣는다.
+  assert.equal((await ackOrphan(store, cartId)).status, 200)
+  const cancelled = await cancelCart()
+  assert.equal(cancelled.status, 200, JSON.stringify(cancelled.body))
+  assert.equal(cancelled.body.status, 'cancelled')
+  assert.ok(cancelled.body.frontOrphan.ackAt)
+  const late = await cancelCart()
+  assert.equal(late.status, 409)
+  assert.equal(late.body.status, 'cancelled')
+  assert.equal(late.body.frontOrphan.approvalNo, '30012345')
+})
+
+testSerial('전산 취소: 읽은 뒤 늦은 승인이 흔적을 남기면 취소하지 않고 409 FRONT_ORPHAN(확인과 전이가 한 번에)', async () => {
+  const { store, cartId, body } = await frontCart('erp-cancel-orphan-race')
+  const res = await withRaceAfterNext('findUnique', async () => {
+    assert.equal((await reportFront(store, cartId, { result: 'paid', paymentKey: newPaymentKey(), payment: SAMPLE_CARD_PAYMENT })).body.code, 'PAID_AFTER_RELEASE')
+  }, () => request(app).post(`/api/erp/carts/${body.referenceId}/cancel`).set('X-ERP-Token', ERP_TOKEN))
+  assert.equal(res.status, 409, JSON.stringify(res.body))
+  assert.equal(res.body.code, 'FRONT_ORPHAN')
+  assert.equal((await rowOf(cartId)).status, 'pending')
+})
+
+testSerial('만료: 확인 전 미반영 승인이 있는 대기 주문은 하루가 지나도 만료하지 않고 POS 목록에 계속 보인다(프론트 단말에는 안 띄운다), 확인하면 만료된다', async () => {
+  const { expireStaleErpCarts } = require('../src/store')
+  // POS로 되돌린 주문
+  const posSide = await forceReleasedFrontCart('expire-orphan-pos')
+  assert.equal((await returnToPos(posSide.store, posSide.cartId)).status, 200)
+  await reportFront(posSide.store, posSide.cartId, { result: 'paid', paymentKey: posSide.key, payment: SAMPLE_CARD_PAYMENT })
+  // 프론트 대기 주문(묘비에 없는 키의 승인) -- 프론트 단말 목록에도 frontOrphan이 실린다.
+  const frontSide = await frontCart('expire-orphan-front')
+  await reportFront(frontSide.store, frontSide.cartId, { result: 'paid', paymentKey: newPaymentKey(), payment: SAMPLE_CARD_PAYMENT })
+  assert.equal((await getFrontCarts(frontSide.store)).body.carts.find((c) => c.id === frontSide.cartId).frontOrphan.approvalNo, '30012345')
+  // 경고가 없는 주문
+  const plain = await postCart(validBody(posSide.store))
+  const dayAgo = new Date(Date.now() - 25 * 60 * 60 * 1000)
+  await prisma.erpCart.updateMany({ where: { id: { in: [posSide.cartId, frontSide.cartId, plain.body.cartId] } }, data: { createdAt: dayAgo } })
+
+  assert.equal(await expireStaleErpCarts(), 1)
+  assert.equal((await rowOf(plain.body.cartId)).status, 'expired')
+  assert.equal((await rowOf(posSide.cartId)).status, 'pending')
+  assert.equal((await rowOf(frontSide.cartId)).status, 'pending')
+  // POS 탭앱(전산 주문·프론트 대기)에는 하루가 지나도 보인다. 손님이 보는 프론트 단말에는 띄우지 않는다.
+  assert.ok((await posQueue(posSide.store)).body.erpCarts.find((c) => c.id === posSide.cartId).frontOrphan)
+  assert.ok((await request(app).get('/api/pos/erp-carts').set('X-Store-Token', posSide.store.posToken)).body.carts.some((c) => c.id === posSide.cartId))
+  assert.ok((await posQueue(frontSide.store)).body.frontCarts.find((c) => c.id === frontSide.cartId).frontOrphan)
+  assert.equal((await getFrontCarts(frontSide.store)).body.carts.some((c) => c.id === frontSide.cartId), false)
+
+  // 확인하면 목록에서 빠지고 다음 만료 잡이 닫는다. 확인한 흔적은 경고 목록에도 올리지 않는다.
+  assert.equal((await ackOrphan(posSide.store, posSide.cartId)).status, 200)
+  assert.equal((await posQueue(posSide.store)).body.erpCarts.some((c) => c.id === posSide.cartId), false)
+  assert.equal(await expireStaleErpCarts(), 1)
+  assert.equal((await rowOf(posSide.cartId)).status, 'expired')
+  assert.deepEqual((await posQueue(posSide.store)).body.frontOrphans, [])
+})
+
+testSerial('전산 재전송: 취소된 주문을 같은 referenceId로 다시 보내면 접수 시각이 새로 찍혀 POS에 바로 뜨고 만료되지 않는다', async () => {
+  const { expireStaleErpCarts } = require('../src/store')
+  const store = await createStore('resend-created-at')
+  const body = validBody(store)
+  const created = await postCart(body)
+  assert.equal(created.status, 201)
+  assert.equal((await request(app).post(`/api/erp/carts/${body.referenceId}/cancel`).set('X-ERP-Token', ERP_TOKEN)).status, 200)
+  // 이틀 전에 접수했다가 취소한 주문
+  await prisma.erpCart.update({ where: { id: created.body.cartId }, data: { createdAt: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000) } })
+
+  const before = Date.now()
+  const again = await postCart(body)
+  assert.equal(again.status, 201, JSON.stringify(again.body))
+  assert.equal(again.body.cartId, created.body.cartId) // 같은 행을 다시 쓴다
+  const row = await rowOf(created.body.cartId)
+  assert.ok(row.createdAt.getTime() >= before - 1000, `createdAt=${row.createdAt.toISOString()}`)
+  assert.ok((await posQueue(store)).body.erpCarts.some((c) => c.id === created.body.cartId))
+  assert.equal(await expireStaleErpCarts(), 0)
+  assert.equal((await getCart(body.referenceId)).body.status, 'pending')
 })

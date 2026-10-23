@@ -5,7 +5,7 @@ installCrashGuard()
 import { posPluginSdk } from '@tossplace/pos-plugin-sdk'
 // 전산(ERP)이 담아둔 장바구니를 POS로 옮기는 화면. 대기열 폴링/토큰 화면과 관심사가 달라
 // 별도 파일로 뒀다 — app.js에서는 초기화와 "같은 폴링 타이머에서 같이 불러오기"만 담당한다.
-import { initErpCarts, refreshErpCarts, applyErpCarts, applyFrontCarts, getErpGeneration, forgetLoadedCart } from './erpCarts.js'
+import { initErpCarts, refreshErpCarts, applyErpCarts, applyFrontCarts, applyFrontOrphans, getErpGeneration, forgetLoadedCart } from './erpCarts.js'
 // 오늘 결제된 전산 주문과 결제 취소. 같은 대기열 폴링 응답(settledCarts)으로 갱신한다.
 import { initSettledCarts, applySettledCarts } from './settledCarts.js'
 // [홍보 문자] 화면: 기간을 정해 방문 손님에게 홍보 문자를 한 번에 보낸다.
@@ -458,10 +458,16 @@ async function loadQueue({ manual = false, bypassGuard = false } = {}) {
       // 프론트 결제 대기 목록을 먼저 반영한다 -- 방금 프론트로 넘긴 카드를 기억하는 목록(sentToFront)이
       // 여기서 정리되므로, 그 뒤에 그려야 POS 목록이 최신 기준으로 걸러진다.
       if (freshErp) applyFrontCarts(body.frontCarts)
+      // 닫힌 주문(지움·만료·전산 취소)에 남은 프론트 승인 경고. 이 필드를 안 주는 옛 서버면 건드리지 않는다.
+      if (freshErp && Array.isArray(body.frontOrphans)) applyFrontOrphans(body.frontOrphans)
       applySettledCarts(body.settledCarts)
       if (freshErp) {
         applyErpCarts(body.erpCarts)
-        updateBadges({ erpCarts: body.erpCarts.length })
+        // 닫힌 주문의 프론트 승인 경고도 [전산 주문] 화면에 있다 -- 다른 화면을 보고 있어도 배지로 눈에 걸리게 함께 센다.
+        const openOrphans = Array.isArray(body.frontOrphans)
+          ? body.frontOrphans.filter((x) => x && x.frontOrphan && !x.frontOrphan.ackAt).length
+          : 0
+        updateBadges({ erpCarts: body.erpCarts.length + openOrphans })
         notifyNewErpCarts(body.erpCarts)
       }
     } else {
@@ -507,14 +513,15 @@ let lastSnapshot = ''
 function snapshotOf(body) {
   try {
     const q = (body.reservations || []).map((r) => `${r.id}:${r.status}`).join(',')
-    // 프론트 승인 경고(frontOrphan)가 생기거나 지워지는 것도 직원이 바로 봐야 하는 변화다.
-    const o = (x) => (x.frontOrphan ? 1 : 0)
+    // 프론트 승인 경고(frontOrphan)가 생기거나 매장 확인(ackAt)으로 접히는 것도 직원이 바로 봐야 하는 변화다.
+    const o = (x) => (x.frontOrphan ? (x.frontOrphan.ackAt ? 2 : 1) : 0)
     const c = (body.erpCarts || []).map((x) => `${x.id}:${o(x)}`).join(',')
     // 프론트 결제(손님이 결제 중인지)와 최근 결제(결제됨·취소됨·영수증·숨김)도 직원이 지켜보는 값이다.
     // 이게 빠져 있으면 대기열과 전산 주문이 그대로인 동안 이 값들이 바뀌어도 폴링이 15초까지 느려졌다.
     const f = (body.frontCarts || []).map((x) => `${x.id}:${x.status}:${o(x)}`).join(',')
     const s = (body.settledCarts || []).map((x) => `${x.id}:${x.status}:${x.receiptStatus || ''}:${x.hidden ? 1 : 0}:${o(x)}`).join(',')
-    return `${q}|${c}|${f}|${s}`
+    const g = (body.frontOrphans || []).map((x) => `${x.id}:${x.status}:${o(x)}`).join(',')
+    return `${q}|${c}|${f}|${s}|${g}`
   } catch {
     return String(Date.now()) // 비교 불가면 항상 "바뀜"으로 취급한다(느려지지 않는 쪽이 안전)
   }
