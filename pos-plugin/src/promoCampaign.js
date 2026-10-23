@@ -200,7 +200,8 @@ export function initPromoCampaign(injected) {
 }
 
 // --- 시연 모드 ---------------------------------------------------------------------
-// 켜면 그날 자정까지 이 매장의 "같은 번호 30일 내 재발송 금지"가 꺼진다(서버가 자정에 저절로 끈다).
+// 켜면 그날 자정까지 이 매장의 "같은 번호 30일 내 재발송 금지"가 꺼진다(서버가 자정에 저절로 끈다). 단, 풀리는 건
+// 정비 이력 화면의 차량별 홍보 발송뿐이다 -- 이 화면의 기간 발송과 자동 발송은 시연 모드여도 30일 제한을 그대로 건다.
 // 수신 동의·수신거부·야간 금지는 그대로다. 시연이 끝나 실매장에서는 탭앱으로 켜지 않는다 -- 같은 손님에게
 // 광고 문자가 반복해서 나갈 수 있다. 본사가 관리자 웹에서 켠 경우에만 카드가 보이고, 여기서는 끄기만 된다.
 let demoMode = false
@@ -218,7 +219,7 @@ function renderDemo(body) {
   card.hidden = !demoMode
   card.classList.toggle('is-on', demoMode)
   status.textContent = demoMode
-    ? `켜짐 — 같은 번호로 바로 다시 보낼 수 있습니다. ${formatTime(body.demoUntil)}에 저절로 꺼집니다.`
+    ? `켜짐 — 정비 이력의 차량별 홍보 발송만 30일 제한 없이 보낼 수 있습니다. 기간 발송은 30일 제한 그대로입니다. ${formatTime(body.demoUntil)}에 저절로 꺼집니다.`
     : '꺼짐 — 같은 번호에는 30일에 한 번만 보냅니다. 시연할 때만 켜세요(오늘 밤 12시에 저절로 꺼짐).'
   btn.textContent = demoMode ? '끄기' : '켜기'
   btn.classList.remove('confirming')

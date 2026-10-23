@@ -74,6 +74,25 @@
         } catch { /* 안내일 뿐 */ }
       }
 
+      // 결과 보고가 401·403(토큰이 틀림·매장 비활성)을 받았을 때. 기록은 남아 있고 토큰을 바로잡으면 다음 복구가 다시 보고한다.
+      function toastTokenProblem() {
+        toast({ message: '결제 결과를 전산에 알리지 못했습니다. 플러그인 설정에서 매장 토큰을 확인해주세요.', icon: 'error' })
+      }
+
+      // SDK 호출(getPayment 등)은 시간 제한이 없어서, 결제를 시작하기 전 지난 시도 확인이 끝나지 않으면 화면이 그대로 멈춘다.
+      // 정해진 시간이 지나면 fallback으로 끝낸다(원래 호출은 뒤에서 계속 돌 수 있다 -- 기록 정리는 같은 키끼리만 하므로 겹쳐도 안전하다).
+      const PRIOR_CHECK_TIMEOUT_MS = 15000
+      function withTimeout(promise, ms, fallback) {
+        let timer
+        return Promise.race([
+          Promise.resolve(promise).catch((e) => {
+            console.error('[erp-pay] 지난 시도 확인 오류', e)
+            return fallback
+          }),
+          new Promise((resolve) => { timer = setTimeout(() => resolve(fallback), ms) }),
+        ]).finally(() => clearTimeout(timer))
+      }
+
       let recovering = false
       // 오류 복구가 시작되면 true. 이미 돌고 있던 결제·취소 흐름(startPayment·runRefund)은 다음 단계로 넘어가기 직전에 이 값을 보고
       // 멈춘다 -- 안 그러면 안내 화면 위로 결제창이 뜨고, 안내 화면의 타이머가 그 결제창 도중에 화면을 끌고 나간다.
@@ -123,6 +142,19 @@
         const paymentRecovered = await pay.recoverInflight(token)
         const refundRecovered = await pay.recoverRefundInflight(token)
         if (aborted) return
+        // 승인(또는 취소)은 됐는데 서버가 기록을 받지 않은 건이 있으면 직원 안내 화면을 먼저 띄우고 이번에는 새 결제를 띄우지 않는다.
+        // 대기화면의 복구가 만든 건도 여기서 안내한다(대기화면이 이 화면으로 넘겨 준다). 그 주문은 한동안 결제창이 자동으로 뜨지 않는다.
+        const orphans = await pay.takeOrphanNotices()
+        if (aborted) return
+        if (orphans.length) {
+          showOrphanNotice(orphans)
+          return
+        }
+        if (paymentRecovered === 'auth' || refundRecovered === 'auth') {
+          // 401·403: 기록은 남겨 뒀다. 토큰을 바로잡으면 다음 복구가 다시 보고한다.
+          showMessage('error', '매장 토큰을 확인해주세요', '지난 결제(또는 취소) 결과를 전산에 알리지 못했습니다. 플러그인 설정에서 매장 토큰을 확인해주세요.', 8000)
+          return
+        }
         if (paymentRecovered === 'pending' || refundRecovered === 'pending') {
           showMessage('error', '직원 확인이 필요합니다', '지난 결제(또는 취소) 결과를 아직 서버에 알리지 못했습니다. 잠시 후 다시 시도합니다.', 8000)
           return
@@ -146,7 +178,9 @@
           runRefund(token, refunds[0])
           return
         }
-        const carts = (body.carts || []).filter((c) => !pay.isSnoozed(pay.cartSnoozeKey(c)))
+        // 쉬는 주문과, 승인됐는데 전산이 받지 않은 결제가 걸린 주문(이중결제 위험)은 뺀다(erp-front-pay.js filterStartableCarts).
+        const carts = await pay.filterStartableCarts(body.carts)
+        if (aborted) return
         if (!carts.length) {
           goHome()
           return
@@ -167,12 +201,17 @@
           carts.forEach((c) => pay.snooze(pay.cartSnoozeKey(c)))
           goHomeWhenIdle()
         }, SELECT_IDLE_MS)
+        // 한 번 고르면 같은 항목·다른 항목을 또 눌러도 무시한다 -- 연타로 결제 시작이 겹치면 결제창이 두 번 뜨거나, 늦게 끝난 쪽이
+        // 이긴 쪽의 기록을 건드린다. 같은 주문은 startPayment의 주문별 잠금이 한 번 더 막는다.
+        let picked = false
         sdk.template.renderSelectPage({
           title: '결제할 차량을 선택해주세요',
           subtitle: '차량번호를 확인해주세요',
           options: carts.map((cart) => ({
             title: `${cartTitle(cart)} · ${pay.formatWon(cart.totalAmount)}`,
             onClick: () => {
+              if (picked) return
+              picked = true
               clearTimeout(selectTimer)
               startPayment(token, cart)
             },
@@ -185,25 +224,81 @@
         })
       }
 
+      // 주문별 결제 시작 잠금. 차량 선택 화면 연타·[다시 결제하기] 연타·자동 시작이 겹쳐 같은 주문의 시작이 두 번 돌면, 결제창이 두 번
+      // 뜨거나 늦게 끝난 쪽이 이긴 쪽의 기록을 건드린다. 시작부터 결제창이 닫히고 결과를 정리할 때까지 같은 주문은 다시 들어오지 못한다.
+      const startingCarts = new Set()
+
       async function startPayment(token, cart) {
         stopLoadWatchdog()
         if (aborted) return // 오류 복구 화면이 이미 떠 있다 -- 새 결제를 시작해 그 화면을 덮지 않는다
+        const lockKey = String(cart.id)
+        if (startingCarts.has(lockKey)) return // 같은 주문의 시작이 이미 돌고 있다(연타)
+        startingCarts.add(lockKey)
+        try {
+          await startPaymentLocked(token, cart)
+        } finally {
+          startingCarts.delete(lockKey)
+        }
+      }
+
+      function showPriorChecking() {
+        showMessage('error', '이전 결제를 확인하고 있습니다', '잠시 후 다시 시도해주세요.', 5000)
+      }
+
+      async function startPaymentLocked(token, cart) {
+        // 승인됐는데 전산이 기록하지 못한 결제가 이 주문에 걸려 있으면 새 결제를 띄우지 않는다(이중결제 방지). 대기화면과 목록에서도
+        // 거르지만 [다시 결제하기] 같은 다른 길로 들어와도 막히게 여기서 한 번 더 본다.
+        const orphan = await pay.findOrphanBlock(cart)
+        if (aborted) return
+        if (orphan) {
+          showOrphanNotice([orphan], cart)
+          return
+        }
+
+        // 같은 주문에 정리 안 된 지난 시도 기록이 남아 있으면(결과 보고 실패 등) 새 시도보다 먼저 마무리한다. 기록 칸은 주문당 하나라
+        // 새 시도가 그 칸을 덮어쓰면 지난 시도를 되돌리거나 승인을 보고할 근거가 사라진다. 끝내 확인이 안 되면 시작하지 않는다.
+        if (await pay.hasInflight(cart.id)) {
+          const prior = await withTimeout(pay.recoverInflight(token, cart.id), PRIOR_CHECK_TIMEOUT_MS, 'pending')
+          if (aborted) return
+          if (prior === 'paid') {
+            showMessage('success', '이미 결제가 끝난 주문입니다', '지난 결제를 전산에 알렸습니다.', 5000)
+            return
+          }
+          if (prior === 'orphan') {
+            showOrphanNotice(await pay.takeOrphanNotices(), cart)
+            return
+          }
+          if (prior === 'auth') toastTokenProblem()
+          if (prior === 'pending' || prior === 'auth' || await pay.hasInflight(cart.id)) {
+            showPriorChecking()
+            return
+          }
+          if (aborted) return
+        }
+
         const paymentKey = crypto.randomUUID()
+        // amount·sentKey는 보고가 끝내 거절될 때 미기록 목록에 옮길 값이다(erp-front-pay.js reportPaid).
+        const record = { cartId: cart.id, paymentKey, amount: cart.totalAmount, sentKey: pay.cartSnoozeKey(cart) }
 
         // 시작 요청(start)을 보내기 **전에** 기록한다. 시작 요청이 시간 초과로 끝나면 서버가 이 키로 '결제 중'을 잡았는지 알 수
         // 없는데, 기록이 있어야 다음에 켜질 때 같은 키로 되돌릴 수 있다(erp-front-pay.js recoverInflight). 예전엔 start가 성공한
         // 뒤에야 기록해서, 시간 초과 건은 되돌릴 근거가 없어 주문이 '손님 결제 중'에 영구히 갇혔다.
-        await pay.saveInflight({ cartId: cart.id, paymentKey, phase: 'starting' })
+        // 그 사이 다른 시도의 기록이 생겼으면 덮어쓰지 않고 시작하지 않는다(claimInflight).
+        if (!await pay.claimInflight({ ...record, phase: 'starting' })) {
+          showPriorChecking()
+          return
+        }
         const started = await pay.startCart(token, cart.id, paymentKey)
         if (!started.ok) {
-          if (started.status === 0) {
-            // 시간 초과·연결 끊김: 서버는 이 키로 '결제 중'을 잡았을 수 있다. 결제창은 아직 안 띄웠으니(돈이 나가지 않았다)
-            // 같은 키로 되돌려 둔다. 서버는 아직 시작 안 된 키의 이 보고를 기억해 두고 늦게 도착하는 start를 거절한다.
-            // 보고가 서버에 닿은 게 확인되면 기록을 지우고, 닿지 못했으면 남겨 둬 다음 복구가 다시 보고한다(지우면 영영 못 되돌린다).
+          if (started.status === 0 || started.status >= 500) {
+            // 시간 초과·연결 끊김·서버 오류(게이트웨이 시간 초과 포함): 서버는 이 키로 '결제 중'을 잡았을 수 있다. 결제창은 아직 안
+            // 띄웠으니(돈이 나가지 않았다) 같은 키로 되돌려 둔다. 서버는 아직 시작 안 된 키의 이 보고를 기억해 두고 늦게 도착하는
+            // start를 거절한다. 보고가 서버에 닿은 게 확인되면 기록을 지우고, 닿지 못했으면 남겨 둬 다음 복구가 다시 보고한다.
             releaseInBackground(token, cart, paymentKey)
           } else {
-            // 서버가 분명히 거절했다(409 등) -- 이 키로는 시작된 게 없으니 되돌릴 기록이 필요 없다.
-            await pay.clearInflight(cart.id)
+            // 서버가 분명히 거절했다(409 등 4xx) -- 이 키로는 시작된 게 없다. 이번 시도가 방금 남긴 기록만 지운다(같은 칸에 다른
+            // 시도의 기록이 들어 있으면 그대로 둔다).
+            await pay.clearInflight(cart.id, paymentKey)
           }
           if (started.status === 409) {
             showMessage('error', '이미 처리 중인 주문입니다', '다른 기기에서 결제 중이거나 이미 끝난 주문입니다.')
@@ -212,7 +307,13 @@
           }
           return
         }
-        await pay.saveInflight({ cartId: cart.id, paymentKey, phase: 'paying' })
+        record.amount = started.body.totalAmount ?? cart.totalAmount // 서버 기준 금액
+        if (!await pay.claimInflight({ ...record, phase: 'paying' })) {
+          // 기록을 고쳐 쓰지 못했다(칸에 다른 시도의 기록이 있다). 기록 없이 결제창을 띄우면 결과를 복구할 수 없으니 되돌린다.
+          releaseInBackground(token, cart, paymentKey)
+          showPriorChecking()
+          return
+        }
 
         // 시작 요청을 기다리는 사이 오류 복구 화면이 떴으면 결제창을 띄우지 않고 같은 키로 되돌린다. 이 검사와 withNative
         // 사이에 await를 두지 마라 -- 검사를 통과한 뒤 nativeBusy가 오르기 전에 복구가 끼어들 틈이 생긴다.
@@ -238,9 +339,14 @@
           const recovered = await pay.recoverInflight(token, cart.id) // 이 주문의 기록만 -- 다른 건의 확인 불가가 이 건 결과를 흐리지 않게
           if (recovered === 'paid') {
             showPaid(cart, paymentKey)
+          } else if (recovered === 'orphan') {
+            // 승인은 됐는데 서버가 받지 않았다. 손님은 결제했으니 영수증은 뽑고, 직원이 알 수 있게 안내한다.
+            printReceiptFor(cart, paymentKey).catch((e) => console.error('[erp-pay] 영수증 출력 오류', e))
+            showOrphanNotice(await pay.takeOrphanNotices(), cart)
           } else if (recovered === 'released') {
             showRetryChoice(token, cart, '결제가 완료되지 않았습니다')
           } else {
+            if (recovered === 'auth') toastTokenProblem()
             showMessage('error', '결제 상태를 확인하지 못했습니다', '직원에게 알려주세요. 결제가 됐는지 확인이 필요합니다.', 8000)
           }
           return
@@ -253,52 +359,68 @@
           try {
             showPaid(cart, paymentKey)
           } finally {
-            reportPaidInBackground(token, cart, paymentKey, result.response)
+            reportPaidInBackground(token, cart, record, result.response)
           }
           return
         }
 
         // CANCELED / TIMEOUT / 그 외 실패 -- 돈이 나가지 않았다. 다시 결제할 수 있게 되돌린다.
+        // 서버가 받았거나 확정적으로 거절했을 때만 기록을 지운다. 429·네트워크 오류·인증 문제면 남겨 둬서 다음 복구가 (단말기에
+        // 승인이 없으니 'cancelled'로) 다시 보고한다(erp-front-pay.js reportReleased). 남은 기록이 있는 동안 [다시 결제하기]는
+        // 그 기록부터 정리한다(startPaymentLocked).
         const failed = result.type !== 'CANCELED' && result.type !== 'TIMEOUT'
-        const released = await pay.reportResult(token, cart.id, {
+        const released = await pay.reportReleased(token, cart.id, paymentKey, {
           result: failed ? 'failed' : 'cancelled',
-          paymentKey,
           errorMessage: failed ? `프론트 결제 실패(${result.type})` : undefined,
         })
-        // 서버가 받았거나 확정적으로 거절했을 때만 지운다. 429처럼 나중에 되는 거절이나 네트워크 오류면 남겨 둬서 다음 복구가
-        // (단말기에 승인이 없으니 'cancelled'로) 다시 보고한다.
-        if (released.ok || pay.isFinalRejection(released)) {
-          await pay.clearInflight(cart.id)
-        }
+        if (released === 'auth') toastTokenProblem()
         showRetryChoice(token, cart, failed ? '결제에 실패했습니다' : '결제가 취소되었습니다')
       }
 
-      // 결제 완료 보고. 서버가 받았거나(ok) 이미 paid로 알고 있을 때(409 + status 'paid')만 inflight 기록을 지운다.
-      // 그 밖의 거절(4xx)이나 실패는 기록을 남긴 채 둔다 -- 손님 화면은 이미 "결제 완료"로 나갔고, 다음에 이 단말기가 켜질 때
-      // recoverInflight가 다시 보고한다. 예전엔 4xx면 무조건 지웠는데, 429(속도 제한)나 일시적인 인증 문제까지 지워 버려
-      // 받은 돈을 전산이 모르는 채로 남겼다.
-      function reportPaidInBackground(token, cart, paymentKey, response) {
+      // 결제 완료 보고(erp-front-pay.js reportPaid). 서버가 기록했을 때만 inflight 기록을 지운다. 409·404 같은 확정 거절은 성공이
+      // 아니다 -- 미기록 목록에 옮기고, 이미 "결제 완료"로 나간 화면을 직원 안내 화면으로 바꾼다(그 주문의 결제창 자동 시작도 막힌다).
+      // 인증 문제(401·403)·네트워크 오류·5xx는 기록을 남긴 채 두고, 다음에 이 단말기가 켜질 때 recoverInflight가 다시 보고한다.
+      function reportPaidInBackground(token, cart, record, response) {
         reportInBackground(async () => {
-          const res = await pay.reportResult(token, cart.id, {
-            result: 'paid',
-            paymentKey,
-            payment: pay.extractPayment(response),
-          })
-          if (res.ok || (res.status === 409 && res.body?.status === 'paid')) {
-            await pay.clearInflight(cart.id)
-          } else {
-            console.warn('[erp-pay] 결제 완료 보고가 받아들여지지 않았습니다. 기록을 남겨 두고 다음에 다시 보고합니다.', res.status, res.body)
+          const outcome = await pay.reportPaid(token, record, pay.extractPayment(response))
+          if (outcome === 'orphan') {
+            // 오류 복구 화면이 떠 있으면 덮지 않는다 -- 안내는 남아 있어 다음에 이 화면이 열릴 때 띄운다(init).
+            if (!recovering) showOrphanNotice(await pay.takeOrphanNotices(), cart)
+          } else if (outcome === 'auth') {
+            toastTokenProblem()
+          } else if (outcome === 'pending') {
+            console.warn('[erp-pay] 결제 완료 보고가 아직 받아들여지지 않았습니다. 기록을 남겨 두고 다음에 다시 보고합니다.')
           }
         })
       }
 
       // 시작 요청이 시간 초과였거나(서버가 결제 중으로 잡았을 수 있다) 시작 직후 오류 복구가 화면을 가져가서 결제창을 못 띄운
-      // 건을 같은 키로 되돌린다. 보고가 서버에 닿았을 때만 기록을 지운다(닿지 못하면 다음 복구가 다시 한다).
+      // 건을 같은 키로 되돌린다. 보고가 서버에 닿았을 때만 이 키의 기록을 지운다(닿지 못하면 다음 복구가 다시 한다).
       function releaseInBackground(token, cart, paymentKey) {
-        reportInBackground(async () => {
-          const res = await pay.reportResult(token, cart.id, { result: 'cancelled', paymentKey })
-          if (res.ok || pay.isFinalRejection(res)) await pay.clearInflight(cart.id)
-        })
+        reportInBackground(() => pay.reportReleased(token, cart.id, paymentKey))
+      }
+
+      // 승인(또는 취소)은 됐는데 서버가 그 보고를 끝내 받지 않은 건의 직원 안내 화면. 승인번호·금액으로 토스 결제내역과 맞춰 보게 한다.
+      // orphans: erp-front-pay.js takeOrphanNotices·findOrphanBlock 결과(비어 있을 수 있다). subject: 지금 화면의 주문(있으면
+      // 그 주문의 건을 앞에 두고 차량번호를 함께 보인다). kind: orphans가 비었을 때 문구를 고르는 값('payment' | 'refund').
+      function showOrphanNotice(orphans, subject, kind) {
+        const list = orphans || []
+        const first = (subject && list.find((o) => String(o.cartId) === String(subject.id))) || list[0] || null
+        const isRefund = (first?.kind || kind) === 'refund'
+        const sameCart = subject && (!first || String(first.cartId) === String(subject.id))
+        const amount = first?.amount ?? (sameCart ? subject.totalAmount : null)
+        const details = [
+          sameCart ? cartTitle(subject) : '',
+          first?.approvalNumber ? `${isRefund ? '원결제 승인번호' : '승인번호'} ${first.approvalNumber}` : '',
+          amount != null ? pay.formatWon(amount) : '',
+        ].filter(Boolean).join(' · ')
+        const more = list.length > 1 ? ` 외 ${list.length - 1}건` : ''
+        showMessage(
+          'error',
+          isRefund ? '결제 취소는 됐지만 전산에 기록하지 못했습니다' : '결제는 승인됐지만 전산에 기록하지 못했습니다',
+          `직원에게 알려주세요${details ? ` (${details})` : ''}${more}`,
+          10000,
+        )
       }
 
       // 결제가 끝나면 영수증을 기본으로 출력한다(프론트에 연결된 프린터, sdk.printer.printReceipt). 전산 주문의 품목·단가를
@@ -353,10 +475,11 @@
         })
       }
 
-      // 결제·취소가 중단됐을 때의 화면. 예전엔 선택 화면(다시 시도/처음 화면으로)이라 아무도 안 누르면 그대로 멈춰
+      // 결제가 중단됐을 때의 화면. 예전엔 선택 화면(다시 시도/처음 화면으로)이라 아무도 안 누르면 그대로 멈춰
       // 있었고, 그동안 대기화면이 아니라 새 결제·취소를 받아 가지 못했다(손님이 그냥 떠나면 프론트가 먹통이 된다).
       // 그래서 결과 화면 + [다시 시도] 버튼으로 바꾸고 10초 뒤 저절로 대기화면으로 돌아가게 한다. 돌아간 뒤 같은 건이
       // 바로 다시 뜨지 않게 2분 쉬게 한다(snooze). 버튼을 눌러 다음 화면으로 갔으면 타이머가 대기화면으로 끌고 가지 않는다.
+      // 버튼 연타는 한 번만 받는다(startPayment의 주문별 잠금도 막는다). 결제 취소는 이 화면을 쓰지 않는다(showRefundStopped).
       function showStoppedWithRetry({ title, description, retryLabel, onRetry, snoozeKey }) {
         pay.snooze(snoozeKey)
         let left = false
@@ -365,7 +488,7 @@
           status: 'error',
           title,
           description,
-          buttons: [{ label: retryLabel, onClick: () => { left = true; onRetry() } }],
+          buttons: [{ label: retryLabel, onClick: () => { if (left) return; left = true; onRetry() } }],
           timerMs: 10000,
           onTimeout: () => { if (!left) goHomeWhenIdle() },
           localeCode: 'ko',
@@ -387,38 +510,101 @@
       // 뜬다. 카드 결제는 결제했던 카드를 다시 꽂아야 한다(NICE VAN 카드는 카드 없이 취소된다 -- erp-front-pay.js
       // requestRefund). 손님이 자리에 없어 취소창이 시간 초과로 닫히면 대기화면이 3초마다 취소창을 다시 띄워 다른
       // 손님이 프론트를 못 쓰게 된다. 그래서 취소가 끝나지 않으면 2분 동안 다시 띄우지 않는다(snooze).
+      // 취소가 중단·실패하면 서버가 주문을 결제 완료(paid)로 되돌리므로, 다시 취소하려면 직원이 [프론트에서 취소]를 다시 눌러야 한다
+      // (이 화면에 [다시 시도하기]를 두지 않는 이유 -- showRefundStopped).
+      // 주문별 취소 시작 잠금(결제의 startingCarts와 같은 이유).
+      const refundingCarts = new Set()
+
       async function runRefund(token, item) {
         stopLoadWatchdog()
         if (aborted) return // 오류 복구 화면이 이미 떠 있다 -- 새 취소를 시작해 그 화면을 덮지 않는다
+        const lockKey = String(item.id)
+        if (refundingCarts.has(lockKey)) return
+        refundingCarts.add(lockKey)
+        try {
+          await runRefundLocked(token, item)
+        } finally {
+          refundingCarts.delete(lockKey)
+        }
+      }
+
+      function showPriorRefundChecking(item) {
+        pay.snooze(pay.refundSnoozeKey(item))
+        showMessage('error', '이전 결제 취소를 확인하고 있습니다', '잠시 후 다시 시도해주세요.', 5000)
+      }
+
+      async function runRefundLocked(token, item) {
+        // 결제와 같다(startPaymentLocked): 같은 주문에 정리 안 된 지난 취소 시도 기록이 있으면 먼저 마무리하고, 끝내 확인이 안 되면
+        // 새 시도를 시작하지 않는다. 새 시도가 그 기록을 덮어쓰면 실제로 끝난 취소를 알릴 근거가 사라진다.
+        if (await pay.hasRefundInflight(item.id)) {
+          const prior = await withTimeout(pay.recoverRefundInflight(token, item.id), PRIOR_CHECK_TIMEOUT_MS, 'pending')
+          if (aborted) return
+          if (prior === 'refunded') {
+            showRefunded(item)
+            return
+          }
+          if (prior === 'orphan') {
+            showOrphanNotice(await pay.takeOrphanNotices(), item, 'refund')
+            return
+          }
+          if (prior === 'auth') toastTokenProblem()
+          if (prior === 'pending' || prior === 'auth' || await pay.hasRefundInflight(item.id)) {
+            showPriorRefundChecking(item)
+            return
+          }
+          if (aborted) return
+        }
 
         // 이 "시도"의 이름표. 서버는 start·result마다 이 값이 진행 중인 시도와 같은지 보고, 다르면 409 { stale:true }로 거절한다.
-        // 시간 초과로 늦게 도착한 옛 시도의 요청이 새 시도(예: [다시 시도하기])를 되돌리거나 완료 처리하는 것을 막는다.
+        // 시간 초과로 늦게 도착한 옛 시도의 요청이 새 시도를 되돌리거나 완료 처리하는 것을 막는다.
         const attemptId = crypto.randomUUID()
+        // approvalNumber(원결제)·amount는 완료 보고가 끝내 거절될 때 직원 안내에 쓴다(erp-front-pay.js reportRefunded).
+        const record = {
+          cartId: item.id,
+          paymentKey: item.refund?.paymentKey,
+          attemptId,
+          approvalNumber: item.refund?.approvalNumber,
+          amount: item.totalAmount,
+        }
         // start를 보내기 **전에** 기록한다(결제와 같은 이유 -- start가 시간 초과로 끝나면 서버가 '취소 중'을 잡았는지 모르는데
         // 기록이 있어야 다음에 되돌린다). refund의 paymentKey는 start 응답에 오는 값이 정본이라 성공하면 그 값으로 다시 저장한다.
-        await pay.saveRefundInflight({ cartId: item.id, paymentKey: item.refund?.paymentKey, attemptId })
+        if (!await pay.claimRefundInflight(record)) {
+          showPriorRefundChecking(item)
+          return
+        }
         const started = await pay.startRefund(token, item.id, attemptId)
         if (!started.ok) {
           pay.snooze(pay.refundSnoozeKey(item))
-          if (started.status === 0) {
-            // 시간 초과: 서버가 '취소 중'을 잡았을 수 있다. 취소창은 아직 안 띄웠으니 되돌려 둔다(결제와 같은 이유).
+          if (started.status === 0 || started.status >= 500) {
+            // 시간 초과·서버 오류: 서버가 '취소 중'을 잡았을 수 있다. 취소창은 아직 안 띄웠으니 되돌려 둔다(결제와 같은 이유).
             // 보고가 서버에 닿았을 때만 기록을 지우고, 못 닿았으면 남겨 둬 다음 복구가 같은 attemptId로 다시 보고한다.
-            releaseRefundInBackground(token, item, attemptId)
+            releaseRefundInBackground(token, record)
           } else {
-            // 서버가 분명히 거절했다(409 stale 포함) -- 이 시도로 시작된 건 없다.
-            await pay.clearRefundInflight(item.id)
+            // 서버가 분명히 거절했다(409 stale 포함 4xx) -- 이 시도로 시작된 건 없다. 이 시도의 기록만 지운다.
+            await pay.clearRefundInflight(item.id, attemptId)
           }
-          showMessage('error', '취소를 시작하지 못했습니다', started.body.error || '정비 대기열에서 상태를 확인해주세요.')
+          if (started.status === 409 && started.body?.status === 'paid') {
+            // 취소 요청이 그 사이 끝났거나 중단돼 결제 완료로 돌아갔다. 다시 취소하려면 직원이 다시 요청해야 한다.
+            showMessage('error', '취소를 시작하지 못했습니다', '다시 취소하려면 직원에게 요청해주세요.', 6000)
+          } else {
+            showMessage('error', '취소를 시작하지 못했습니다', started.body.error || '정비 대기열에서 상태를 확인해주세요.')
+          }
           return
         }
         const refund = started.body.refund || item.refund
-        await pay.saveRefundInflight({ cartId: item.id, paymentKey: refund.paymentKey, attemptId })
+        const active = { ...record, paymentKey: refund.paymentKey, approvalNumber: refund.approvalNumber ?? record.approvalNumber }
+        if (!await pay.claimRefundInflight(active)) {
+          // 기록을 고쳐 쓰지 못했다(칸에 다른 시도의 기록이 있다). 기록 없이 취소창을 띄우면 결과를 복구할 수 없으니 되돌린다.
+          releaseRefundInBackground(token, active)
+          showPriorRefundChecking(item)
+          return
+        }
 
         // 결제와 같다: start를 기다리는 사이 오류 복구 화면이 떴으면 취소창을 띄우지 않고 되돌린다. 이 검사와 withNative 사이에
         // await를 두지 마라.
         if (aborted) {
           pay.snooze(pay.refundSnoozeKey(item))
-          releaseRefundInBackground(token, item, attemptId)
+          releaseRefundInBackground(token, active)
           return
         }
 
@@ -436,56 +622,54 @@
           const recovered = await pay.recoverRefundInflight(token, item.id) // 이 주문의 기록만
           if (recovered === 'refunded') {
             showRefunded(item)
+          } else if (recovered === 'orphan') {
+            showOrphanNotice(await pay.takeOrphanNotices(), item, 'refund')
+          } else if (recovered === 'released') {
+            // 취소가 안 됐고 서버도 주문을 결제 완료로 되돌렸다. 이 화면에서 다시 시도할 수 없다(showRefundStopped).
+            showRefundStopped(item, '결제 취소가 완료되지 않았습니다')
           } else {
-            // 'released'(취소가 안 됐다)와 'pending'(됐는지 아직 모른다)도 중단 화면과 같은 [다시 시도하기] + 10초 뒤 자동 복귀로
-            // 보여 준다. 예전엔 버튼도 타이머도 없는 안내 화면이라 아무도 안 누르면 4~8초 뒤 대기화면으로 돌아가 같은 취소가
-            // 곧바로 또 떴다.
-            const pending = recovered !== 'released'
-            showStoppedWithRetry({
-              title: pending ? '취소 상태를 확인하지 못했습니다' : '결제 취소가 완료되지 않았습니다',
-              description: pending
-                ? '직원에게 알려주세요. 취소됐는지 확인이 필요합니다.'
-                : `${cartTitle(item)} · ${pay.formatWon(item.totalAmount)}`,
-              retryLabel: '다시 시도하기',
-              onRetry: () => runRefund(token, item),
-              snoozeKey: pay.refundSnoozeKey(item),
-            })
+            // 'pending'·'auth'(됐는지 아직 모른다). 예전의 [다시 시도하기]는 남은 기록 때문에 시작하지 못하고(서버도 아직 이 시도로
+            // 취소 중이라 409) 항상 실패했다 -- 버튼 없이 안내만 하고 저절로 대기화면으로 돌아간다. 기록은 다음 복구가 마무리한다.
+            if (recovered === 'auth') toastTokenProblem()
+            showMessage('error', '취소 상태를 확인하지 못했습니다', '직원에게 알려주세요. 취소됐는지 확인이 필요합니다.', 8000)
           }
           return
         }
 
         if (result.type === 'SUCCESS') {
-          const res = await pay.reportRefund(token, item.id, { result: 'refunded', attemptId })
-          // 서버가 받았거나(ok) 다른 시도가 이미 가져갔다고 할 때(409 stale)만 지운다. 그 밖의 거절·실패는 기록을 남겨 두고 다음
-          // 복구가 다시 보고한다 -- 취소는 이미 끝났는데 전산이 모르는 상태를 막으려는 것이다.
-          if (res.ok || (res.status === 409 && res.body?.stale)) await pay.clearRefundInflight(item.id)
+          // 서버가 기록했을 때만 기록을 지운다. 끝내 받지 않으면(409 stale 포함) 미기록 목록에 옮기고 직원 안내 화면을 띄운다.
+          // 인증 문제·네트워크 오류면 기록을 남겨 두고 다음 복구가 다시 보고한다(erp-front-pay.js reportRefunded).
+          const outcome = await pay.reportRefunded(token, active)
+          if (outcome === 'orphan') {
+            showOrphanNotice(await pay.takeOrphanNotices(), item, 'refund')
+            return
+          }
+          if (outcome === 'auth') toastTokenProblem()
           showRefunded(item)
           return
         }
 
         const failed = result.type !== 'CANCELED' && result.type !== 'TIMEOUT'
-        const res = await pay.reportRefund(token, item.id, {
+        const released = await pay.reportRefundReleased(token, active, {
           result: failed ? 'failed' : 'cancelled',
           errorMessage: failed ? `프론트 결제 취소 실패(${result.type})` : undefined,
-          attemptId,
         })
-        if (res.ok || pay.isFinalRejection(res)) await pay.clearRefundInflight(item.id)
-        showStoppedWithRetry({
-          title: failed ? '결제 취소에 실패했습니다' : '결제 취소를 중단했습니다',
-          description: `${cartTitle(item)} · ${pay.formatWon(item.totalAmount)}`,
-          retryLabel: '다시 시도하기',
-          onRetry: () => runRefund(token, item),
-          snoozeKey: pay.refundSnoozeKey(item),
-        })
+        if (released === 'auth') toastTokenProblem()
+        showRefundStopped(item, failed ? '결제 취소에 실패했습니다' : '결제 취소를 중단했습니다')
+      }
+
+      // 결제 취소가 중단·실패했을 때의 화면. 서버는 중단·실패 보고를 받으면 주문을 결제 완료(paid)로 되돌리므로 이 프론트가 같은
+      // 취소를 다시 시작할 수 없다 -- 예전의 [다시 시도하기]는 항상 '취소할 수 없는 주문입니다'로 실패했다. 다시 취소하려면 직원이
+      // 정비 대기열(POS 탭앱)에서 [프론트에서 취소]를 다시 눌러야 하므로 그렇게 안내하고, 버튼 없이 잠시 뒤 대기화면으로 돌아간다.
+      function showRefundStopped(item, title) {
+        pay.snooze(pay.refundSnoozeKey(item))
+        showMessage('error', title, `다시 취소하려면 직원에게 요청해주세요. (${cartTitle(item)} · ${pay.formatWon(item.totalAmount)})`, 8000)
       }
 
       // 취소 시작 요청이 시간 초과였거나 시작 직후 오류 복구가 화면을 가져가서 취소창을 못 띄운 건을 되돌린다(releaseInBackground와 같다).
-      // attemptId를 실어 보내므로 그 사이 새 시도가 시작됐다면 서버가 409 { stale:true }로 거절하고, 그건 확정 거절이라 기록을 지운다.
-      function releaseRefundInBackground(token, item, attemptId) {
-        reportInBackground(async () => {
-          const res = await pay.reportRefund(token, item.id, { result: 'cancelled', attemptId })
-          if (res.ok || pay.isFinalRejection(res)) await pay.clearRefundInflight(item.id)
-        })
+      // attemptId를 실어 보내므로 그 사이 새 시도가 시작됐다면 서버가 409 { stale:true }로 거절하고, 그건 확정 거절이라 이 시도의 기록을 지운다.
+      function releaseRefundInBackground(token, record) {
+        reportInBackground(() => pay.reportRefundReleased(token, record))
       }
 
       function showRefunded(item) {

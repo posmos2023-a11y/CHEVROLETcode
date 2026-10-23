@@ -31,8 +31,15 @@ process.env.TOSS_WEBHOOK_SECRET = ''
 const solapi = require('../src/solapi')
 const promoCalls = []
 let failNext = null // null | 'error'(확실한 실패) | 'timeout' | 'network'(결과 모름)
+// 발송사가 접수를 늘 거부하는 번호(보낼 때마다 확실한 실패)
+const rejectedPhones = new Set()
 solapi.sendPromoAlimtalk = async (payload) => {
   promoCalls.push(payload)
+  if (rejectedPhones.has(payload.phone)) {
+    const err = new Error('수신번호 접수 거부(테스트)')
+    err.definiteFailure = true
+    throw err
+  }
   if (failNext === 'error') {
     failNext = null
     const err = new Error('수신번호 오류(테스트)')
@@ -67,6 +74,7 @@ async function resetDatabase() {
   )
   promoCalls.length = 0
   failNext = null
+  rejectedPhones.clear()
 }
 
 before(async () => {
@@ -548,10 +556,68 @@ testSerial('자동 홍보: 결과를 모르는 실패는 다시 보내지 않고
   const store2 = await createStore('auto-fail-2')
   const b = await duePayment(store2, '01020240002')
   failNext = 'error'
+  const before = Date.now()
   await sendDuePromotions()
   const rowB = await prisma.payment.findUnique({ where: { id: b.id } })
   assert.equal(rowB.promoSent, false)
   assert.equal(rowB.promoClaimedAt, null)
+  // 같은 실행에서 다시 잡히지 않게 하루 뒤로 미룬다.
+  assert.ok(rowB.promoAt.getTime() >= before + DAY - 60 * 1000, `promoAt=${rowB.promoAt.toISOString()}`)
+  assert.equal(promoCalls.filter((p) => p.phone === '01020240002').length, 1)
+})
+
+testSerial('자동 홍보: 발송사가 거부하는 번호가 묶음 크기(100)보다 많아도 한 실행 안에서 뒤의 정상 대상까지 보낸다', async () => {
+  if (!isDaytimeKst()) return
+  const { sendDuePromotions } = require('../server')
+  const store = await createStore('auto-starve')
+  const rejected = []
+  for (let i = 0; i < 105; i += 1) {
+    const phone = `0109${String(1000000 + i).slice(-7)}`
+    rejectedPhones.add(phone)
+    // 정상 대상보다 차례(promoAt)가 앞선다 -- 예전에는 실패한 이 건들이 매 묶음 맨 앞에 다시 잡혔다.
+    rejected.push(await duePayment(store, phone, { promoAt: new Date(Date.now() - 10 * DAY - i * 1000) }))
+  }
+  const good = []
+  for (let i = 0; i < 3; i += 1) good.push(await duePayment(store, `0108${String(1000000 + i).slice(-7)}`))
+
+  const before = Date.now()
+  const result = await sendDuePromotions()
+  assert.equal(result.sent, 3, JSON.stringify(result))
+  assert.equal(result.failed, 105, JSON.stringify(result))
+  assert.equal(result.exhausted, false, JSON.stringify(result))
+  // 거부 번호마다 한 번씩만 시도했다(같은 실행에서 다시 보내지 않는다).
+  assert.equal(promoCalls.length, 108)
+  assert.equal(new Set(promoCalls.map((p) => p.phone)).size, 108)
+  const goodRows = await prisma.payment.findMany({ where: { id: { in: good.map((p) => p.id) } } })
+  assert.ok(goodRows.every((r) => r.promoSent && r.promoSentAt), '정상 대상이 발송되지 않았다')
+  const rejectedRows = await prisma.payment.findMany({ where: { id: { in: rejected.map((p) => p.id) } } })
+  assert.ok(rejectedRows.every((r) => !r.promoSent && !r.promoClaimedAt && r.promoAt.getTime() >= before + DAY - 60 * 1000))
+})
+
+testSerial('자동 홍보: 같은 번호가 7일 안에 3번 확실히 실패하면 더 미루지 않고 "보내지 않음"으로 닫는다', async () => {
+  if (!isDaytimeKst()) return
+  const { sendDuePromotions } = require('../server')
+  const store = await createStore('auto-fail-cap')
+  const phone = '01020290001'
+  rejectedPhones.add(phone)
+  const p = await duePayment(store, phone)
+  // 앞선 두 번의 실행에서 이미 두 번 실패했다(8일 전 실패는 세지 않는다).
+  for (const daysAgo of [1, 2, 8]) {
+    await prisma.promoSend.create({ data: { storeId: store.id, phone, via: 'auto', status: 'failed', sentAt: new Date(Date.now() - daysAgo * DAY) } })
+  }
+  await sendDuePromotions()
+  const row = await prisma.payment.findUnique({ where: { id: p.id } })
+  assert.equal(row.promoSent, true)
+  assert.equal(row.promoSentAt, null)
+
+  // 7일 안의 실패가 두 번 이하면 하루 뒤로 미루기만 한다.
+  const other = await createStore('auto-fail-cap-2')
+  const q = await duePayment(other, phone)
+  await prisma.promoSend.create({ data: { storeId: other.id, phone, via: 'auto', status: 'failed', sentAt: new Date(Date.now() - DAY) } })
+  await sendDuePromotions()
+  const rowQ = await prisma.payment.findUnique({ where: { id: q.id } })
+  assert.equal(rowQ.promoSent, false)
+  assert.ok(rowQ.promoAt.getTime() > Date.now() + DAY - 5 * 60 * 1000)
 })
 
 testSerial('자동 홍보: 야간에는 아무것도 잡지 않고 끝낸다(야간에 실행될 때만 확인)', async () => {

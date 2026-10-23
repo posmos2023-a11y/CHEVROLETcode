@@ -70,11 +70,13 @@ const {
   markErpCartPaid,
   markErpCartFrontPaying,
   releaseErpCartFrontPaying,
-  tombstoneErpCartFrontKey,
+  recordErpCartFrontReleasedKey,
+  isReleasedToken,
   forceReleaseErpCartFrontPaying,
   forceReleaseErpCartRefunding,
   FORCE_RELEASE_AFTER_MS,
   markErpCartFrontPaid,
+  markErpCartFrontPaidAfterRelease,
   sendErpCartToFront,
   returnErpCartToPos,
   listFrontErpCartsForPos,
@@ -111,6 +113,7 @@ const {
   registerPromoExclusion,
   skipDuePromotion,
   postponeDuePromotion,
+  countRecentAutoPromoFailures,
   closeSiblingDuePromotions,
   listPromoCampaignCandidates,
   completeReservationAfterPayment,
@@ -1225,6 +1228,7 @@ app.get('/api/pos/erp-carts', posIpFloodLimiter, posQueueReadLimiter, requireSto
 // 시간 초과로 포기한 뒤 늦게 도착하는 요청이 자기 시도의 것인지 남의 것인지 서버가 가리는 데 쓴다(consume·refund-start·
 // refund-result). 선택 값이라 안 보내는 옛 클라이언트는 예전처럼 동작한다.
 // 반환: 값 | null(안 보냄) | false(형식이 틀림 -- 호출부가 400으로 거절)
+// 쉼표가 들어갈 수 없어야 한다 -- 접은 취소 시도를 쉼표로 이어 refundReleasedAttemptId 한 컬럼에 목록으로 둔다(store.js 묘비 목록).
 const ATTEMPT_ID_RE = /^[A-Za-z0-9_-]{8,64}$/
 
 function parseAttemptId(raw) {
@@ -1232,6 +1236,14 @@ function parseAttemptId(raw) {
   const value = String(raw).trim()
   return ATTEMPT_ID_RE.test(value) ? value : false
 }
+
+// 담기(loaded) 뒤에 이어지는 상태. 이 상태들에서는 담을 때 남긴 consumeAttemptId가 그대로 남는다(결제·취소 전이가 지우지 않는다).
+const CONSUMED_CART_STATUSES = ['loaded', 'paid', 'refund_requested', 'refunding', 'refunded']
+
+// 다른 단말기가 담은 주문을 [담기 취소]로 억지로 되돌릴 수 있게 되기까지의 시간. 담은 단말기에는 그 주문의 품목이 POS
+// 장바구니와 결제 대기 기록에 그대로 남아 있어, 다른 단말기가 되돌리면 두 곳에서 결제될 수 있다. 그래서 담은 단말기에서
+// 취소하는 것이 원칙이고, 그 단말기가 꺼졌거나 사라진 경우만 이 시간이 지난 뒤 직원이 확인하고(force) 되돌린다.
+const UNLOAD_FORCE_AFTER_MS = 30 * 60 * 1000
 
 // POS 플러그인이 addLineItem() 결과를 되돌려준다. posLimiter를 쓴다 -- 폴링(조회)이 아니라
 // "이 매장 전체 기준으로 한도를 두는 게 의미 있는" 상태 변경 액션이라 posQueueReadLimiter가 아닌
@@ -1249,11 +1261,13 @@ app.post('/api/pos/erp-carts/:id/consume', posIpFloodLimiter, posLimiter, requir
   }
   // 이미 처리된 건을 돌려줄 때, 그 처리가 이 요청(같은 attemptId)의 첫 시도가 성공한 것인지 알려준다. 재시도한 탭앱이
   // 자기 첫 성공을 "다른 단말기가 먼저 담았다"로 오해해 이미 POS에 담은 주문을 또 담지 않게 한다.
+  // 담긴 뒤 이어지는 상태(결제·취소)에서도 consumeAttemptId는 그대로 남으므로 같이 본다 -- 담기 보고와 결제 통보의 응답을
+  // 모두 놓친 탭앱이 담기를 다시 보냈을 때, 자기가 담아 결제까지 끝낸 주문을 "다른 단말기가 처리"로 오인하지 않게 한다.
   const alreadyProcessedBody = (row) => ({
     ok: true,
     alreadyProcessed: true,
     status: row?.status,
-    ownAttempt: row?.status === 'loaded' && Boolean(attemptId) && row.consumeAttemptId === attemptId,
+    ownAttempt: Boolean(attemptId) && CONSUMED_CART_STATUSES.includes(row?.status) && row.consumeAttemptId === attemptId,
   })
 
   // 다른 매장 소유의 cart를 건드리지 못하게 storeId까지 확인한다 -- id만으로 조회하면 다른 매장
@@ -1288,13 +1302,18 @@ app.post('/api/pos/erp-carts/:id/consume', posIpFloodLimiter, posLimiter, requir
   if (result === 'loaded') {
     changed = await markErpCartLoaded(cart.id, attemptId)
   } else if (result === 'dismissed') {
-    changed = await markErpCartDismissed(cart.id, note)
+    changed = await markErpCartDismissed(cart.id, note, 'pos')
   } else {
     changed = await markErpCartFailed(cart.id, note)
   }
 
   if (!changed) {
     const latest = await prisma.erpCart.findUnique({ where: { id: cart.id } })
+    if (latest?.payTarget === 'front') {
+      // 읽은 직후 다른 단말기가 [프론트로 결제 요청]으로 넘겼다(전이는 payTarget 'pos'에서만 일어나 담기지 않았다). 위의
+      // 사전 확인과 같은 409를 돌려 탭앱이 담은 품목을 되돌리고 결제하지 않게 한다.
+      return res.status(409).json({ ok: false, error: '프론트에서 결제하도록 넘긴 주문입니다.', status: latest.status, payTarget: 'front' })
+    }
     return res.json(alreadyProcessedBody(latest))
   }
   return res.json({ ok: true, alreadyProcessed: false, status: result })
@@ -1302,17 +1321,65 @@ app.post('/api/pos/erp-carts/:id/consume', posIpFloodLimiter, posLimiter, requir
 
 // 담김(loaded) 되돌리기. 직원이 잘못 담았거나 POS 장바구니를 비워서 이 주문을 다시 담아야 할 때, 탭앱이 호출한다.
 // 결제 통보(paidAt)가 이미 있는 주문과 프론트 결제 건은 되돌리지 않는다(store.markErpCartUnloaded).
+// body: { attemptId?(담을 때 consume에 실은 값), force?(다른 단말기가 담은 주문을 직원이 확인하고 되돌림) }
+// 담은 단말기만 되돌릴 수 있다(consumeAttemptId 비교). 다른 단말기가 되돌리면 담은 단말기의 POS 장바구니와 결제 대기 기록은
+// 그대로 남아, 이 주문이 다시 담기거나 프론트로 넘어가 결제된 뒤 담은 단말기에서 또 결제될 수 있다. 담은 단말기가 사라진
+// 경우를 위해 담은 지 UNLOAD_FORCE_AFTER_MS가 지났고 force:true면 허용한다. 옛 탭앱이 담은 주문(consumeAttemptId 없음)은 예전처럼.
+// 담긴 채 24시간이 넘은 주문은 되돌려도 전산 주문 목록에 다시 뜨지 않으므로 pending 대신 dismissed로 닫는다.
 app.post('/api/pos/erp-carts/:id/unload', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+  const attemptId = parseAttemptId(req.body?.attemptId)
+  if (attemptId === false) {
+    return res.status(400).json({ ok: false, error: 'attemptId는 8~64자의 영문/숫자/하이픈/밑줄이어야 합니다.' })
+  }
+  const force = req.body?.force === true
   const cart = await prisma.erpCart.findUnique({ where: { id: req.params.id } })
   if (!cart || cart.storeId !== req.store.id) {
     return res.status(404).json({ ok: false, error: '주문을 찾을 수 없습니다.' })
   }
-  const changed = await markErpCartUnloaded(cart.id, req.store.id)
-  if (!changed) {
+
+  // 다른 단말기가 담은 주문이면 억지로 되돌릴 수 있게 되기까지 남은 시간(ms). 담은 단말기의 주문이면 null.
+  const otherDeviceWaitMs = (row) => {
+    if (row?.status !== 'loaded' || !row.consumeAttemptId || row.consumeAttemptId === attemptId) return null
+    const loadedAtMs = row.loadedAt ? new Date(row.loadedAt).getTime() : 0
+    return Math.max(0, loadedAtMs + UNLOAD_FORCE_AFTER_MS - Date.now())
+  }
+  const otherDeviceBody = (row, waitMs) => ({
+    ok: false,
+    code: 'LOADED_ON_OTHER_DEVICE',
+    canForceAfterSec: Math.ceil(waitMs / 1000),
+    error: '다른 단말기에서 담은 주문입니다. 담은 단말기에서 취소해주세요.',
+    status: row.status,
+  })
+
+  // 되돌릴 수 있는 상태(loaded)일 때만 담은 단말기를 따진다(그 밖은 아래 전이가 실패해 상태와 함께 409로 답한다).
+  const waitMs = otherDeviceWaitMs(cart)
+  if (waitMs !== null && (!force || waitMs > 0)) {
+    return res.status(409).json(otherDeviceBody(cart, waitMs))
+  }
+  const forced = waitMs !== null
+
+  // 읽은 담기 시도 그대로일 때만 되돌린다 -- 확인한 뒤 그 사이 다른 단말기가 되돌렸다가 다시 담은 주문을 건드리지 않는다.
+  const outcome = await markErpCartUnloaded(cart.id, req.store.id, { consumeAttemptId: cart.consumeAttemptId ?? null })
+  if (!outcome) {
     const latest = await prisma.erpCart.findUnique({ where: { id: cart.id } })
+    const latestWaitMs = otherDeviceWaitMs(latest)
+    if (latestWaitMs !== null) {
+      // 그 사이 다른 단말기가 다시 담았다.
+      return res.status(409).json(otherDeviceBody(latest, latestWaitMs))
+    }
     return res.status(409).json({
       ok: false, error: '아직 결제되지 않은, POS에 담긴 주문만 되돌릴 수 있습니다.', status: latest?.status, payTarget: latest?.payTarget,
     })
+  }
+  if (forced) {
+    // 담은 단말기에는 이 주문의 품목과 결제 대기 기록이 남아 있을 수 있다 -- 이중 결제가 나면 이 로그로 되짚는다.
+    logger.warn('[pos] 다른 단말기에서 담은 주문을 직원이 확인하고 되돌림', {
+      storeId: req.store.id, cartId: cart.id, referenceId: cart.referenceId, loadedAt: cart.loadedAt, outcome,
+    })
+  }
+  if (outcome === 'dismissed') {
+    logger.info('[pos] 담긴 채 24시간이 지난 주문을 되돌려 닫음(dismissed)', { storeId: req.store.id, cartId: cart.id, referenceId: cart.referenceId })
+    return res.json({ ok: true, status: 'dismissed' })
   }
   logger.info('[pos] 담긴 주문을 담기 전으로 되돌림', { storeId: req.store.id, cartId: cart.id })
   return res.json({ ok: true, status: 'pending' })
@@ -2846,27 +2913,76 @@ app.get('/api/pos/history', posIpFloodLimiter, posQueueReadLimiter, requireStore
 //
 // Payment 테이블에는 넣지 않는다 — 그쪽은 고객 동의를 받은 흐름이고 프로모션 대상 판정에 쓰인다.
 // 동의 없이 POS에서 일어난 결제를 섞으면 그 판정이 흐려진다(schema.prisma 주석 참고).
+//
+// body: { paymentId?, orderId?, manual?(직원이 손으로 맞춘 결제) }
+// 응답 409 code: ALREADY_PAID_OTHER(이미 다른 결제로 결제된 주문 -- 이중 결제 확인) | ALREADY_CLOSED(이미 끝난 주문에 온 결제)
+
+// 결제 전에 끝난 주문(전산 취소·매장이 지움·담기 실패·만료). 여기에 결제 통보가 오면 받은 돈을 대사해야 한다.
+const CLOSED_CART_STATUSES = ['dismissed', 'failed', 'expired', 'cancelled']
+// 결제된 뒤의 상태(취소가 끝나기 전)
+const PAID_LIKE_CART_STATUSES = ['paid', 'refund_requested', 'refunding']
+const CLOSED_CART_PAID_ERROR = '이미 끝난(취소·만료·지움) 주문이라 결제 완료로 기록하지 못했습니다. 받은 결제를 확인해주세요.'
+
+// 이미 결제된 주문(row)에 온 POS 결제 통보가 그 주문을 결제한 바로 그 POS 결제인지(재시도·응답 유실). 결제 ID가 어느 한쪽에
+// 없으면 가릴 수 없으므로 예전처럼 같은 결제로 본다(옛 탭앱, ID 없이 기록된 주문). 프론트 결제 건은 늘 다른 결제다.
+function isSamePosPayment(row, reportedPaymentId) {
+  if (!row || row.payTarget !== 'pos') return false
+  return !reportedPaymentId || !row.tossPaymentId || row.tossPaymentId === reportedPaymentId
+}
+
 app.post('/api/pos/erp-carts/:id/paid', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
   const cart = await prisma.erpCart.findUnique({ where: { id: req.params.id } })
   if (!cart || cart.storeId !== req.store.id) {
     return res.status(404).json({ ok: false, error: '장바구니를 찾을 수 없습니다.' })
   }
-  if (cart.status === 'paid') {
-    // 탭앱이 재시도했거나 단말기가 두 대다. 이미 기록된 건이면 그대로 알려준다.
-    return res.json({ ok: true, alreadyProcessed: true, status: 'paid' })
+  const reportedPaymentId = req.body?.paymentId ? String(req.body.paymentId).slice(0, 200) : null
+  // manual: 탭앱이 결제를 자동으로 맞추지 못해 직원이 [주문] 탭을 보고 손으로 고른 결제다. 나중에 대사할 때 구분하려고 남긴다.
+  const manual = req.body?.manual === true
+  const reportMeta = (row) => ({
+    storeId: req.store.id,
+    cartId: cart.id,
+    referenceId: cart.referenceId,
+    status: row?.status ?? null,
+    payTarget: row?.payTarget ?? null,
+    storedPaymentId: row?.tossPaymentId ?? null,
+    reportedPaymentId,
+    orderId: req.body?.orderId ?? null,
+    manual,
+  })
+  if (manual) logger.info('[pos] 직원이 손으로 확인한 POS 결제 통보', reportMeta(cart))
+
+  // 이미 결제된 주문에 온 통보가 같은 결제의 재시도(응답 유실·탭앱 재시도)인지 다른 결제(같은 주문을 두 번 받음)인지 가른다.
+  // 같은 결제면 그대로 처리됨으로 답하고, 다른 결제면 받은 돈이 기록 어디에도 안 남으므로 크게 남기고 409로 알려 탭앱이 직원에게
+  // 이중 결제를 확인하게 한다.
+  const respondPaidRow = (row) => {
+    if (isSamePosPayment(row, reportedPaymentId)) {
+      return res.json({ ok: true, alreadyProcessed: true, status: row.status })
+    }
+    logger.error('[pos] 이미 결제된 주문에 다른 결제 통보가 왔습니다. 대사가 필요합니다', reportMeta(row))
+    return res.status(409).json({
+      ok: false,
+      code: 'ALREADY_PAID_OTHER',
+      status: row.status,
+      error: '이 주문은 이미 다른 결제로 결제 완료됐습니다. 같은 주문을 두 번 결제했는지 [주문] 탭에서 확인해주세요.',
+    })
   }
+  if (cart.status === 'paid') return respondPaidRow(cart)
   if (cart.payTarget !== 'pos' || !['pending', 'loaded'].includes(cart.status)) {
-    if (['dismissed', 'failed', 'expired', 'cancelled'].includes(cart.status)) {
+    if (CLOSED_CART_STATUSES.includes(cart.status)) {
       // 이미 끝난 주문인데 POS에서는 돈이 나갔다는 통보가 왔다. 조용히 409만 돌려주면 결제된 사실이 우리 기록 어디에도
       // 남지 않으므로 크게 남긴다 -- 매장·토스 결제 ID로 대사해서 주문을 되살리거나 환불해야 한다.
-      logger.error('[pos] 결제 통보가 끝난 주문에 왔습니다. 대사가 필요합니다', {
-        storeId: req.store.id,
-        cartId: cart.id,
-        referenceId: cart.referenceId,
-        status: cart.status,
-        paymentId: req.body?.paymentId ?? null,
-        orderId: req.body?.orderId ?? null,
+      logger.error('[pos] 결제 통보가 끝난 주문에 왔습니다. 대사가 필요합니다', { ...reportMeta(cart), paymentId: reportedPaymentId })
+      return res.status(409).json({
+        ok: false, code: 'ALREADY_CLOSED', error: CLOSED_CART_PAID_ERROR, status: cart.status,
       })
+    }
+    if (['refund_requested', 'refunding', 'refunded'].includes(cart.status) && !isSamePosPayment(cart, reportedPaymentId)) {
+      // 결제된 뒤 취소가 진행 중이거나 끝난 주문에 다른 결제 통보가 왔다(프론트 결제 건 포함) -- 이중 결제다.
+      return respondPaidRow(cart)
+    }
+    if (cart.payTarget !== 'pos') {
+      // 프론트 결제 건(대기·결제 중·담김)인데 POS에서 돈이 나갔다는 통보다. 프론트에서도 결제되면 두 번 받는다.
+      logger.error('[pos] 프론트 결제 주문에 POS 결제 통보가 왔습니다. 대사가 필요합니다', reportMeta(cart))
     }
     // 담기 전(pending)·담김(loaded)이 아니거나 프론트 결제 건은 POS 결제로 기록할 수 없다.
     return res.status(409).json({ ok: false, error: '담기 전이거나 담긴 POS 결제 주문만 결제 완료로 기록할 수 있습니다.', status: cart.status })
@@ -2877,8 +2993,18 @@ app.post('/api/pos/erp-carts/:id/paid', posIpFloodLimiter, posLimiter, requireSt
     orderId: req.body?.orderId,
   })
   if (!changed) {
+    // 읽은 뒤 다른 요청이 먼저 바꿨다. 다시 읽은 상태로 위와 같은 규칙을 건다.
     const latest = await prisma.erpCart.findUnique({ where: { id: cart.id } })
-    return res.json({ ok: true, alreadyProcessed: true, status: latest?.status })
+    if (latest && PAID_LIKE_CART_STATUSES.includes(latest.status)) return respondPaidRow(latest)
+    if (latest && [...CLOSED_CART_STATUSES, 'refunded'].includes(latest.status)) {
+      logger.error('[pos] 결제 통보가 끝난 주문에 왔습니다. 대사가 필요합니다', { ...reportMeta(latest), paymentId: reportedPaymentId })
+      return res.status(409).json({
+        ok: false, code: 'ALREADY_CLOSED', error: CLOSED_CART_PAID_ERROR, status: latest.status,
+      })
+    }
+    // 그 사이 프론트로 넘어갔다 등. POS에서 받은 돈을 이 주문에 기록하지 못했다.
+    logger.error('[pos] POS 결제 통보를 주문에 반영하지 못했습니다. 대사가 필요합니다', reportMeta(latest))
+    return res.status(409).json({ ok: false, error: '담기 전이거나 담긴 POS 결제 주문만 결제 완료로 기록할 수 있습니다.', status: latest?.status, payTarget: latest?.payTarget })
   }
   if (cart.deletedAt) {
     logger.warn('[pos] 삭제했던 주문이 결제 완료로 확정되어 되살립니다', { storeId: req.store.id, cartId: cart.id, referenceId: cart.referenceId })
@@ -2968,7 +3094,7 @@ app.post('/api/pos/erp-carts/:id/dismiss-front', posIpFloodLimiter, posLimiter, 
   if (!cart) return
   if (cart.payTarget !== 'front') return res.status(409).json({ ok: false, error: '프론트 결제 대기 주문이 아닙니다.' })
   if (cart.status === 'dismissed') return res.json({ ok: true, alreadyProcessed: true })
-  const changed = cart.status === 'pending' ? await markErpCartDismissed(cart.id, '매장이 프론트 대기에서 지움') : false
+  const changed = cart.status === 'pending' ? await markErpCartDismissed(cart.id, '매장이 프론트 대기에서 지움', 'front') : false
   if (!changed) return res.status(409).json({ ok: false, error: '손님이 결제 중이거나 이미 처리된 주문이라 지울 수 없습니다.', status: cart.status })
   return res.json({ ok: true, alreadyProcessed: false })
 }))
@@ -3059,7 +3185,16 @@ app.post('/api/pos/queue/:id/resend-done', posIpFloodLimiter, posLimiter, requir
 // 승인 여부를 확인해 보고를 마저 보낸다(front-plugin/index.html 참고). 그래도 끝내 안 풀리면(프론트가 아예 복구되지 않는 등)
 // 10분이 지난 뒤 직원이 탭앱에서 force-release로 풀 수 있다 -- 결제 취소 쪽(refunding)도 같다.
 
+// 쉼표가 들어갈 수 없어야 한다 -- 포기한 키를 쉼표로 이어 frontReleasedKey 한 컬럼에 목록으로 둔다(store.js 묘비 목록).
 const FRONT_PAYMENT_KEY_RE = /^[A-Za-z0-9_-]{8,64}$/
+
+// 프론트 결제가 끝난 뒤의 상태(취소 요청·진행·완료 포함)
+const FRONT_PAID_STATUSES = ['paid', 'refund_requested', 'refunding', 'refunded']
+
+// 이 주문을 결제한 바로 그 프론트 결제(paymentKey)의 재보고인지(응답 유실·재시작 후 복구).
+function isSameFrontPayment(row, paymentKey) {
+  return Boolean(row) && row.payTarget === 'front' && row.frontPaymentKey === paymentKey && FRONT_PAID_STATUSES.includes(row.status)
+}
 
 // 부가세는 전산(erp-simulator/cart.py)과 같은 기준(합계 / 11 반올림)으로 나눈다. 금액을 서버가
 // 정해 내려주는 이유: 프론트가 자기가 가진 값으로 결제하면 그 사이 바뀐 주문과 금액이 어긋날 수 있다.
@@ -3263,9 +3398,10 @@ app.post('/api/pos/erp-carts/:id/refunded', posIpFloodLimiter, posLimiter, requi
 // 갇힌 프론트 결제 중(paying)·취소 중(refunding)을 직원이 푸는 비상구. 프론트가 결과 보고를 못 한 채 꺼지면 서버는 자동으로
 // 되돌리지 않으므로(실제로는 승인됐을 수 있어서 되돌리면 이중결제) 사람이 풀어야 한다. 그래서 정상 결제·취소가 끝나고도
 // 남을 시간(10분)이 지난 건만 푼다 -- 지금 손님이 결제하는 주문을 풀면 같은 주문이 두 번 결제될 수 있다.
-//   - 결제 중: pending으로 풀고 옛 paymentKey를 frontReleasedKey에 남긴다. 그 키의 늦은 /start는 거절되고, 늦은 'paid' 보고는
-//     반영되지 않은 채 logger.error(대사 필요)로 남는다. 실제로 결제가 승인됐다면 토스 웹훅·승인 내역으로 대사해야 한다.
-//   - 취소 중: paid로 풀고 그 시도를 refundReleasedAttemptId에 남긴다. 카드 취소가 실제로 끝났다면 토스 취소 웹훅이 refunded로 맞춘다.
+//   - 결제 중: pending으로 풀고 옛 paymentKey를 묘비 목록(frontReleasedKey)에 더한다. 그 키의 늦은 /start는 거절된다. 그 키의
+//     늦은 'paid' 보고는 아직 아무도 주문을 다시 잡지 않았으면(프론트 대기 pending) 결제 완료로 받고, 그 밖(POS로 되돌림·다시
+//     결제됨·지움 등)이면 logger.error(대사 필요)와 409 PAID_AFTER_RELEASE로 남긴다(/result 참고).
+//   - 취소 중: paid로 풀고 그 시도를 묘비 목록(refundReleasedAttemptId)에 더한다. 카드 취소가 실제로 끝났다면 토스 취소 웹훅이 refunded로 맞춘다.
 app.post('/api/pos/erp-carts/:id/force-release', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
   const cart = await prisma.erpCart.findUnique({ where: { id: req.params.id } })
   if (!cart || cart.storeId !== req.store.id) {
@@ -3335,9 +3471,10 @@ app.post('/api/front/erp-carts/:id/refund-start', posIpFloodLimiter, posLimiter,
   if (!cart || cart.storeId !== req.store.id || cart.payTarget !== 'front') {
     return res.status(404).json({ ok: false, error: '주문을 찾을 수 없습니다.' })
   }
-  if (attemptId && cart.refundReleasedAttemptId === attemptId) {
+  if (isReleasedToken(cart.refundReleasedAttemptId, attemptId)) {
     // 프론트가 이 시도는 포기했다고 이미 알렸는데(시간 초과 뒤 refund-result) 이 start가 늦게 도착했다. 받아주면 프론트는
-    // 취소창을 접었는데 서버만 refunding으로 잡혀 직원이 풀 때까지 갇힌다.
+    // 취소창을 접었는데 서버만 refunding으로 잡혀 직원이 풀 때까지 갇힌다. (읽은 뒤 끼어든 포기 보고는 markErpCartRefunding이
+    // 전이와 함께 다시 확인해 거절한다.)
     return res.status(409).json({ ok: false, error: '이미 중단된 취소 시도입니다.', stale: true, status: cart.status })
   }
   if (cart.status === 'refunding') {
@@ -3351,6 +3488,10 @@ app.post('/api/front/erp-carts/:id/refund-start', posIpFloodLimiter, posLimiter,
   const claimed = await markErpCartRefunding(cart.id, req.store.id, attemptId)
   if (!claimed) {
     const latest = await prisma.erpCart.findUnique({ where: { id: cart.id } })
+    if (isReleasedToken(latest?.refundReleasedAttemptId, attemptId)) {
+      // 읽은 직후 같은 시도의 포기 보고가 먼저 처리됐다.
+      return res.status(409).json({ ok: false, error: '이미 중단된 취소 시도입니다.', stale: true, status: latest.status })
+    }
     return res.status(409).json({ ok: false, error: '취소할 수 없는 주문입니다.', status: latest?.status })
   }
   return res.json({ ok: true, alreadyProcessed: false, id: cart.id, refund: frontRefundParams(cart) })
@@ -3382,6 +3523,10 @@ app.post('/api/front/erp-carts/:id/refund-result', posIpFloodLimiter, posLimiter
       logger.error('[front] 다른 시도의 결제 취소 완료 보고가 와서 거절했습니다. 토스 취소 내역과 대사가 필요합니다.', {
         cartId: cart.id, status: cart.status, attemptId, currentAttemptId: cart.refundAttemptId,
       })
+    } else {
+      // 접은 시도는 지금 상태와 관계없이 묘비 목록에 남긴다 -- 지금 시도가 끝난 뒤 같은 주문의 취소가 다시 요청됐을 때 이 시도의
+      // 늦은 refund-start가 그 취소를 가로채지 못하게 한다(지금 쥐고 있는 시도는 목록을 보지 않으므로 막지 않는다).
+      await markErpCartRefundAttemptReleased(cart.id, attemptId)
     }
     return res.status(409).json({ ok: false, error: '지금 진행 중인 취소 시도의 보고가 아닙니다.', stale: true, status: cart.status })
   }
@@ -3400,16 +3545,26 @@ app.post('/api/front/erp-carts/:id/refund-result', posIpFloodLimiter, posLimiter
   // refund_requested로 되돌리지 않는다(store.releaseErpCartRefunding 주석).
   const note = result === 'failed' ? (trimmedString(req.body?.errorMessage, 500) || '프론트 결제 취소 실패') : null
   const released = await releaseErpCartRefunding(cart.id, note, attemptId)
-  if (!released) {
-    if (cart.status === 'refund_requested' || cart.status === 'paid') {
-      // refund-start보다 먼저 도착했거나(시간 초과 뒤 프론트가 먼저 포기를 알림) 이미 풀린 뒤의 재시도다. 시도를 기록해 두면
-      // 늦게 도착하는 같은 시도의 refund-start를 거절할 수 있다.
-      if (attemptId) await markErpCartRefundAttemptReleased(cart.id, attemptId)
-      return res.json({ ok: true, alreadyProcessed: true, status: cart.status })
+  if (released) return res.json({ ok: true, alreadyProcessed: false, status: 'paid' })
+
+  // 풀 게 없다: refund-start보다 먼저 도착했거나(시간 초과 뒤 프론트가 먼저 포기를 알림) 이미 풀린 뒤의 재시도다. 시도를 묘비
+  // 목록에 남겨 늦게 도착하는 같은 시도의 refund-start를 거절한다(markErpCartRefunding이 전이와 함께 확인한다).
+  if (attemptId) {
+    const marked = await markErpCartRefundAttemptReleased(cart.id, attemptId)
+    // 기록하기 직전에 그 refund-start가 먼저 처리돼 refunding이 됐을 수 있다(같은 시도) -- 이제는 정상적으로 푼다.
+    const retried = await releaseErpCartRefunding(cart.id, note, attemptId)
+    if (retried) return res.json({ ok: true, alreadyProcessed: false, status: 'paid' })
+    if (!marked) {
+      // 기록하지 못한 채 200을 주면 프론트가 기록을 지우고, 늦은 refund-start가 취소 중으로 가둘 수 있다. 다시 보내게 한다.
+      logger.warn('[front] 취소 시도 중단을 기록하지 못했습니다(다시 보내도록 503)', { cartId: cart.id, attemptId })
+      return res.status(503).json({ ok: false, error: '잠시 후 다시 시도해주세요.' })
     }
-    return res.status(409).json({ ok: false, error: '주문 상태가 맞지 않습니다.', status: cart.status })
   }
-  return res.json({ ok: true, alreadyProcessed: false, status: 'paid' })
+  const latest = await prisma.erpCart.findUnique({ where: { id: cart.id }, select: { status: true } })
+  if (latest?.status === 'refund_requested' || latest?.status === 'paid') {
+    return res.json({ ok: true, alreadyProcessed: true, status: latest.status })
+  }
+  return res.status(409).json({ ok: false, error: '주문 상태가 맞지 않습니다.', status: latest?.status })
 }))
 
 // 결제창을 띄우기 직전에 부른다. 이 주문을 이 프론트가 잡았다는 표시(paying)와 paymentKey를 남기고,
@@ -3440,9 +3595,9 @@ app.post('/api/front/erp-carts/:id/start', posIpFloodLimiter, posLimiter, requir
   }
   if (!claimed) {
     // 조회와 전이 사이에 다른 프론트가 먼저 잡았거나 전산이 취소했다. 또는 프론트가 이 paymentKey를 이미 포기한다고
-    // 알려(frontReleasedKey) 늦게 도착한 start가 거절된 경우다.
+    // 알려(묘비 목록 frontReleasedKey) 늦게 도착한 start가 거절된 경우다.
     const latest = await prisma.erpCart.findUnique({ where: { id: cart.id } })
-    if (latest?.frontReleasedKey === paymentKey) {
+    if (isReleasedToken(latest?.frontReleasedKey, paymentKey)) {
       return res.status(409).json({ ok: false, error: '이미 중단된 결제 시도입니다. 새 paymentKey로 다시 시도해주세요.', stale: true, status: latest.status })
     }
     return res.status(409).json({ ok: false, error: '결제할 수 없는 주문입니다(이미 결제 중이거나 끝났습니다).', status: latest?.status })
@@ -3538,25 +3693,60 @@ app.post('/api/front/erp-carts/:id/result', posIpFloodLimiter, posLimiter, requi
     return res.status(400).json({ ok: false, error: 'paymentKey가 올바르지 않습니다.' })
   }
 
+  // 다른 매장 주문·없는 주문은 404. 프론트 결제 건이 아니게 된 주문(POS로 되돌림)도 예전에는 404였는데, 'paid' 보고라면
+  // 받은 돈이 아무 흔적 없이 사라지므로 아래에서 대사 필요 409로 남긴다.
   const cart = await prisma.erpCart.findUnique({ where: { id: req.params.id } })
-  if (!cart || cart.storeId !== req.store.id || cart.payTarget !== 'front') {
+  if (!cart || cart.storeId !== req.store.id) {
     return res.status(404).json({ ok: false, error: '주문을 찾을 수 없습니다.' })
   }
 
   if (result === 'paid') {
-    // 프론트가 재시도했다(응답을 못 받았거나 재시작 후 복구). 같은 키로 이미 끝난 건이면 성공으로 돌려준다.
-    if (cart.status === 'paid' && cart.frontPaymentKey === paymentKey) {
-      return res.json({ ok: true, alreadyProcessed: true, status: 'paid' })
+    // 프론트가 재시도했다(응답을 못 받았거나 재시작 후 복구). 같은 키로 이미 끝난 건이면 성공으로 돌려준다. 그 뒤 취소가
+    // 요청·진행·완료된 주문도 같은 결제의 재보고라 성공으로 본다(대사할 결제가 아니다).
+    if (isSameFrontPayment(cart, paymentKey)) {
+      return res.json({ ok: true, alreadyProcessed: true, status: cart.status })
     }
     const payment = sanitizeFrontPayment(req.body?.payment)
-    const changed = await markErpCartFrontPaid(cart.id, paymentKey, JSON.stringify(payment), payment.approvalNumber)
+    const paymentJson = JSON.stringify(payment)
+    let changed = false
+    let afterRelease = false
+    if (cart.payTarget === 'front') {
+      changed = await markErpCartFrontPaid(cart.id, paymentKey, paymentJson, payment.approvalNumber)
+      if (!changed) {
+        // 풀린 시도(포기·시간 초과·직원의 [결제 중 풀기])의 승인 보고일 수 있다. 아무도 주문을 다시 잡지 않았으면(pending)
+        // 결제 완료로 받는다 -- 손님 돈은 이미 나갔고, 안 받으면 같은 주문의 결제창이 다시 떠 한 번 더 결제된다.
+        changed = await markErpCartFrontPaidAfterRelease(cart.id, req.store.id, paymentKey, paymentJson, payment.approvalNumber)
+        afterRelease = changed
+      }
+    }
     if (!changed) {
-      // 돈은 나갔는데 주문 상태가 맞지 않는다(다른 키로 잡혀 있거나 이미 다른 상태). 조용히 넘기면
-      // 아무도 모르는 결제가 생기므로 오류로 크게 남긴다 -- 관리자가 승인번호로 대사해야 한다.
-      logger.error('[front] 결제 완료 보고를 반영하지 못했습니다. 승인 내역과 대사가 필요합니다.', {
-        cartId: cart.id, status: cart.status, approvalNumber: payment.approvalNumber,
+      const latest = await prisma.erpCart.findUnique({ where: { id: cart.id } })
+      // 읽은 뒤 같은 보고의 재시도가 먼저 반영했다.
+      if (isSameFrontPayment(latest, paymentKey)) {
+        return res.json({ ok: true, alreadyProcessed: true, status: latest.status })
+      }
+      // 돈은 나갔는데 주문에 붙일 수 없다(POS로 되돌림·다른 키로 결제 중이거나 결제됨·지움·만료·전산 취소 등). 조용히 넘기면
+      // 아무도 모르는 결제가 생기므로 오류로 크게 남긴다 -- 관리자가 승인번호로 대사해야 한다. 전용 code로 프론트가 "완료 알림"
+      // 대신 "직원 확인 필요"를 띄우고 같은 주문의 결제를 다시 시작하지 않게 한다.
+      logger.error('[front] 결제가 승인됐지만 주문에 반영하지 못함. 대사 필요', {
+        cartId: cart.id,
+        status: latest?.status ?? null,
+        payTarget: latest?.payTarget ?? null,
+        paymentKey,
+        approvalNumber: payment.approvalNumber,
+        amount: cart.totalAmount,
       })
-      return res.status(409).json({ ok: false, error: '주문 상태가 맞지 않아 결제 완료를 기록하지 못했습니다.', status: cart.status })
+      return res.status(409).json({
+        ok: false,
+        code: 'PAID_AFTER_RELEASE',
+        status: latest?.status ?? null,
+        error: '결제는 승인됐지만 주문 상태가 맞지 않아 결제 완료로 기록하지 못했습니다. 직원 확인이 필요합니다.',
+      })
+    }
+    if (afterRelease) {
+      logger.warn('[front] 풀린 결제 시도의 승인 보고를 결제 완료로 반영했습니다', {
+        storeId: req.store.id, cartId: cart.id, referenceId: cart.referenceId, approvalNumber: payment.approvalNumber,
+      })
     }
     if (cart.deletedAt) {
       logger.warn('[front] 삭제했던 주문이 결제 완료로 확정되어 되살립니다', { storeId: req.store.id, cartId: cart.id, referenceId: cart.referenceId })
@@ -3600,29 +3790,34 @@ app.post('/api/front/erp-carts/:id/result', posIpFloodLimiter, posLimiter, requi
     return res.json({ ok: true, alreadyProcessed: false, status: 'paid', reservationCompleted, receipt })
   }
 
-  // cancelled/failed: 돈이 나가지 않았으므로 다시 결제할 수 있게 되돌린다.
+  // cancelled/failed: 돈이 나가지 않았으므로 다시 결제할 수 있게 되돌린다(되돌리면서 그 키를 묘비 목록에 남긴다).
   const note = result === 'failed'
     ? (trimmedString(req.body?.errorMessage, 500) || '프론트 결제 실패')
     : null
-  const released = await releaseErpCartFrontPaying(cart.id, paymentKey, note)
-  if (!released) {
-    if (cart.status === 'pending') {
-      // 되돌릴 게 없다: 같은 보고의 재시도로 이미 되돌려졌거나, 프론트가 /start 시간 초과로 포기를 먼저 알렸는데 그 /start가
-      // 아직 서버에 도착하지 않은 경우다. 뒤쪽을 그냥 200으로 끝내면 늦게 처리된 /start가 이 주문을 paying으로 잡아 프론트는
-      // 포기했는데 서버만 결제 중으로 영구히 갇힌다. 그래서 이 키를 묘비로 남겨 그 키의 /start를 거절한다.
-      const marked = await tombstoneErpCartFrontKey(cart.id, paymentKey)
-      if (!marked) {
-        // 읽은 직후 그 /start가 먼저 처리돼 paying이 됐다(같은 키). 이제는 정상적으로 되돌릴 수 있다.
-        const retried = await releaseErpCartFrontPaying(cart.id, paymentKey, note)
-        if (retried) return res.json({ ok: true, alreadyProcessed: false, status: 'pending' })
-        const latest = await prisma.erpCart.findUnique({ where: { id: cart.id }, select: { status: true } })
-        return res.status(409).json({ ok: false, error: '주문 상태가 맞지 않습니다.', status: latest?.status })
-      }
-      return res.json({ ok: true, alreadyProcessed: true, status: 'pending' })
-    }
-    return res.status(409).json({ ok: false, error: '주문 상태가 맞지 않습니다.', status: cart.status })
+  if (cart.payTarget !== 'front') {
+    // POS로 되돌린 주문이다(예전처럼 404). 포기한 키는 남겨 둔다 -- 다시 프론트로 넘어왔을 때 그 키의 늦은 /start가 잡지 못하게.
+    await recordErpCartFrontReleasedKey(cart.id, paymentKey)
+    return res.status(404).json({ ok: false, error: '주문을 찾을 수 없습니다.' })
   }
-  return res.json({ ok: true, alreadyProcessed: false, status: 'pending' })
+  const released = await releaseErpCartFrontPaying(cart.id, paymentKey, note)
+  if (released) return res.json({ ok: true, alreadyProcessed: false, status: 'pending' })
+
+  // 되돌릴 게 없다: 같은 보고의 재시도로 이미 되돌려졌거나, 프론트가 /start 시간 초과로 포기를 먼저 알렸는데 그 /start가 아직
+  // 서버에 도착하지 않았거나, 다른 키가 결제 중인 경우다. 그냥 끝내면 늦게 처리된 /start가 이 주문을 paying으로 잡아 프론트는
+  // 포기했는데 서버만 결제 중으로 갇힌다. 그래서 주문 상태와 관계없이 이 키를 묘비 목록에 남겨 그 키의 /start를 거절한다
+  // (지금 다른 키로 결제 중인 시도는 목록을 보지 않으므로 그대로 끝까지 결제된다).
+  const marked = await recordErpCartFrontReleasedKey(cart.id, paymentKey)
+  // 기록하기 직전에 그 /start가 먼저 처리돼 paying이 됐을 수 있다(같은 키) -- 이제는 정상적으로 되돌린다.
+  const retried = await releaseErpCartFrontPaying(cart.id, paymentKey, note)
+  if (retried) return res.json({ ok: true, alreadyProcessed: false, status: 'pending' })
+  if (!marked) {
+    // 기록하지 못한 채 200을 주면 프론트가 기록을 지우고, 늦은 /start가 결제 중으로 가둘 수 있다. 다시 보내게 한다.
+    logger.warn('[front] 결제 시도 중단을 기록하지 못했습니다(다시 보내도록 503)', { cartId: cart.id })
+    return res.status(503).json({ ok: false, error: '잠시 후 다시 시도해주세요.' })
+  }
+  const latest = await prisma.erpCart.findUnique({ where: { id: cart.id }, select: { status: true } })
+  if (latest?.status === 'pending') return res.json({ ok: true, alreadyProcessed: true, status: 'pending' })
+  return res.status(409).json({ ok: false, error: '주문 상태가 맞지 않습니다.', status: latest?.status })
 }))
 
 // --- 쉐보레 전산(ERP) "물건 담기" -> POS 플러그인 장바구니 중계 (POS-CART-BRIDGE §1) ---
@@ -3857,6 +4052,32 @@ function requirePromotionJobAuth(req, res, next) {
 const PROMO_BATCH_SIZE = 100
 const PROMO_TIME_BUDGET_MS = 50 * 1000
 const DEFAULT_PROMO_MAX_PER_RUN = 2000
+// 확실히 안 나간 자동 홍보(발송사 접수 거부 등)는 이만큼 뒤로 미뤄 다시 보낸다. 예전에는 claim만 풀어, promoAt이 그대로라
+// 같은 실행의 다음 묶음에서 또 맨 앞에 잡혔다 -- 거부되는 번호가 묶음 크기(100) 이상이면 매 묶음이 그 번호들로 꽉 차, 뒤의
+// 정상 대상은 실행 상한(건수·시간)이 끝날 때까지 한 번도 시도되지 않았다(매일 똑같이).
+const PROMO_DEFINITE_FAILURE_RETRY_MS = 24 * 60 * 60 * 1000
+// 이 기간에 같은 매장·번호로 자동 홍보가 이만큼 확실히 실패했으면 그 결제의 자동 홍보를 "보내지 않음"으로 닫는다.
+const PROMO_DEFINITE_FAILURE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
+const PROMO_DEFINITE_FAILURE_MAX = 3
+
+// 자동 홍보가 확실히 실패했다(지금 실패도 PromoSend 'failed'로 이미 남아 있다). 최근 실패가 상한에 이르렀으면 닫고, 아니면 하루 뒤로 미룬다.
+async function settleDefinitePromoFailure(payment) {
+  let failures = 0
+  try {
+    failures = await countRecentAutoPromoFailures(payment.storeId, payment.phone, new Date(Date.now() - PROMO_DEFINITE_FAILURE_WINDOW_MS))
+  } catch (e) {
+    // 세지 못하면 미루기만 한다(닫는 쪽은 되돌릴 수 없다).
+    logger.error('[promotion-job] 자동 홍보 실패 횟수 조회 실패', { paymentId: payment.id, error: e.message })
+  }
+  if (failures >= PROMO_DEFINITE_FAILURE_MAX) {
+    logger.warn('[promotion-job] 같은 번호로 자동 홍보가 계속 실패해 보내지 않음으로 닫습니다', {
+      paymentId: payment.id, storeId: payment.storeId, failures,
+    })
+    await skipDuePromotion(payment.id, payment.promoClaimedAt)
+    return
+  }
+  await postponeDuePromotion(payment.id, new Date(Date.now() + PROMO_DEFINITE_FAILURE_RETRY_MS), payment.promoClaimedAt)
+}
 
 // claimDuePromotions(limit=100)을 예전엔 하루 한 번 딱 한 번만 호출해서, 하루 대상자가 100명을
 // 넘으면 그 초과분은 영원히 밀렸다(다음 실행도 어차피 앞의 100명만 다시 훑고 지나감 — claim이
@@ -3943,9 +4164,8 @@ async function sendDuePromotions() {
           error: notifyError.message,
         })
         await finishPromoSend(claim.record.id, definite ? 'failed' : 'unknown')
-        // 확실히 안 나갔으면 다음 실행에서 다시 보낸다. 결과를 모르면(시간 초과 등) 나갔을 수 있으므로
-        // 보낸 것으로 닫는다 -- 같은 광고가 두 번 가는 쪽이 더 나쁘다.
-        if (definite) await releasePromoClaim(payment.id, payment.promoClaimedAt)
+        // 결과를 모르면(시간 초과 등) 나갔을 수 있으므로 보낸 것으로 닫는다 -- 같은 광고가 두 번 가는 쪽이 더 나쁘다.
+        if (definite) await settleDefinitePromoFailure(payment)
         else await markPromoSent(payment.id)
       }
     }

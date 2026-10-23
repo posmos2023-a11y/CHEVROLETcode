@@ -14,8 +14,19 @@
 // 정리 기능(리허설·테스트 기록용): [숨기기]는 이 목록과 정비 이력에서만 감춘다(맨 위 '숨긴 N건 보기'로 다시
 // 꺼낼 수 있다). [삭제]는 탭앱·오늘 현황·관리자 웹 어디에도 안 보이게 한다(서버는 행을 지우지 않는다 --
 // 실제 결제라 분쟁·대사 근거가 남아야 한다). [영수증 보내기]는 예약 손님 번호로 전자영수증을 (다시) 보낸다.
+//
+// POS에 담김(결제 전) 카드:
+//   - [POS에서 결제했어요]: 결제는 했는데 탭앱이 전산 주문과 맞추지 못한 경우(다른 POS 상품을 함께 결제, 같은 내용의
+//     주문이 둘, 할인 등). 이 단말기에 남겨 둔 '맞추지 못한 POS 결제'(erpCarts.js) 중 하나를 골라 결제 완료로 기록한다.
+//   - [담기 취소]: 잘못 담았을 때 전산 주문 목록으로 되돌린다. 서버는 담은 단말기에서만 받는다.
 import { posPluginSdk } from '@tossplace/pos-plugin-sdk'
-import { forgetLoadedCart, peekLoadedCartKeys } from './erpCarts.js'
+import {
+  forgetLoadedCart,
+  forgetPaidCart,
+  listUnmatchedPayments,
+  peekLoadedRecord,
+  removeUnmatchedPayment,
+} from './erpCarts.js'
 
 const listEl = document.getElementById('settled-cart-list')
 
@@ -33,6 +44,18 @@ const sdkCancelFailed = new Set()
 const sdkCancelTimedOut = new Set()
 // 프론트 취소(refunding)가 이 시간보다 오래 갇혀 있으면 [취소 중 풀기]를 보여준다. 서버가 같은 10분을 다시 확인한다.
 const STUCK_REFUND_MS = 10 * 60 * 1000
+// [POS에서 결제했어요]로 결제를 고르는 중인 카드와 고른 결제. 폴링이 목록을 다시 그려도 고르던 상태가 남아야 한다.
+let paidPicker = null // { cartId, selected: paymentId | null }
+// 서버가 "다른 단말기에서 담은 주문"이라며 담기 취소를 거절했지만, 이제는 여기서 되돌려도 된다고(canForceAfterSec 0)
+// 답한 카드. 이 카드에만 [그래도 되돌리기]를 따로 보여준다.
+const forceUnloadAllowed = new Set()
+// 단말기 시계와 서버 시계(loadedAt)가 어긋날 수 있어서, "담은 뒤의 결제"를 가를 때 이만큼 앞선 결제까지 넣는다.
+const CLOCK_SKEW_MS = 5 * 60 * 1000
+const NO_UNMATCHED_MESSAGE =
+  '이 단말기에는 전산 주문과 맞추지 못한 POS 결제가 없습니다. POS [주문]에서 이 주문이 결제됐는지 확인해주세요. ' +
+  '다른 단말기에서 결제했다면 그 단말기의 [최근 결제]에서 눌러주세요.'
+const DOUBLE_PAID_MESSAGE = '이 주문은 이미 다른 결제로 결제됐습니다. 이중 결제인지 POS [주문]에서 확인하세요.'
+const CLOSED_LABEL = { dismissed: '지워진', failed: '실패 처리된', cancelled: '취소된', refunded: '환불된', expired: '만료된' }
 
 export function initSettledCarts(injected) {
   deps = injected
@@ -126,13 +149,41 @@ function toolsFor(cart) {
   return parts.join('')
 }
 
+// 이 카드를 담은 뒤 이 단말기에서 생긴, 전산 주문과 맞추지 못한 POS 결제(최근 것부터). 담은 시각을 모르면 전부 보여준다.
+function unmatchedAfterLoad(cart) {
+  const since = Date.parse(cart.loadedAt || '')
+  const list = listUnmatchedPayments()
+  const after = Number.isFinite(since) ? list.filter((p) => p.at >= since - CLOCK_SKEW_MS) : list
+  return after.slice().sort((a, b) => b.at - a.at)
+}
+
+// 담기 취소 전에 "이미 결제됐을 수 있다"고 경고할지. 담은 뒤 맞추지 못한 결제가 있거나, 이 단말기 기록의 품목이
+// POS 장바구니에서 사라졌으면(결제로 비워졌을 수 있다) 경고한다. 결제된 주문을 되돌리면 다시 결제 대기가 되어
+// 두 번 결제될 수 있다.
+function mayAlreadyBePaid(cart) {
+  if (unmatchedAfterLoad(cart).length) return true
+  const record = peekLoadedRecord(cart.id)
+  return Boolean(record && record.goneAt)
+}
+
 function actionsFor(cart) {
   if (cart.status === 'refunded') return ''
 
-  // POS에 담았지만 아직 결제하지 않은 주문. 잘못 담았을 때 전산 주문 목록으로 되돌린다. 이 탭앱이 담은
-  // 품목(기록에 남은 key)은 POS [주문]에서도 함께 지운다(unloadCart).
+  // POS에 담았지만 결제 통보가 없는 주문. [POS에서 결제했어요]는 결제했는데 맞추지 못한 경우, [담기 취소]는 잘못 담았을 때
+  // 전산 주문 목록으로 되돌린다(이 탭앱이 담은 품목은 POS [주문]에서도 함께 지운다, unloadCart).
   if (cart.status === 'loaded') {
-    return button('unload', cart, '담기 취소(다시 대기로)', '정말 되돌릴까요? POS [주문]의 품목도 함께 지웁니다', 'wrap')
+    const unloadConfirm = mayAlreadyBePaid(cart)
+      ? '이미 결제됐을 수 있습니다. 결제했다면 [POS에서 결제했어요]를 누르세요. 그래도 되돌릴까요?'
+      : '정말 되돌릴까요? POS [주문]의 품목도 함께 지웁니다'
+    const parts = [
+      button('pos-paid', cart, 'POS에서 결제했어요', '결제한 내역을 고를까요?', 'wrap'),
+      button('unload', cart, '담기 취소(다시 대기로)', unloadConfirm, 'wrap'),
+    ]
+    if (forceUnloadAllowed.has(cart.id)) {
+      // 담은 단말기의 장바구니에는 품목이 그대로 남는다. 거기서 결제되면 이중 결제라 따로, 더 분명하게 묻는다.
+      parts.push(button('unload-force', cart, '그래도 되돌리기', '담은 단말기에서 결제하지 않았고 품목도 지웠나요?', 'danger wrap'))
+    }
+    return parts.join('')
   }
 
   // 'refunding'은 프론트 플러그인이 카드를 취소하는 중이라 손댈 게 없다. 10분 넘게 갇힌 경우만 풀 수 있다.
@@ -164,6 +215,38 @@ function actionsFor(cart) {
 
   if (cart.status === 'refund_requested') return button('front-withdraw', cart, '취소 요청 철회', '요청을 철회할까요?')
   return ''
+}
+
+// [POS에서 결제했어요]를 확인한 뒤 카드 안에 펼치는 고르기 칸. 직원이 POS [주문]의 결제 내역과 시각·금액·품목을
+// 맞춰 보고 고른다. 하나뿐이면 미리 골라 둔다(openPaidPicker).
+function pickerHtml(cart) {
+  if (!paidPicker || paidPicker.cartId !== cart.id || cart.status !== 'loaded') return ''
+  const id = deps.escapeHtml(cart.id)
+  const close = `<button class="settled-action paid-pick-close" type="button" data-cart-id="${id}">닫기</button>`
+  const options = unmatchedAfterLoad(cart)
+  if (!options.length) {
+    return `<div class="paid-picker"><div class="erp-cart-memo settled-warn">${deps.escapeHtml(NO_UNMATCHED_MESSAGE)}</div><div class="erp-cart-actions">${close}</div></div>`
+  }
+  const rows = options.map((p) => {
+    const selected = paidPicker.selected === p.paymentId
+    const titles = (p.titles || []).join(', ')
+    return `<button class="paid-pick-option${selected ? ' selected' : ''}" type="button" aria-pressed="${selected}"
+              data-cart-id="${id}" data-payment-id="${deps.escapeHtml(p.paymentId)}">
+              <span class="paid-pick-time">${formatTime(p.at)}</span>
+              <span class="paid-pick-amount">${p.amount === null ? '금액 확인 불가' : formatWon(p.amount)}</span>
+              <span class="paid-pick-titles">${titles ? deps.escapeHtml(titles) : '품목 확인 불가'}</span>
+            </button>`
+  }).join('')
+  const canSubmit = Boolean(paidPicker.selected) && options.some((p) => p.paymentId === paidPicker.selected) && !busy.has(cart.id)
+  return `
+    <div class="paid-picker">
+      <div class="paid-picker-title">이 단말기에서 전산 주문과 맞추지 못한 결제입니다. POS [주문]의 결제 시각·금액·품목과 맞춰 보고 이 주문의 결제를 골라주세요.</div>
+      ${rows}
+      <div class="erp-cart-actions">
+        <button class="settled-action paid-pick-submit" type="button" data-cart-id="${id}" ${canSubmit ? '' : 'disabled'}>이 결제로 기록</button>
+        ${close}
+      </div>
+    </div>`
 }
 
 function render() {
@@ -211,8 +294,10 @@ function render() {
           ${cart.status === 'refunded' && cart.refundNote ? `<div class="erp-cart-memo">${deps.escapeHtml(cart.refundNote)} · ${formatTime(cart.refundedAt)}</div>` : ''}
           ${cart.errorMessage && cart.status !== 'refunded' ? `<div class="erp-cart-memo settled-error">${deps.escapeHtml(cart.errorMessage)}</div>` : ''}
           ${sdkCancelTimedOut.has(cart.id) && cart.status === 'paid' ? '<div class="erp-cart-memo settled-warn">POS [주문]에서 이 결제가 취소됐는지 확인해주세요. 취소됐으면 [POS에서 취소했어요]를, 아니면 [결제 취소]를 다시 눌러주세요.</div>' : ''}
+          ${cart.status === 'loaded' && paidPicker?.cartId !== cart.id && unmatchedAfterLoad(cart).length ? '<div class="erp-cart-memo settled-warn">담은 뒤 이 단말기에서 전산 주문과 맞추지 못한 POS 결제가 있습니다. 이 주문을 결제했다면 [POS에서 결제했어요]를 눌러주세요.</div>' : ''}
           ${receipt ? `<div class="erp-cart-memo">${deps.escapeHtml(receipt)}</div>` : ''}
           ${actions ? `<div class="erp-cart-actions">${actions}</div>` : ''}
+          ${pickerHtml(cart)}
           ${tools ? `<div class="erp-cart-actions settled-tools">${tools}</div>` : ''}
         </article>
       `
@@ -224,6 +309,28 @@ function handleClick(e) {
   if (e.target.closest('[data-toggle-hidden]')) {
     showHidden = !showHidden
     render()
+    return
+  }
+  // [POS에서 결제했어요]의 고르기 칸. 결제를 고르는 것과 닫는 것은 한 번에 된다(되돌릴 수 있고 아무것도 보내지 않는다).
+  // 기록은 이미 두 번 눌러 확인한 뒤에 펼친 칸이라 [이 결제로 기록]은 한 번에 보낸다.
+  const option = e.target.closest('button.paid-pick-option')
+  if (option) {
+    const { cartId, paymentId } = option.dataset
+    if (paidPicker && paidPicker.cartId === cartId && !busy.has(cartId)) {
+      paidPicker = { cartId, selected: paymentId }
+      render()
+    }
+    return
+  }
+  const closeBtn = e.target.closest('button.paid-pick-close')
+  if (closeBtn) {
+    paidPicker = null
+    render()
+    return
+  }
+  const submitBtn = e.target.closest('button.paid-pick-submit')
+  if (submitBtn) {
+    if (!submitBtn.disabled) run('pos-paid-submit', submitBtn.dataset.cartId)
     return
   }
   const btn = e.target.closest('button.settled-action')
@@ -304,7 +411,10 @@ async function run(action, cartId) {
       markLocal([cartId], { status: 'paid' })
       return deps.notify('success', '취소 요청을 철회했습니다.')
     }
+    if (action === 'pos-paid') return openPaidPicker(cart)
+    if (action === 'pos-paid-submit') return await submitManualPaid(cart)
     if (action === 'unload') return await unloadCart(cartId)
+    if (action === 'unload-force') return await unloadCart(cartId, { force: true })
     if (action === 'force-release') {
       // 409(10분이 안 됐거나 이미 풀림)는 서버 문구를 그대로 보여준다.
       const res = await post(`/api/pos/erp-carts/${cartId}/force-release`)
@@ -318,10 +428,74 @@ async function run(action, cartId) {
   }
 }
 
+// [POS에서 결제했어요]를 두 번 눌러 확인한 뒤 부른다. 고를 결제가 없으면 칸을 펼치지 않고 안내한다.
+function openPaidPicker(cart) {
+  const record = peekLoadedRecord(cart.id)
+  if (record && record.paymentId) {
+    // 이 단말기가 이미 이 주문의 결제를 맞췄고 전산 통보만 밀려 있다. 다른 결제를 골라 기록하면 엉뚱한 결제로 남는다.
+    paidPicker = null
+    return deps.notify('error', '이 단말기에서 이 주문의 결제를 이미 확인했고 전산에 알리는 중입니다. 따로 기록하지 말고 잠시 기다려주세요.')
+  }
+  const options = unmatchedAfterLoad(cart)
+  if (!options.length) {
+    paidPicker = null
+    return deps.notify('error', NO_UNMATCHED_MESSAGE)
+  }
+  paidPicker = { cartId: cart.id, selected: options.length === 1 ? options[0].paymentId : null }
+}
+
+// 고른 POS 결제로 이 주문을 결제 완료로 기록한다(/paid, manual). 서버가 이미 다른 결제로 결제된 주문이라고 하면
+// 이중 결제를 확인하게 하고, 그 결제는 다른 주문에 쓸 수 있게 목록에 남긴다.
+async function submitManualPaid(cart) {
+  const picker = paidPicker && paidPicker.cartId === cart.id ? paidPicker : null
+  const payment = picker && unmatchedAfterLoad(cart).find((p) => p.paymentId === picker.selected)
+  if (!payment) return deps.notify('error', '기록할 결제를 먼저 골라주세요.')
+  // 고르는 사이 이 단말기가 그 주문의 결제를 자동으로 맞췄다면 그쪽이 맞다(openPaidPicker와 같은 이유).
+  const record = peekLoadedRecord(cart.id)
+  if (record && record.paymentId) {
+    paidPicker = null
+    return deps.notify('error', '이 단말기에서 이 주문의 결제를 이미 확인했고 전산에 알리는 중입니다. 따로 기록하지 말고 잠시 기다려주세요.')
+  }
+  const res = await post(`/api/pos/erp-carts/${cart.id}/paid`, { paymentId: payment.paymentId, orderId: payment.orderId, manual: true })
+  if (!res.ok) {
+    if (res.status === 401) return
+    const code = res.body && res.body.code
+    if (res.status === 409 && code === 'ALREADY_PAID_OTHER') {
+      paidPicker = null
+      return deps.notify('error', DOUBLE_PAID_MESSAGE)
+    }
+    if (res.status === 409 && code === 'ALREADY_CLOSED') {
+      paidPicker = null
+      const label = CLOSED_LABEL[res.body.status] || '닫힌'
+      return deps.notify('error', `전산에서 이미 ${label} 주문이라 기록하지 않았습니다. 실제로 결제했다면 POS [주문] 내역과 전산을 대조해주세요.`)
+    }
+    return deps.notify('error', res.body.error || '결제 완료로 기록하지 못했습니다. 잠시 후 다시 시도해주세요.')
+  }
+  removeUnmatchedPayment(payment.paymentId)
+  // 이 단말기에 남은 결제 대기 기록을 지운다 -- 남겨 두면 나중의 다른 결제와 또 맞을 수 있다.
+  forgetPaidCart(cart.id)
+  paidPicker = null
+  markLocal([cart.id], { status: 'paid', paidAt: new Date().toISOString(), tossPaymentId: payment.paymentId, tossOrderId: payment.orderId })
+  return deps.notify('success', '고른 POS 결제로 결제 완료를 기록했습니다.')
+}
+
 // 서버를 먼저 되돌리고(실패하면 POS 장바구니는 그대로 둔다) 그다음 이 탭앱이 담은 품목만 지운다. 지우기 전에
 // 장바구니를 읽어 아직 남아 있는 key만 지운다 -- 직원이 이미 지웠거나 결제로 비워진 품목을 다시 건드리지 않는다.
-async function unloadCart(cartId) {
-  const keys = peekLoadedCartKeys(cartId)
+//
+// 막는 경우와 서버가 거절하는 경우:
+//   - 이 단말기 기록에 결제(paymentId)가 붙어 있으면 요청하지 않는다. 결제는 끝났고 전산 통보만 밀린 건이라, 되돌리면
+//     받은 돈이 기록에서 사라지고 주문이 다시 결제 대기가 된다(다시 결제하면 이중 청구).
+//   - 담을 때의 표식(attemptId)을 함께 보낸다. 다른 단말기가 담은 주문이면 서버가 LOADED_ON_OTHER_DEVICE로 거절한다 --
+//     그 단말기의 장바구니와 결제 대기 기록은 그대로라서 거기서 결제되면 이중 결제다. 담은 단말기를 쓸 수 없어 충분히
+//     시간이 지났으면(canForceAfterSec 0) [그래도 되돌리기](force)를 따로 두 번 눌러 되돌릴 수 있다.
+//   - 담긴 지 24시간이 지난 주문은 되돌려도 전산 주문 목록에 다시 뜨지 않는다. 서버는 대신 주문을 닫고 status
+//     'dismissed'로 답한다. 이 단말기의 POS 품목은 그대로 지운다.
+async function unloadCart(cartId, { force = false } = {}) {
+  const record = peekLoadedRecord(cartId)
+  if (record && record.paymentId) {
+    return deps.notify('error', '이 단말기에서 이미 결제된 주문입니다. 전산에 결제 완료를 다시 알리는 중이니 담기 취소하지 마세요.')
+  }
+  const keys = record ? record.keys : []
   let present = []
   if (keys.length) {
     try {
@@ -332,10 +506,37 @@ async function unloadCart(cartId) {
       present = []
     }
   }
-  const res = await post(`/api/pos/erp-carts/${cartId}/unload`)
+  const body = {}
+  if (record && record.attemptId) body.attemptId = record.attemptId
+  if (force) body.force = true
+  const res = await post(`/api/pos/erp-carts/${cartId}/unload`, body)
+  if (!res.ok && res.status === 409 && res.body?.code === 'LOADED_ON_OTHER_DEVICE') {
+    const wait = Number(res.body.canForceAfterSec)
+    if (wait === 0) {
+      forceUnloadAllowed.add(cartId)
+      return deps.notify(
+        'error',
+        '다른 단말기에서 담은 주문입니다. 담은 단말기의 [최근 결제]에서 담기 취소하는 게 안전합니다. ' +
+        '그 단말기를 쓸 수 없으면, 거기서 결제하지 않았는지 확인하고 그 단말기의 품목을 지운 뒤 [그래도 되돌리기]를 눌러주세요.'
+      )
+    }
+    forceUnloadAllowed.delete(cartId)
+    const minutes = Number.isFinite(wait) && wait > 0 ? Math.ceil(wait / 60) : null
+    return deps.notify(
+      'error',
+      `다른 단말기에서 담은 주문입니다. 담은 단말기의 [최근 결제]에서 담기 취소해주세요.` +
+      (minutes ? ` 그 단말기를 쓸 수 없으면 약 ${minutes}분 뒤에 여기서도 되돌릴 수 있습니다.` : '')
+    )
+  }
   // 409인데 이미 pending이면 다른 단말기가 먼저 되돌린 것이다 -- 완료로 보고 이 단말기의 품목만 정리한다.
   const alreadyPending = res.status === 409 && res.body?.status === 'pending'
-  if (!res.ok && !alreadyPending) return deps.notify('error', res.body.error || '전산 주문 목록으로 되돌리지 못했습니다.')
+  if (!res.ok && !alreadyPending) {
+    if (res.status === 401) return
+    return deps.notify('error', res.body.error || '전산 주문 목록으로 되돌리지 못했습니다.')
+  }
+  const closedStale = res.ok && res.body?.status === 'dismissed'
+  forceUnloadAllowed.delete(cartId)
+  if (paidPicker && paidPicker.cartId === cartId) paidPicker = null
   lastCarts = lastCarts.filter((c) => c.id !== cartId)
   // 전산 주문 목록 쪽에 남은 "POS에 담는 중/결제 대기" 기록을 지우고 목록을 새로 불러온다(erpCarts.js).
   forgetLoadedCart(cartId)
@@ -347,17 +548,54 @@ async function unloadCart(cartId) {
       failed += 1
     }
   }
+  const head = closedStale
+    ? '담긴 지 24시간이 지나 주문을 닫았습니다. 다시 결제하려면 전산에서 다시 보내주세요.'
+    : '전산 주문 목록으로 되돌렸습니다.'
+  const kind = closedStale ? 'warn' : 'success'
   if (!present.length) {
-    return deps.notify('success', '전산 주문 목록으로 되돌렸습니다. POS [주문]에 이 품목이 남아 있으면 지워주세요.')
+    const where = force ? '담은 단말기의 POS [주문]에 품목이 남아 있으면 그 단말기에서 지워주세요.' : 'POS [주문]에 이 품목이 남아 있으면 지워주세요.'
+    return deps.notify(kind, `${head} ${where}`)
   }
   if (failed) {
-    return deps.notify('error', `전산 주문 목록으로 되돌렸지만 POS 품목 ${failed}개를 지우지 못했습니다. POS [주문]에서 직접 지워주세요.`)
+    return deps.notify('error', `${head} 다만 POS 품목 ${failed}개를 지우지 못했습니다. POS [주문]에서 직접 지워주세요.`)
   }
-  return deps.notify('success', 'POS [주문]에서 품목을 지우고 전산 주문 목록으로 되돌렸습니다.')
+  return deps.notify(kind, `${head} POS [주문]의 품목도 지웠습니다.`)
+}
+
+// 결제 취소 전에 POS 주문의 결제를 읽어 본다. 'paid' 이벤트는 결제 한 건마다 오고 payment.cancel도 결제 한 건만 취소한다.
+// 카드 여러 장으로 나눠 결제한 주문을 여기서 취소하면 한 장만 취소되는데 전산에는 전액 환불로 기록된다 -- 나머지 카드는
+// 청구된 채 남는다. 그래서 취소되지 않은 결제가 둘 이상이면 SDK 취소를 부르지 않고 POS [주문]에서 각각 취소하게 한다.
+// 결제를 읽지 못해도 같은 쪽(직접 취소)으로 보낸다 -- 확인 없이 한 장만 취소하는 것보다 직원이 한 번 더 하는 쪽이 싸다.
+async function readOrderPayments(orderId) {
+  try {
+    const order = await posPluginSdk.order.getOrder(orderId)
+    return Array.isArray(order && order.payments) ? order.payments : null
+  } catch (e) {
+    console.error('[settled-cart] 취소 전에 POS 주문을 읽지 못했습니다.', e?.message)
+    return null
+  }
 }
 
 async function cancelOnPos(cart) {
   sdkCancelTimedOut.delete(cart.id)
+  const payments = await readOrderPayments(cart.tossOrderId)
+  const live = payments ? payments.filter((p) => p && p.state !== 'CANCELLED') : null
+  if (!live) {
+    sdkCancelFailed.add(cart.id)
+    deps.notify('error', 'POS 주문의 결제 내역을 확인하지 못해 여기서 취소하지 않았습니다. POS [주문]에서 이 결제를 직접 취소한 뒤 [POS에서 취소했어요]를 눌러주세요.')
+    return
+  }
+  if (live.length > 1) {
+    sdkCancelFailed.add(cart.id)
+    deps.notify('error', '카드 여러 장으로 나눠 결제한 건입니다. POS [주문]에서 각각 취소한 뒤 [POS에서 취소했어요]를 눌러주세요.')
+    return
+  }
+  if (live.length === 0 || String(live[0].id) !== String(cart.tossPaymentId)) {
+    // 이미 취소됐거나, 남은 결제가 전산이 아는 결제와 다르다. 여기서 엉뚱한 결제를 취소하지 않는다.
+    sdkCancelFailed.add(cart.id)
+    deps.notify('error', 'POS의 결제 내역이 전산 기록과 다릅니다(이미 취소됐을 수 있습니다). POS [주문]에서 확인하고 취소한 뒤 [POS에서 취소했어요]를 눌러주세요.')
+    return
+  }
   try {
     await posPluginSdk.payment.cancel({ id: cart.tossOrderId }, { id: cart.tossPaymentId })
   } catch (e) {

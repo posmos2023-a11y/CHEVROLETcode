@@ -1328,6 +1328,7 @@ testSerial('결제: 이미 끝난(dismissed/failed/expired/cancelled) 주문에 
     }
     assert.equal(res.status, 409, status)
     assert.equal(res.body.status, status)
+    assert.equal(res.body.code, 'ALREADY_CLOSED')
     const call = calls.find((c) => c.message.includes('결제 통보가 끝난 주문에 왔습니다'))
     assert.ok(call, `${status}: 대사 필요 로그가 남지 않았다`)
     assert.equal(call.meta.cartId, cartId)
@@ -1347,11 +1348,202 @@ testSerial('결제: 삭제 표시가 남은 담김 주문이 결제 완료로 �
   assert.ok(queue.body.settledCarts.some((c) => c.id === cartId))
 })
 
+// logger의 한 수준(error/warn/info) 호출을 가로채 기록한다(대사 필요 로그가 실제로 남는지 확인하는 용도).
+async function captureLogger(level, fn) {
+  const logger = require('../src/logger')
+  const original = logger[level]
+  const calls = []
+  logger[level] = (message, meta) => { calls.push({ message, meta }) }
+  try { await fn() } finally { logger[level] = original }
+  return calls
+}
+
+// body를 실행하는 동안 erpCart[method]의 다음 호출 한 번이 끝난 직후 race()를 실행한다(그 사이 다른 요청이 끼어든 것처럼).
+// findUnique면 읽은 옛 값을, updateMany면 그 결과를 그대로 돌려준다. race 안의 호출은 원래대로 동작한다.
+async function withRaceAfterNext(method, race, body) {
+  const original = prisma.erpCart[method]
+  let fired = false
+  prisma.erpCart[method] = async (...args) => {
+    const result = await original.apply(prisma.erpCart, args)
+    if (!fired) {
+      fired = true
+      await race(result)
+    }
+    return result
+  }
+  try {
+    return await body()
+  } finally {
+    prisma.erpCart[method] = original
+  }
+}
+
+testSerial('결제: 이미 결제된 주문에 다른 결제 ID의 통보가 오면 409 ALREADY_PAID_OTHER와 대사 필요 로그, 같은 결제의 재시도는 처리됨', async () => {
+  const { store, cartId } = await loadedCart('paid-other')
+  assert.equal((await markPaid(store, cartId, { paymentId: 'pay-first' })).status, 200)
+
+  let res
+  const errors = await captureLogger('error', async () => {
+    res = await markPaid(store, cartId, { paymentId: 'pay-second', orderId: 'ord-second' })
+  })
+  assert.equal(res.status, 409, JSON.stringify(res.body))
+  assert.equal(res.body.code, 'ALREADY_PAID_OTHER')
+  assert.equal(res.body.status, 'paid')
+  const log = errors.find((c) => c.message.includes('이미 결제된 주문에 다른 결제 통보'))
+  assert.ok(log, '대사 필요 로그가 남지 않았다')
+  assert.equal(log.meta.storedPaymentId, 'pay-first')
+  assert.equal(log.meta.reportedPaymentId, 'pay-second')
+  assert.equal((await prisma.erpCart.findUnique({ where: { id: cartId } })).tossPaymentId, 'pay-first')
+
+  // 같은 결제의 재시도, 결제 ID 없이 보내는 옛 탭앱은 예전처럼 처리됨이다.
+  for (const body of [{ paymentId: 'pay-first' }, {}]) {
+    const again = await markPaid(store, cartId, body)
+    assert.equal(again.status, 200, JSON.stringify(again.body))
+    assert.equal(again.body.alreadyProcessed, true)
+  }
+})
+
+testSerial('결제: 결제 ID 없이 기록된 주문은 어떤 결제 ID가 와도 같은 결제로 본다(가릴 수 없다)', async () => {
+  const { store, cartId } = await loadedCart('paid-legacy-id')
+  assert.equal((await markPaid(store, cartId, {})).status, 200)
+  const res = await markPaid(store, cartId, { paymentId: 'pay-late' })
+  assert.equal(res.status, 200)
+  assert.equal(res.body.alreadyProcessed, true)
+})
+
+testSerial('결제: 읽은 직후 다른 통보가 먼저 결제로 기록했으면 같은 규칙으로 가르고, 그 사이 끝난 주문이면 409 ALREADY_CLOSED', async () => {
+  // 그 사이 다른 결제(pay-a)가 먼저 기록됐다 -- 이 통보(pay-b)는 이중 결제다.
+  const first = await loadedCart('paid-race-other')
+  let res = await withRaceAfterNext('findUnique', async () => {
+    assert.equal((await markPaid(first.store, first.cartId, { paymentId: 'pay-a' })).status, 200)
+  }, () => markPaid(first.store, first.cartId, { paymentId: 'pay-b' }))
+  assert.equal(res.status, 409, JSON.stringify(res.body))
+  assert.equal(res.body.code, 'ALREADY_PAID_OTHER')
+
+  // 같은 결제의 두 통보가 겹쳤다 -- 처리됨.
+  const second = await loadedCart('paid-race-same')
+  res = await withRaceAfterNext('findUnique', async () => {
+    assert.equal((await markPaid(second.store, second.cartId, { paymentId: 'pay-same' })).status, 200)
+  }, () => markPaid(second.store, second.cartId, { paymentId: 'pay-same' }))
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal(res.body.alreadyProcessed, true)
+
+  // 그 사이 주문이 끝났다(전산 취소 등) -- 예전에는 처리됨(ok)으로 답해 받은 돈이 흔적 없이 사라졌다.
+  for (const status of ['cancelled', 'dismissed', 'expired', 'failed', 'refunded']) {
+    const third = await loadedCart(`paid-race-closed-${status}`)
+    let closed
+    const errors = await captureLogger('error', async () => {
+      closed = await withRaceAfterNext('findUnique', async () => {
+        await prisma.erpCart.update({ where: { id: third.cartId }, data: { status } })
+      }, () => markPaid(third.store, third.cartId, { paymentId: 'pay-closed' }))
+    })
+    assert.equal(closed.status, 409, `${status}: ${JSON.stringify(closed.body)}`)
+    assert.equal(closed.body.code, 'ALREADY_CLOSED')
+    assert.equal(closed.body.status, status)
+    assert.ok(errors.some((c) => c.message.includes('결제 통보가 끝난 주문에 왔습니다')), `${status}: 대사 필요 로그가 남지 않았다`)
+  }
+})
+
+testSerial('결제: manual(직원이 손으로 맞춘 결제) 통보는 info 로그로 남기고 평소처럼 기록한다', async () => {
+  const { store, cartId } = await loadedCart('paid-manual')
+  let res
+  const infos = await captureLogger('info', async () => {
+    res = await markPaid(store, cartId, { paymentId: 'pay-manual', manual: true })
+  })
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal(res.body.status, 'paid')
+  const log = infos.find((c) => c.message.includes('직원이 손으로 확인한 POS 결제 통보'))
+  assert.ok(log)
+  assert.equal(log.meta.manual, true)
+  assert.equal(log.meta.reportedPaymentId, 'pay-manual')
+})
+
 // --- 담김 되돌리기(unload) ----------------------------------------------------
 
-function unloadCart(store, cartId) {
-  return request(app).post(`/api/pos/erp-carts/${cartId}/unload`).set('X-Store-Token', store.posToken).send({})
+function unloadCart(store, cartId, body = {}) {
+  return request(app).post(`/api/pos/erp-carts/${cartId}/unload`).set('X-Store-Token', store.posToken).send(body)
 }
+
+// attemptId를 실어 담은(새 탭앱) 주문
+async function loadedCartWithAttempt(label, attemptId) {
+  const store = await createStore(label)
+  assert.equal((await postCart(validBody(store))).status, 201)
+  const cartId = (await getPosCarts(store)).body.carts[0].id
+  assert.equal((await consumeCart(store, cartId, { result: 'loaded', attemptId })).body.alreadyProcessed, false)
+  return { store, cartId }
+}
+
+testSerial('담김 되돌리기: 담은 단말기(같은 attemptId)는 되돌리고, 다른 단말기는 409 LOADED_ON_OTHER_DEVICE', async () => {
+  const mine = 'attempt-unload-mine-1'
+  const { store, cartId } = await loadedCartWithAttempt('unload-attempt', mine)
+
+  for (const body of [{ attemptId: 'attempt-unload-other' }, {}, { force: true }]) {
+    const res = await unloadCart(store, cartId, body)
+    assert.equal(res.status, 409, JSON.stringify(res.body))
+    assert.equal(res.body.code, 'LOADED_ON_OTHER_DEVICE')
+    assert.equal(res.body.error, '다른 단말기에서 담은 주문입니다. 담은 단말기에서 취소해주세요.')
+    // 담은 지 30분이 지나야 억지로 되돌릴 수 있다.
+    assert.ok(res.body.canForceAfterSec > 1700 && res.body.canForceAfterSec <= 1800, `canForceAfterSec=${res.body.canForceAfterSec}`)
+  }
+  assert.equal((await prisma.erpCart.findUnique({ where: { id: cartId } })).status, 'loaded')
+
+  const res = await unloadCart(store, cartId, { attemptId: mine })
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal(res.body.status, 'pending')
+  const stored = await prisma.erpCart.findUnique({ where: { id: cartId } })
+  assert.equal(stored.status, 'pending')
+  assert.equal(stored.consumeAttemptId, null)
+  assert.equal((await unloadCart(store, cartId, { attemptId: 'bad id' })).status, 400)
+})
+
+testSerial('담김 되돌리기: 담은 지 30분이 지나면 다른 단말기도 force로 되돌릴 수 있고 경고 로그를 남긴다(force 없이는 여전히 409)', async () => {
+  const { store, cartId } = await loadedCartWithAttempt('unload-force', 'attempt-unload-force-1')
+  await prisma.erpCart.update({ where: { id: cartId }, data: { loadedAt: new Date(Date.now() - 31 * 60 * 1000) } })
+
+  const noForce = await unloadCart(store, cartId, { attemptId: 'attempt-unload-other' })
+  assert.equal(noForce.status, 409)
+  assert.equal(noForce.body.code, 'LOADED_ON_OTHER_DEVICE')
+  assert.equal(noForce.body.canForceAfterSec, 0)
+
+  let res
+  const warns = await captureLogger('warn', async () => {
+    res = await unloadCart(store, cartId, { attemptId: 'attempt-unload-other', force: true })
+  })
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal(res.body.status, 'pending')
+  assert.ok(warns.some((c) => c.message.includes('다른 단말기에서 담은 주문을 직원이 확인하고 되돌림')))
+  assert.equal((await prisma.erpCart.findUnique({ where: { id: cartId } })).status, 'pending')
+})
+
+testSerial('담김 되돌리기: 확인한 직후 다른 단말기가 되돌렸다 다시 담았으면 그 담기를 건드리지 않는다(시도 조건이 전이 안에 있다)', async () => {
+  const mine = 'attempt-unload-race-1'
+  const { store, cartId } = await loadedCartWithAttempt('unload-race', mine)
+  const res = await withRaceAfterNext('findUnique', async () => {
+    // 같은 단말기의 다른 화면이 먼저 되돌렸고, 다른 단말기가 곧바로 다시 담았다.
+    await prisma.erpCart.update({ where: { id: cartId }, data: { status: 'pending', loadedAt: null, consumeAttemptId: null } })
+    assert.equal((await consumeCart(store, cartId, { result: 'loaded', attemptId: 'attempt-unload-race-2' })).body.alreadyProcessed, false)
+  }, () => unloadCart(store, cartId, { attemptId: mine }))
+  assert.equal(res.status, 409, JSON.stringify(res.body))
+  assert.equal(res.body.code, 'LOADED_ON_OTHER_DEVICE')
+  const stored = await prisma.erpCart.findUnique({ where: { id: cartId } })
+  assert.equal(stored.status, 'loaded')
+  assert.equal(stored.consumeAttemptId, 'attempt-unload-race-2')
+})
+
+testSerial('담김 되돌리기: 접수 후 24시간이 지난 담김 주문은 보이지 않는 pending 대신 dismissed로 닫는다', async () => {
+  const mine = 'attempt-unload-stale-1'
+  const { store, cartId } = await loadedCartWithAttempt('unload-stale', mine)
+  await prisma.erpCart.update({ where: { id: cartId }, data: { createdAt: new Date(Date.now() - 25 * 60 * 60 * 1000) } })
+  const res = await unloadCart(store, cartId, { attemptId: mine })
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.deepEqual(res.body, { ok: true, status: 'dismissed' })
+  const stored = await prisma.erpCart.findUnique({ where: { id: cartId } })
+  assert.equal(stored.status, 'dismissed')
+  assert.equal(stored.errorMessage, '담긴 채 24시간이 지나 매장에서 되돌림')
+  assert.equal((await getPosCarts(store)).body.carts.length, 0)
+  // 다시 보내도 상태는 그대로(이미 pending이 아니다)
+  assert.equal((await unloadCart(store, cartId, { attemptId: mine })).status, 409)
+})
 
 testSerial('담김 되돌리기: loaded 주문이 pending으로 돌아가 POS 목록에 다시 뜨고 다시 담을 수 있다', async () => {
   const { store, cartId } = await loadedCart('unload-basic')
@@ -1425,6 +1617,48 @@ testSerial('담기 시도: 재시도가 받은 alreadyProcessed가 자기 첫 �
   const again = await consumeCart(store, second, { result: 'loaded', attemptId: mine })
   assert.equal(again.body.alreadyProcessed, true)
   assert.equal(again.body.ownAttempt, false)
+})
+
+testSerial('담기 시도: 자기가 담아 결제까지 끝난 주문에 담기를 다시 보내도 ownAttempt true(다른 단말기 처리로 오인하지 않는다)', async () => {
+  const mine = 'attempt-consume-paid-1'
+  const { store, cartId } = await loadedCartWithAttempt('consume-attempt-paid', mine)
+  assert.equal((await markPaid(store, cartId, { paymentId: 'pay-own' })).status, 200)
+  const retry = await consumeCart(store, cartId, { result: 'loaded', attemptId: mine })
+  assert.equal(retry.body.alreadyProcessed, true)
+  assert.equal(retry.body.status, 'paid')
+  assert.equal(retry.body.ownAttempt, true)
+  // 결제 취소까지 끝난 뒤에도 같다.
+  assert.equal((await request(app).post(`/api/pos/erp-carts/${cartId}/refunded`).set('X-Store-Token', store.posToken).send({ method: 'pos' })).status, 200)
+  const afterRefund = await consumeCart(store, cartId, { result: 'loaded', attemptId: mine })
+  assert.equal(afterRefund.body.status, 'refunded')
+  assert.equal(afterRefund.body.ownAttempt, true)
+  // 다른 시도는 여전히 false
+  assert.equal((await consumeCart(store, cartId, { result: 'loaded', attemptId: 'attempt-consume-paid-2' })).body.ownAttempt, false)
+})
+
+testSerial('담기: 읽은 직후 다른 단말기가 [프론트로 결제 요청]으로 넘기면 담지 않고 409(payTarget front)로 답한다', async () => {
+  const store = await createStore('consume-front-race')
+  assert.equal((await postCart(validBody(store))).status, 201)
+  const cartId = (await getPosCarts(store)).body.carts[0].id
+  const res = await withRaceAfterNext('findUnique', async () => {
+    const sent = await request(app).post(`/api/pos/erp-carts/${cartId}/send-to-front`).set('X-Store-Token', store.posToken)
+    assert.equal(sent.status, 200, JSON.stringify(sent.body))
+  }, () => consumeCart(store, cartId, { result: 'loaded', attemptId: 'attempt-front-race-1' }))
+  assert.equal(res.status, 409, JSON.stringify(res.body))
+  assert.equal(res.body.payTarget, 'front')
+  const stored = await prisma.erpCart.findUnique({ where: { id: cartId } })
+  // 예전에는 loaded·front 주문이 생겨 POS 결제 통보도 담기 취소도 받지 못하는 채로 갇혔다.
+  assert.equal(stored.status, 'pending')
+  assert.equal(stored.payTarget, 'front')
+  assert.equal(stored.consumeAttemptId, null)
+
+  // 지우기·실패 보고도 같은 이유로 프론트 건을 건드리지 않는다.
+  for (const result of ['dismissed', 'failed']) {
+    const { markErpCartDismissed, markErpCartFailed } = require('../src/store')
+    const changed = result === 'dismissed' ? await markErpCartDismissed(cartId, 'x', 'pos') : await markErpCartFailed(cartId, 'x')
+    assert.equal(changed, false, result)
+  }
+  assert.equal((await prisma.erpCart.findUnique({ where: { id: cartId } })).status, 'pending')
 })
 
 testSerial('담기 시도: attemptId 형식이 틀리면 400이고 아무것도 바뀌지 않는다', async () => {

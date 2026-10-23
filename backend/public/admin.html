@@ -993,11 +993,17 @@ async function previewPromoCampaign() {
   const optOutWarn = body.optOutConfigured
     ? ''
     : '<p class="testform-msg err">수신거부 안내가 기본 문구("매장으로 연락")입니다. 080 무료수신거부 번호처럼 손님에게 비용이 들지 않는 방법을 서버 설정 PROMO_OPT_OUT_TEXT에 넣어 주세요.</p>'
+  // 시연 모드가 30일 제한을 푸는 곳은 정비 이력의 차량별 수동 발송뿐이다. 이 화면(기간 발송)과 자동 홍보는 켜져 있어도
+  // 30일 제한이 그대로라, "바로 다시 보낼 수 있다"고 쓰면 직원이 같은 번호에 다시 보내려다 헷갈린다.
+  // 켜기는 본사 관리자만 할 수 있다(서버가 매장 관리자의 켜기를 403으로 막는다) -- 매장 관리자에게는 켜져 있을 때 끄기만 보인다.
+  const demoButton = body.demoMode
+    ? '<button id="promo-demo-btn" type="button" data-enable="0">시연 모드 끄기</button>'
+    : (adminRole === 'store_admin' ? '' : '<button id="promo-demo-btn" type="button" data-enable="1">시연 모드 켜기(오늘 자정까지)</button>')
   const demoLine = `<div class="testform-body" style="align-items:center;${body.demoMode ? 'background:#fff6e5;border-radius:8px;padding:6px 10px;' : ''}">
       <span style="font-size:12px;">시연 모드: ${body.demoMode
-        ? `<strong>켜짐</strong> — 같은 번호로 바로 다시 보낼 수 있습니다(${escapeHtml(fmtDate(body.demoUntil))}에 저절로 꺼짐)`
+        ? `<strong>켜짐</strong> — 정비 이력의 차량별 수동 발송만 30일 제한이 꺼집니다. 기간 발송·자동 홍보는 그대로 30일 제한입니다(${escapeHtml(fmtDate(body.demoUntil))}에 저절로 꺼짐)`
         : '꺼짐 — 같은 번호에는 30일에 한 번만 보냅니다'}</span>
-      <button id="promo-demo-btn" type="button" data-enable="${body.demoMode ? '0' : '1'}">${body.demoMode ? '시연 모드 끄기' : '시연 모드 켜기(오늘 자정까지)'}</button>
+      ${demoButton}
     </div>`
   promoResult.innerHTML = `
     ${demoLine}
@@ -1078,18 +1084,19 @@ async function sendPromoCampaign() {
   setPromoMsg(promoSummary(t, remaining, stopReason), clean ? 'ok' : 'err')
 }
 
-// 시연 모드: 켜면 그날 자정까지 이 매장의 30일 재발송 제한이 꺼진다(서버가 자정에 저절로 끈다).
+// 시연 모드: 켜면 그날 자정까지 이 매장의 정비 이력 차량별 수동 발송에서만 30일 재발송 제한이 꺼진다(서버가 자정에 저절로
+// 끈다). 기간 발송·자동 홍보는 켜져 있어도 30일 제한을 그대로 건다.
 async function togglePromoDemo(enable) {
   const storeId = promoTargetStoreId()
   if (!storeId || promoSending) return
-  if (enable && !window.confirm('시연 모드를 켜면 오늘 자정까지 이 매장의 "같은 번호 30일 내 재발송 금지"가 꺼집니다.\n수신 동의·수신거부·야간 금지는 그대로입니다. 켤까요?')) return
+  if (enable && !window.confirm('시연 모드를 켜면 오늘 자정까지 이 매장의 정비 이력 차량별 수동 발송에서만 "같은 번호 30일 내 재발송 금지"가 꺼집니다.\n기간 발송·자동 홍보는 그대로 30일 제한이고, 수신 동의·수신거부·야간 금지도 그대로입니다. 켤까요?')) return
   const { ok, body } = await promoRequest('POST', '/api/admin/promo-demo-mode', { storeId, enabled: enable })
   if (!ok) {
     setPromoMsg(body.error || '시연 모드를 바꾸지 못했습니다.', 'err')
     return
   }
   await previewPromoCampaign()
-  setPromoMsg(body.demoMode ? '시연 모드를 켰습니다. 오늘 자정에 저절로 꺼집니다.' : '시연 모드를 껐습니다.', 'ok')
+  setPromoMsg(body.demoMode ? '시연 모드를 켰습니다(정비 이력의 차량별 수동 발송만). 오늘 자정에 저절로 꺼집니다.' : '시연 모드를 껐습니다.', 'ok')
 }
 
 async function registerPromoOptOut() {

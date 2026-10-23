@@ -879,6 +879,7 @@ async function skipDuePromotion(id, claimedAt) {
 }
 
 // 30일 안에 다른 경로로 광고를 받은 번호면 자동 홍보를 그 30일이 끝날 때까지 미룬다.
+// 확실히 안 나간 발송(발송사 접수 거부 등)도 하루 뒤로 미룬다(server.js sendDuePromotions).
 async function postponeDuePromotion(id, until, claimedAt) {
   try {
     await prisma.payment.updateMany({
@@ -888,6 +889,12 @@ async function postponeDuePromotion(id, until, claimedAt) {
   } catch {
     // releasePromoClaim과 같은 이유로 삼킨다.
   }
+}
+
+// 이 매장·번호로 since 이후 자동 홍보가 확실히 실패한(PromoSend via 'auto', status 'failed') 횟수. 발송사가 계속 거부하는
+// 번호는 몇 번 미뤄도 똑같이 실패하므로, 호출부가 이 횟수로 그만 보낼지 정한다.
+function countRecentAutoPromoFailures(storeId, phone, since) {
+  return prisma.promoSend.count({ where: { storeId, phone, via: 'auto', status: 'failed', sentAt: { gte: since } } })
 }
 
 // 자동 홍보를 한 번 보낸 뒤, 같은 매장·같은 번호의 다른 결제(분할 결제, 취소 후 재결제 등 같은 방문)가 곧
@@ -1115,31 +1122,78 @@ function listFrontErpCartsForPos(storeId, limit) {
   })
 }
 
+// --- 포기한 시도 기록(묘비) 목록 -----------------------------------------------------------
+//
+// frontReleasedKey(프론트 결제 paymentKey)와 refundReleasedAttemptId(프론트 취소 attemptId)는 "이 시도는 접었다"고 기록된
+// 값의 목록이다. 예전에는 한 칸이라 다음 포기 기록이 앞의 것을 덮어써, 앞 시도의 늦은 /start·refund-start가 다시 주문을
+// 잡아 프론트는 포기했는데 서버만 결제 중·취소 중으로 갇혔다. 그래서 최근 RELEASED_TOKEN_LIMIT개를 쉼표로 이어 같은 컬럼에
+// 둔다(새 컬럼이 필요 없고, 옛 한 칸 값은 한 개짜리 목록으로 그대로 읽힌다).
+// 쉼표를 구분자로 쓸 수 있는 이유: 두 값 모두 서버가 /^[A-Za-z0-9_-]{8,64}$/로 검사한 뒤에만 들어온다(server.js
+// FRONT_PAYMENT_KEY_RE·ATTEMPT_ID_RE) -- 값 안에 쉼표가 있을 수 없다.
+// 목록을 바꾸는 쪽(기록)과 목록으로 거르는 쪽(/start·refund-start) 모두 "읽은 목록 값 그대로일 때만" 바꾸는 updateMany를 쓴다.
+// /start가 목록을 읽은 뒤 그 키가 기록되면 /start의 전이가 실패하고, 다시 읽어 그 키를 보고 거절한다 -- 확인과 전이가 원자적이다.
+const RELEASED_TOKEN_LIMIT = 10
+const RELEASED_TOKEN_SEPARATOR = ','
+
+function parseReleasedTokens(value) {
+  return value ? String(value).split(RELEASED_TOKEN_SEPARATOR).filter(Boolean) : []
+}
+
+// 이 값이 포기한 시도 목록에 있는지. token이 없으면(옛 클라이언트) 늘 false.
+function isReleasedToken(value, token) {
+  return Boolean(token) && parseReleasedTokens(value).includes(token)
+}
+
+// 목록 끝에 token을 더한다(이미 있으면 끝으로 옮긴다). 최근 RELEASED_TOKEN_LIMIT개만 남긴다.
+function appendReleasedToken(value, token) {
+  if (!token) return value ?? null
+  const tokens = parseReleasedTokens(value).filter((t) => t !== token)
+  tokens.push(token)
+  return tokens.slice(-RELEASED_TOKEN_LIMIT).join(RELEASED_TOKEN_SEPARATOR)
+}
+
+// field(묘비 목록 컬럼)가 읽은 값 그대로일 때만 바꾼다. build(current)가 { where, data }를 돌려주면 그 조건에 "목록이 읽은 값
+// 그대로"를 더해 updateMany 하고, 'done'이면 바꿀 것 없이 성공, null이면 조건이 안 맞아 실패다. 목록만 그 사이 바뀌어
+// 실패했으면 다시 읽어 몇 번 더 시도하고, 다른 조건(상태 등) 때문에 실패했으면 바로 끝낸다. 반환: 바꿨는지
+const RELEASED_LIST_CAS_ATTEMPTS = 5
+
+async function updateErpCartWithReleasedList(id, field, build) {
+  for (let i = 0; i < RELEASED_LIST_CAS_ATTEMPTS; i += 1) {
+    const row = await prisma.erpCart.findUnique({ where: { id }, select: { [field]: true } })
+    if (!row) return false
+    const current = row[field] ?? null
+    const args = build(current)
+    if (args === 'done') return true
+    if (!args) return false
+    const result = await prisma.erpCart.updateMany({ where: { ...args.where, id, [field]: current }, data: args.data })
+    if (result.count > 0) return true
+    const after = await prisma.erpCart.findUnique({ where: { id }, select: { [field]: true } })
+    if (!after || (after[field] ?? null) === current) return false
+  }
+  return false
+}
+
 // 프론트가 결제창을 띄우기 직전에 이 주문을 "결제 중"으로 잡는다. pending -> paying 전이가
 // 원자적이라 프론트가 두 대여도 한 대만 잡는다(나머지는 count 0을 받는다).
 // paymentKey를 함께 박아두고, 이후 결과 보고는 이 값이 맞을 때만 받는다.
-// frontReleasedKey가 이 키와 같으면 거절한다 -- 프론트가 이미 "이 키는 포기"라고 알린 /start가 늦게 도착한 경우다.
-// OR로 쓴 이유: { not: paymentKey }만 쓰면 SQL에서 NULL <> 'x'가 NULL이라 묘비가 없는(NULL) 행이 통째로 빠져
-// 평범한 /start가 전부 거절된다.
+// 포기한 키 목록(frontReleasedKey)에 이 키가 있으면 거절한다 -- 프론트가 이미 "이 키는 포기"라고 알린 /start가 늦게 도착한 경우다.
+// 목록 확인은 updateErpCartWithReleasedList가 전이와 한 번에 한다(위 주석).
 async function markErpCartFrontPaying(id, storeId, paymentKey) {
-  const result = await prisma.erpCart.updateMany({
-    where: {
-      id, storeId, payTarget: 'front', status: 'pending',
-      OR: [{ frontReleasedKey: null }, { frontReleasedKey: { not: paymentKey } }],
-    },
+  return updateErpCartWithReleasedList(id, 'frontReleasedKey', (released) => (isReleasedToken(released, paymentKey) ? null : {
+    where: { storeId, payTarget: 'front', status: 'pending' },
     data: { status: 'paying', frontPaymentKey: paymentKey, frontPayingAt: new Date(), errorMessage: null },
-  })
-  return result.count > 0
+  }))
 }
 
-// /start보다 먼저 도착한 cancelled/failed 보고를 기록한다(묘비). pending일 때만 -- 이미 paying이 됐다면 호출부가
-// releaseErpCartFrontPaying으로 정상 해제해야 한다. 반환: 기록됐는지.
-async function tombstoneErpCartFrontKey(id, paymentKey) {
-  const result = await prisma.erpCart.updateMany({
-    where: { id, status: 'pending' },
-    data: { frontReleasedKey: paymentKey },
-  })
-  return result.count > 0
+// 프론트가 포기한(cancelled/failed, /start 시간 초과 뒤의 cancelled 포함) 결제 키를 묘비 목록에 남긴다. 주문 상태와 관계없이
+// 남긴다 -- 예전에는 pending일 때만 남겨, 다른 키가 paying을 쥐고 있을 때 온 포기 보고는 기록 없이 끝났고 그 키의 늦은 /start가
+// 나중에 주문을 잡았다. 지금 paying을 쥔 키의 완료(markErpCartFrontPaid)는 목록을 보지 않으므로 막지 않는다.
+// 반환: 기록됐는지(이미 있으면 true)
+async function recordErpCartFrontReleasedKey(id, paymentKey) {
+  return updateErpCartWithReleasedList(id, 'frontReleasedKey', (released) => (isReleasedToken(released, paymentKey) ? 'done' : {
+    where: {},
+    data: { frontReleasedKey: appendReleasedToken(released, paymentKey) },
+  }))
 }
 
 // 직원이 10분 넘게 갇힌 결제 중/취소 중을 푸는 비상구(POST /api/pos/erp-carts/:id/force-release)가 쓰는 기준 시간.
@@ -1147,40 +1201,42 @@ async function tombstoneErpCartFrontKey(id, paymentKey) {
 // 풀어 이중결제가 날 수 있고, 너무 길면 갇힌 매장이 영업 중에 기다려야 한다.
 const FORCE_RELEASE_AFTER_MS = 10 * 60 * 1000
 
-// 갇힌 프론트 결제 중(paying)을 pending으로 푼다. 옛 paymentKey를 frontReleasedKey에 남겨 그 키의 늦은 /start·/result가
-// 다시 이 주문을 잡거나 덮지 못하게 한다. 늦은 'paid' 보고는 markErpCartFrontPaid가 거절하고 호출부가 대사 필요로 남긴다.
+// 갇힌 프론트 결제 중(paying)을 pending으로 푼다. 옛 paymentKey를 묘비 목록(frontReleasedKey)에 더해 그 키의 늦은 /start가
+// 다시 이 주문을 잡지 못하게 한다. 그 키의 늦은 'paid' 보고는 아무도 주문을 다시 잡지 않았다면(pending) 결제 완료로 받고
+// (markErpCartFrontPaidAfterRelease -- 실제로 돈이 나갔다), 그 밖에는 호출부가 대사 필요로 남긴다.
 // frontPaymentKey까지 where에 넣어, 읽은 뒤 다른 시도가 끼어든 경우를 건드리지 않는다.
 async function forceReleaseErpCartFrontPaying(id, storeId, paymentKey, note) {
-  const result = await prisma.erpCart.updateMany({
-    where: { id, storeId, status: 'paying', frontPaymentKey: paymentKey },
-    data: { status: 'pending', frontPaymentKey: null, frontPayingAt: null, frontReleasedKey: paymentKey, errorMessage: note },
-  })
-  return result.count > 0
+  return updateErpCartWithReleasedList(id, 'frontReleasedKey', (released) => ({
+    where: { storeId, status: 'paying', frontPaymentKey: paymentKey },
+    data: { status: 'pending', frontPaymentKey: null, frontPayingAt: null, frontReleasedKey: appendReleasedToken(released, paymentKey), errorMessage: note },
+  }))
 }
 
-// 갇힌 프론트 취소 중(refunding)을 paid로 푼다. 옛 attemptId를 refundReleasedAttemptId에 남겨 그 시도의 늦은 refund-start가
-// 다시 잡지 못하게 한다. (이미 카드 취소가 끝났다면 토스 취소 웹훅이 refunded로 맞춘다.)
+// 갇힌 프론트 취소 중(refunding)을 paid로 푼다. 옛 attemptId를 묘비 목록(refundReleasedAttemptId)에 더해 그 시도의 늦은
+// refund-start가 다시 잡지 못하게 한다. (이미 카드 취소가 끝났다면 토스 취소 웹훅이 refunded로 맞춘다.)
 async function forceReleaseErpCartRefunding(id, storeId, attemptId, note) {
-  const result = await prisma.erpCart.updateMany({
-    where: { id, storeId, status: 'refunding', refundAttemptId: attemptId ?? null },
+  return updateErpCartWithReleasedList(id, 'refundReleasedAttemptId', (released) => ({
+    where: { storeId, status: 'refunding', refundAttemptId: attemptId ?? null },
     data: {
       status: 'paid', refundRequestedAt: null, refundStartedAt: null, errorMessage: note,
-      // 옛 프론트가 잡은 취소(attemptId 없음)면 이전에 접은 시도의 기록을 지우지 않는다.
-      ...(attemptId ? { refundReleasedAttemptId: attemptId } : {}),
+      // 옛 프론트가 잡은 취소(attemptId 없음)면 목록에 더할 것이 없다(이전에 접은 시도의 기록은 그대로 둔다).
+      ...(attemptId ? { refundReleasedAttemptId: appendReleasedToken(released, attemptId) } : {}),
     },
-  })
-  return result.count > 0
+  }))
 }
 
 // 손님이 결제창을 닫았거나 승인이 실패했다 -- 돈이 나가지 않았으므로 다시 결제할 수 있게
 // pending으로 되돌린다. paymentKey가 맞을 때만 되돌린다. 서버가 시간 기준으로 알아서 되돌리지는
 // 않는다: 프론트가 보고를 못 했을 뿐 실제로는 승인됐을 수 있어서, 되돌리면 이중결제가 된다.
+// 되돌리면서 그 키를 묘비 목록에 더한다 -- 같은 키의 /start가 재전송되어 늦게 도착해도 다시 잡지 못한다.
 async function releaseErpCartFrontPaying(id, paymentKey, errorMessage) {
-  const result = await prisma.erpCart.updateMany({
-    where: { id, status: 'paying', frontPaymentKey: paymentKey },
-    data: { status: 'pending', frontPaymentKey: null, frontPayingAt: null, errorMessage: errorMessage ?? null },
-  })
-  return result.count > 0
+  return updateErpCartWithReleasedList(id, 'frontReleasedKey', (released) => ({
+    where: { status: 'paying', frontPaymentKey: paymentKey },
+    data: {
+      status: 'pending', frontPaymentKey: null, frontPayingAt: null, errorMessage: errorMessage ?? null,
+      frontReleasedKey: appendReleasedToken(released, paymentKey),
+    },
+  }))
 }
 
 // 프론트에서 승인이 끝났다는 보고. paying + 같은 paymentKey일 때만 paid로 넘긴다.
@@ -1192,6 +1248,27 @@ async function markErpCartFrontPaid(id, paymentKey, paymentJson, approvalNo) {
     data: { status: 'paid', paidAt: new Date(), frontPaymentJson: paymentJson ?? null, frontApprovalNo: approvalNo ?? null, deletedAt: null },
   })
   return result.count > 0
+}
+
+// 풀린(포기·시간 초과·직원 풀기) 결제 키의 승인 보고. 프론트가 승인 직후 꺼져 보고를 못 했고, 그 사이 직원이 [결제 중 풀기]를
+// 눌렀거나 포기 보고가 먼저 처리된 경우다. 손님 돈은 이미 나갔으므로, 아직 아무도 이 주문을 다시 잡지 않았다면(프론트 대기
+// pending) 결제 완료로 받는다 -- 안 받으면 주문이 다시 결제 대기로 떠 손님이 한 번 더 결제한다. 그 키가 묘비 목록에 있을
+// 때만 받는다(목록에 없는 키는 이 주문에서 결제창이 뜬 적이 없다). 데이터는 markErpCartFrontPaid와 같고 frontPaymentKey도 채운다.
+// 반환: 반영했는지
+async function markErpCartFrontPaidAfterRelease(id, storeId, paymentKey, paymentJson, approvalNo) {
+  try {
+    return await updateErpCartWithReleasedList(id, 'frontReleasedKey', (released) => (isReleasedToken(released, paymentKey) ? {
+      where: { storeId, payTarget: 'front', status: 'pending', frontPaymentKey: null },
+      data: {
+        status: 'paid', paidAt: new Date(), frontPaymentKey: paymentKey,
+        frontPaymentJson: paymentJson ?? null, frontApprovalNo: approvalNo ?? null, deletedAt: null,
+      },
+    } : null))
+  } catch (e) {
+    // 같은 paymentKey가 다른 주문에 쓰여 있다(unique) -- 이 주문에 붙일 수 없으므로 호출부가 대사 필요로 남긴다.
+    if (e?.code === 'P2002') return false
+    throw e
+  }
 }
 
 // --- 토스 결제내역 매핑 -------------------------------------------------------------
@@ -1389,12 +1466,13 @@ async function withdrawErpCartRefund(id, storeId) {
 // 프론트가 취소창을 띄우기 직전에 잡는다(두 대가 동시에 취소하지 않게).
 // attemptId(옛 프론트는 없음)와 시작 시각을 함께 남긴다 -- 시작 시각은 직원이 갇힌 취소 중을 풀 수 있는 기준이고,
 // attemptId는 이후 refund-result가 "지금 쥐고 있는 시도"의 보고인지 가리는 열쇠다.
+// 이미 접은 시도(refundReleasedAttemptId 목록)면 잡지 않는다. 이 확인을 전이와 한 번에 한다 -- 호출부가 읽은 뒤 같은 시도의
+// 포기 보고가 끼어들어 기록되면 여기서 거절된다(예전에는 읽는 단계에서만 확인해 그 틈에 refunding으로 갇혔다).
 async function markErpCartRefunding(id, storeId, attemptId) {
-  const result = await prisma.erpCart.updateMany({
-    where: { id, storeId, payTarget: 'front', status: 'refund_requested' },
+  return updateErpCartWithReleasedList(id, 'refundReleasedAttemptId', (released) => (isReleasedToken(released, attemptId) ? null : {
+    where: { storeId, payTarget: 'front', status: 'refund_requested' },
     data: { status: 'refunding', refundAttemptId: attemptId ?? null, refundStartedAt: new Date() },
-  })
-  return result.count > 0
+  }))
 }
 
 // 프론트 취소가 안 됐다(손님이 취소창을 닫음/카드 오류/프론트 재시작) -- 돈은 그대로 나간 채이므로 paid로 돌린다.
@@ -1402,30 +1480,31 @@ async function markErpCartRefunding(id, storeId, attemptId) {
 // 그 사이 결제 주문 처리까지 막혔다("갇힘"). paid로 두면 탭앱에서 직원이 다시 [프론트에서 취소]를 눌러야 새
 // refundRequestedAt으로 요청이 다시 뜬다. 사유는 errorMessage에 남아 탭앱에 보인다.
 // attemptId가 주어지면 다른 시도가 쥐고 있는 취소는 풀지 않고(호출부가 먼저 409로 거르지만 그 사이 끼어든 경우를 위해
-// where에도 둔다), 푼 시도를 refundReleasedAttemptId에 남겨 같은 시도의 늦은 refund-start 재시도가 다시 잡지 못하게 한다.
+// where에도 둔다), 푼 시도를 묘비 목록(refundReleasedAttemptId)에 더해 같은 시도의 늦은 refund-start 재시도가 다시 잡지 못하게 한다.
 async function releaseErpCartRefunding(id, errorMessage, attemptId) {
-  const result = await prisma.erpCart.updateMany({
+  return updateErpCartWithReleasedList(id, 'refundReleasedAttemptId', (released) => ({
     where: {
-      id, status: 'refunding',
+      status: 'refunding',
       ...(attemptId ? { OR: [{ refundAttemptId: null }, { refundAttemptId: attemptId }] } : {}),
     },
     data: {
       status: 'paid', refundRequestedAt: null, refundStartedAt: null,
       errorMessage: errorMessage || '프론트 취소 중단',
-      ...(attemptId ? { refundReleasedAttemptId: attemptId } : {}),
+      ...(attemptId ? { refundReleasedAttemptId: appendReleasedToken(released, attemptId) } : {}),
     },
-  })
-  return result.count > 0
+  }))
 }
 
-// refunding이 아닌 상태(요청됨·결제 완료)에서 "이 시도는 접었다"는 보고가 먼저 도착했다. 같은 시도의 refund-start가
-// 시간 초과로 늦게 처리될 수 있어서, 시도를 기록해 두었다가 그 start를 거절한다.
+// 취소를 쥐고 있지 않은 시도의 "이 시도는 접었다"는 보고(요청됨·결제 완료 상태에서 먼저 도착했거나, 다른 시도가 취소 중일 때 옴).
+// 같은 시도의 refund-start가 시간 초과로 늦게 처리될 수 있어서, 시도를 묘비 목록에 남겨 두었다가 그 start를 거절한다.
+// 주문 상태와 관계없이 남긴다(예전에는 요청됨·결제 완료일 때만 남겨, 다른 상태에서 온 포기 보고는 기록 없이 끝났다).
+// 반환: 기록됐는지(이미 있으면 true)
 async function markErpCartRefundAttemptReleased(id, attemptId) {
-  const result = await prisma.erpCart.updateMany({
-    where: { id, status: { in: ['refund_requested', 'paid'] } },
-    data: { refundReleasedAttemptId: attemptId },
-  })
-  return result.count > 0
+  if (!attemptId) return false
+  return updateErpCartWithReleasedList(id, 'refundReleasedAttemptId', (released) => (isReleasedToken(released, attemptId) ? 'done' : {
+    where: {},
+    data: { refundReleasedAttemptId: appendReleasedToken(released, attemptId) },
+  }))
 }
 
 // 취소 완료 기록. fromStatuses로 어느 상태에서 넘어올 수 있는지 호출부가 정한다
@@ -1486,9 +1565,11 @@ async function listSettledErpCartsForPos(storeId, since, limit) {
 // 딱 한쪽만 count:1을 받는다.
 // attemptId(탭앱이 요청마다 만든 구분자, 옛 탭앱은 없음)를 함께 남겨, 응답을 못 받아 재시도한 탭앱이 "이미 loaded"를 받았을 때
 // 자기 첫 요청이 성공한 것인지 다른 단말기가 먼저 담은 것인지 가릴 수 있게 한다.
+// payTarget 'pos'도 where에 둔다: 호출부가 읽은 직후 다른 단말기의 [프론트로 결제 요청]이 payTarget을 front로 바꾸면, 그대로
+// 담았을 때 loaded·front 주문이 생겨 POS 결제 통보도 담기 취소도 받지 못하는 채로 갇힌다.
 async function markErpCartLoaded(id, attemptId) {
   const result = await prisma.erpCart.updateMany({
-    where: { id, status: 'pending' },
+    where: { id, status: 'pending', payTarget: 'pos' },
     data: { status: 'loaded', loadedAt: new Date(), consumeAttemptId: attemptId ?? null },
   })
   return result.count > 0
@@ -1496,21 +1577,38 @@ async function markErpCartLoaded(id, attemptId) {
 
 // POS에 담은 주문(loaded)을 담기 전(pending)으로 되돌린다. 잘못 담았거나 POS 장바구니를 비운 경우 탭앱에서 다시 담을 수
 // 있게 한다. 결제 통보(paidAt)가 이미 있는 주문, 프론트 결제 건은 되돌리지 않는다.
+// consumeAttemptId를 주면(undefined가 아니면) 그 담기 시도의 주문일 때만 되돌린다 -- 호출부가 "담은 단말기의 요청인지"를 확인한
+// 뒤 그 사이 다른 단말기가 다시 담은 경우를 건드리지 않는다(null이면 옛 탭앱이 담은 주문만).
+// 전산 주문 목록은 접수 후 ERP_CART_STALE_HOURS가 지난 pending을 보여주지 않는다(listPendingErpCarts). 그보다 오래 담겨 있던
+// 주문을 pending으로 되돌리면 어느 목록에도 안 보이다가 만료되므로, 그런 주문은 매장이 지운 것(dismissed)으로 닫는다.
 // 한계: POS 쪽에서 실제로는 결제를 마쳤는데 통보만 못 온 주문을 되돌리면 같은 주문이 한 번 더 결제될 수 있다 -- 그 경우
 // 늦게 도착한 결제 통보를 pending도 받게 해 두었다(markErpCartPaid).
-async function markErpCartUnloaded(id, storeId) {
-  const result = await prisma.erpCart.updateMany({
-    where: { id, storeId, status: 'loaded', payTarget: 'pos', paidAt: null },
+// 반환: 'pending'(되돌림) | 'dismissed'(오래돼 닫음) | null(조건이 맞지 않음)
+const UNLOAD_STALE_NOTE = '담긴 채 24시간이 지나 매장에서 되돌림'
+
+async function markErpCartUnloaded(id, storeId, { consumeAttemptId } = {}) {
+  const staleBefore = new Date(Date.now() - ERP_CART_STALE_HOURS * 60 * 60 * 1000)
+  const where = {
+    id, storeId, status: 'loaded', payTarget: 'pos', paidAt: null,
+    ...(consumeAttemptId !== undefined ? { consumeAttemptId } : {}),
+  }
+  const returned = await prisma.erpCart.updateMany({
+    where: { ...where, createdAt: { gte: staleBefore } },
     data: { status: 'pending', loadedAt: null, consumeAttemptId: null },
   })
-  return result.count > 0
+  if (returned.count > 0) return 'pending'
+  const closed = await prisma.erpCart.updateMany({
+    where: { ...where, createdAt: { lt: staleBefore } },
+    data: { status: 'dismissed', errorMessage: UNLOAD_STALE_NOTE },
+  })
+  return closed.count > 0 ? 'dismissed' : null
 }
 
-// markErpCartLoaded와 동일한 이유로 원자적 updateMany를 쓴다. errorMessage는 호출부(server.js)가
+// markErpCartLoaded와 동일한 이유로 원자적 updateMany를 쓴다(payTarget 'pos'도 같은 이유). errorMessage는 호출부(server.js)가
 // 이미 500자로 잘라 넘긴다고 가정한다(여기서 다시 자르지 않음 -- 책임을 한 곳에 둔다).
 async function markErpCartFailed(id, errorMessage) {
   const result = await prisma.erpCart.updateMany({
-    where: { id, status: 'pending' },
+    where: { id, status: 'pending', payTarget: 'pos' },
     data: { status: 'failed', errorMessage: errorMessage ?? null },
   })
   return result.count > 0
@@ -2193,10 +2291,11 @@ async function listErpCarts({ storeId, status, limit = 50, offset = 0 }) {
 //
 // 전산이 취소한 것(cancelled)과 구분해서 dismissed로 남긴다 -- 전산 입장에서 "우리가 취소했다"와
 // "매장이 거부했다"는 후속 조치가 다르다(후자는 왜 거부했는지 확인해야 한다).
-// 다른 전이와 같은 이유로 원자적 updateMany를 쓴다.
-async function markErpCartDismissed(id, reason) {
+// 다른 전이와 같은 이유로 원자적 updateMany를 쓴다. payTarget을 주면 그 결제처일 때만 지운다 -- POS 담기 경로는 'pos',
+// 프론트 대기 지우기는 'front'를 넘겨, 읽은 직후 [프론트로 결제 요청]·[POS로 되돌리기]가 끼어든 주문을 엉뚱한 쪽에서 지우지 않는다.
+async function markErpCartDismissed(id, reason, payTarget) {
   const result = await prisma.erpCart.updateMany({
-    where: { id, status: 'pending' },
+    where: { id, status: 'pending', ...(payTarget ? { payTarget } : {}) },
     data: { status: 'dismissed', errorMessage: reason ?? null },
   })
   return result.count > 0
@@ -2560,11 +2659,13 @@ module.exports = {
   markErpCartPaid,
   markErpCartFrontPaying,
   releaseErpCartFrontPaying,
-  tombstoneErpCartFrontKey,
+  recordErpCartFrontReleasedKey,
+  isReleasedToken,
   forceReleaseErpCartFrontPaying,
   forceReleaseErpCartRefunding,
   FORCE_RELEASE_AFTER_MS,
   markErpCartFrontPaid,
+  markErpCartFrontPaidAfterRelease,
   sendErpCartToFront,
   returnErpCartToPos,
   listFrontErpCartsForPos,
@@ -2600,6 +2701,7 @@ module.exports = {
   registerPromoExclusion,
   skipDuePromotion,
   postponeDuePromotion,
+  countRecentAutoPromoFailures,
   closeSiblingDuePromotions,
   listPromoCampaignCandidates,
   completeReservationAfterPayment,

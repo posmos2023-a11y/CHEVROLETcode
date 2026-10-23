@@ -305,6 +305,7 @@ testSerial('결과 paid: paymentKey가 다르면 기록하지 않는다(409)', a
   await startFront(store, cartId, newPaymentKey())
   const res = await reportFront(store, cartId, { result: 'paid', paymentKey: newPaymentKey(), payment: SAMPLE_CARD_PAYMENT })
   assert.equal(res.status, 409)
+  assert.equal(res.body.code, 'PAID_AFTER_RELEASE')
   const row = await prisma.erpCart.findUnique({ where: { id: cartId } })
   assert.equal(row.status, 'paying')
 })
@@ -837,16 +838,21 @@ for (const result of ['cancelled', 'failed']) {
   })
 }
 
-testSerial('묘비: 이미 paying으로 잡힌 뒤의 cancelled 보고는 예전처럼 pending으로 되돌리고 묘비를 남기지 않는다', async () => {
+testSerial('묘비: 이미 paying으로 잡힌 뒤의 cancelled 보고는 pending으로 되돌리고, 그 키도 묘비로 남겨 같은 키의 늦은 /start 재전송을 막는다', async () => {
   const { store, cartId } = await frontCart('tombstone-normal')
   const key = newPaymentKey()
   await startFront(store, cartId, key)
   const res = await reportFront(store, cartId, { result: 'cancelled', paymentKey: key })
   assert.equal(res.body.alreadyProcessed, false)
-  assert.equal((await rowOf(cartId)).frontReleasedKey, null)
+  assert.equal(res.body.status, 'pending')
+  assert.equal((await rowOf(cartId)).frontReleasedKey, key)
+  const late = await startFront(store, cartId, key)
+  assert.equal(late.status, 409)
+  assert.equal(late.body.stale, true)
+  assert.equal((await startFront(store, cartId, newPaymentKey())).status, 200)
 })
 
-testSerial('비상구(결제 중): 10분이 안 지났으면 409와 남은 시간을 주고, 지났으면 pending으로 풀어 옛 키의 늦은 보고를 막는다', async () => {
+testSerial('비상구(결제 중): 10분이 안 지났으면 409와 남은 시간을 주고, 지났으면 pending으로 풀어 옛 키의 늦은 /start를 막는다', async () => {
   const { store, cartId } = await frontCart('force-paying')
   const key = newPaymentKey()
   await startFront(store, cartId, key)
@@ -872,17 +878,232 @@ testSerial('비상구(결제 중): 10분이 안 지났으면 409와 남은 시�
   assert.equal(row.frontPayingAt, null)
   assert.equal(row.frontReleasedKey, key)
 
-  // 풀린 옛 시도의 늦은 보고: 시작은 거절, 'paid'는 반영하지 않고 대사가 필요하다는 오류 로그를 남긴다.
-  assert.equal((await startFront(store, cartId, key)).status, 409)
-  const logs = await captureLoggerErrors(async () => {
-    const late = await reportFront(store, cartId, { result: 'paid', paymentKey: key, payment: SAMPLE_CARD_PAYMENT })
-    assert.equal(late.status, 409)
-  })
-  assert.ok(logs.some((l) => l.message.includes('결제 완료 보고를 반영하지 못했습니다')), '대사 필요 로그가 남지 않았다')
-  assert.equal((await rowOf(cartId)).status, 'pending')
+  // 풀린 옛 시도의 늦은 /start는 거절한다.
+  const lateStart = await startFront(store, cartId, key)
+  assert.equal(lateStart.status, 409)
+  assert.equal(lateStart.body.stale, true)
 
   // 풀린 뒤에는 새 키로 다시 결제할 수 있다.
   assert.equal((await startFront(store, cartId, newPaymentKey())).status, 200)
+})
+
+// --- 풀린 결제 시도의 늦은 승인 보고(PAID_AFTER_RELEASE) ------------------------------------------
+
+const PAID_AFTER_RELEASE_LOG = '[front] 결제가 승인됐지만 주문에 반영하지 못함. 대사 필요'
+
+// 프론트가 승인 직후 꺼져 결과를 못 보낸 채 10분이 지나 직원이 [결제 중 풀기]를 누른 주문
+async function forceReleasedFrontCart(label, make = frontCart) {
+  const made = await make(label)
+  const key = newPaymentKey()
+  assert.equal((await startFront(made.store, made.cartId, key)).status, 200)
+  await prisma.erpCart.update({ where: { id: made.cartId }, data: { frontPayingAt: elevenMinutesAgo() } })
+  assert.equal((await forceRelease(made.store, made.cartId)).status, 200)
+  return { ...made, key }
+}
+
+testSerial('풀린 뒤 승인 보고: 아무도 다시 잡지 않았으면(프론트 대기) 결제 완료로 받고 예약 완료·영수증까지 처리한다', async () => {
+  global.__notifications.length = 0
+  const { store, cartId, key, reservation } = await forceReleasedFrontCart('after-release-paid', linkedFrontCart)
+  const late = await reportFront(store, cartId, { result: 'paid', paymentKey: key, payment: SAMPLE_CARD_PAYMENT })
+  assert.equal(late.status, 200, JSON.stringify(late.body))
+  assert.equal(late.body.status, 'paid')
+  assert.equal(late.body.alreadyProcessed, false)
+  assert.equal(late.body.reservationCompleted, true)
+  assert.equal(late.body.receipt, 'sent')
+
+  const row = await rowOf(cartId)
+  assert.equal(row.status, 'paid')
+  assert.equal(row.frontPaymentKey, key)
+  assert.equal(row.frontApprovalNo, '30012345')
+  assert.ok(row.paidAt)
+  assert.equal((await prisma.reservation.findUnique({ where: { id: reservation.id } })).status, 'completed')
+  assert.equal(global.__notifications.filter((n) => n.method === 'sendReceiptAlimtalk').length, 1)
+  // 결제 완료가 됐으니 프론트 목록에 다시 뜨지 않는다(같은 주문의 결제창이 다시 뜨지 않는다).
+  assert.deepEqual((await getFrontCarts(store)).body.carts, [])
+
+  // 같은 보고의 재시도는 성공(alreadyProcessed)이고 영수증을 다시 보내지 않는다.
+  const again = await reportFront(store, cartId, { result: 'paid', paymentKey: key, payment: SAMPLE_CARD_PAYMENT })
+  assert.equal(again.status, 200)
+  assert.equal(again.body.alreadyProcessed, true)
+  assert.equal(global.__notifications.filter((n) => n.method === 'sendReceiptAlimtalk').length, 1)
+})
+
+testSerial('풀린 뒤 승인 보고: POS로 되돌린 주문이면 404 대신 409 PAID_AFTER_RELEASE와 대사 필요 로그를 남긴다', async () => {
+  const { store, cartId, key } = await forceReleasedFrontCart('after-release-pos')
+  assert.equal((await returnToPos(store, cartId)).status, 200)
+  let late
+  const logs = await captureLoggerErrors(async () => {
+    late = await reportFront(store, cartId, { result: 'paid', paymentKey: key, payment: SAMPLE_CARD_PAYMENT })
+  })
+  assert.equal(late.status, 409, JSON.stringify(late.body))
+  assert.equal(late.body.code, 'PAID_AFTER_RELEASE')
+  assert.equal(late.body.status, 'pending')
+  const log = logs.find((l) => l.message === PAID_AFTER_RELEASE_LOG)
+  assert.ok(log, '대사 필요 로그가 남지 않았다')
+  assert.deepEqual(log.meta, { cartId, status: 'pending', payTarget: 'pos', paymentKey: key, approvalNumber: '30012345', amount: 65000 })
+  const row = await rowOf(cartId)
+  assert.equal(row.status, 'pending')
+  assert.equal(row.payTarget, 'pos')
+})
+
+testSerial('풀린 뒤 승인 보고: 새 시도가 이미 잡았거나 지운 주문이면 반영하지 않고 409 PAID_AFTER_RELEASE', async () => {
+  // 새 시도가 결제 중이다 -- 옛 키의 보고가 그 시도를 덮으면 안 되고, 새 시도는 끝까지 결제된다.
+  const first = await forceReleasedFrontCart('after-release-retaken')
+  const newKey = newPaymentKey()
+  assert.equal((await startFront(first.store, first.cartId, newKey)).status, 200)
+  let late
+  const logs = await captureLoggerErrors(async () => {
+    late = await reportFront(first.store, first.cartId, { result: 'paid', paymentKey: first.key, payment: SAMPLE_CARD_PAYMENT })
+  })
+  assert.equal(late.status, 409)
+  assert.equal(late.body.code, 'PAID_AFTER_RELEASE')
+  assert.equal(late.body.status, 'paying')
+  assert.ok(logs.some((l) => l.message === PAID_AFTER_RELEASE_LOG && l.meta.status === 'paying'))
+  assert.equal((await rowOf(first.cartId)).frontPaymentKey, newKey)
+  assert.equal((await reportFront(first.store, first.cartId, { result: 'paid', paymentKey: newKey, payment: SAMPLE_CARD_PAYMENT })).status, 200)
+
+  // 그 뒤 다른 키로 결제가 끝난 주문에 옛 키의 보고가 와도 같다(같은 주문을 두 번 받은 것).
+  const otherKey = await reportFront(first.store, first.cartId, { result: 'paid', paymentKey: first.key, payment: SAMPLE_CARD_PAYMENT })
+  assert.equal(otherKey.status, 409)
+  assert.equal(otherKey.body.code, 'PAID_AFTER_RELEASE')
+  assert.equal(otherKey.body.status, 'paid')
+
+  // 직원이 탭앱에서 지운(dismissed) 주문
+  const second = await forceReleasedFrontCart('after-release-dismissed')
+  assert.equal((await posPost(second.store, `/api/pos/erp-carts/${second.cartId}/dismiss-front`)).status, 200)
+  const dismissed = await reportFront(second.store, second.cartId, { result: 'paid', paymentKey: second.key, payment: SAMPLE_CARD_PAYMENT })
+  assert.equal(dismissed.status, 409)
+  assert.equal(dismissed.body.code, 'PAID_AFTER_RELEASE')
+  assert.equal(dismissed.body.status, 'dismissed')
+  assert.equal((await rowOf(second.cartId)).status, 'dismissed')
+})
+
+testSerial('승인 보고: 묘비에 없는 키(이 주문에서 결제창이 뜬 적 없음)는 프론트 대기 주문이어도 결제 완료로 받지 않는다', async () => {
+  const { store, cartId } = await frontCart('paid-unknown-key')
+  const logs = await captureLoggerErrors(async () => {
+    const res = await reportFront(store, cartId, { result: 'paid', paymentKey: newPaymentKey(), payment: SAMPLE_CARD_PAYMENT })
+    assert.equal(res.status, 409)
+    assert.equal(res.body.code, 'PAID_AFTER_RELEASE')
+  })
+  assert.ok(logs.some((l) => l.message === PAID_AFTER_RELEASE_LOG))
+  assert.equal((await rowOf(cartId)).status, 'pending')
+  // 없는 주문·다른 매장은 그대로 404
+  assert.equal((await reportFront(store, crypto.randomUUID(), { result: 'paid', paymentKey: newPaymentKey(), payment: SAMPLE_CARD_PAYMENT })).status, 404)
+})
+
+testSerial('승인 보고: 같은 키로 결제된 뒤 취소가 요청된 주문에 온 재보고는 성공(alreadyProcessed)으로 본다', async () => {
+  const { store, cartId } = await frontCart('paid-retry-refund')
+  const key = newPaymentKey()
+  await startFront(store, cartId, key)
+  await reportFront(store, cartId, { result: 'paid', paymentKey: key, payment: SAMPLE_CARD_PAYMENT })
+  assert.equal((await posPost(store, `/api/pos/erp-carts/${cartId}/refund-request`)).status, 200)
+  const retry = await reportFront(store, cartId, { result: 'paid', paymentKey: key, payment: SAMPLE_CARD_PAYMENT })
+  assert.equal(retry.status, 200, JSON.stringify(retry.body))
+  assert.equal(retry.body.alreadyProcessed, true)
+  assert.equal(retry.body.status, 'refund_requested')
+})
+
+// --- 묘비 목록(최근 10개) ---------------------------------------------------------------------
+
+const releasedKeysOf = async (cartId) => ((await rowOf(cartId)).frontReleasedKey || '').split(',').filter(Boolean)
+
+testSerial('묘비 목록: 포기 보고가 연달아 먼저 도착해도 앞의 키를 덮어쓰지 않아, 두 키의 늦은 /start를 모두 거절한다', async () => {
+  const { store, cartId } = await frontCart('tombstone-multi')
+  const b = newPaymentKey()
+  const c = newPaymentKey()
+  // /start(B) 시간 초과 → cancelled(B) 먼저 처리 → 다시 시작한 /start(C)도 시간 초과 → cancelled(C) 먼저 처리
+  assert.equal((await reportFront(store, cartId, { result: 'cancelled', paymentKey: b })).status, 200)
+  assert.equal((await reportFront(store, cartId, { result: 'cancelled', paymentKey: c })).status, 200)
+  assert.deepEqual(await releasedKeysOf(cartId), [b, c])
+  // 예전에는 묘비가 C로 덮여, 늦게 처리된 /start(B)가 주문을 결제 중으로 가뒀다.
+  for (const key of [b, c]) {
+    const late = await startFront(store, cartId, key)
+    assert.equal(late.status, 409, JSON.stringify(late.body))
+    assert.equal(late.body.stale, true)
+  }
+  assert.equal((await rowOf(cartId)).status, 'pending')
+})
+
+testSerial('묘비 목록: 다른 키가 결제 중일 때 온 포기 보고도 남기고, 결제 중인 키는 그대로 끝까지 결제된다', async () => {
+  const { store, cartId } = await frontCart('tombstone-while-paying')
+  const a = newPaymentKey()
+  const b = newPaymentKey()
+  assert.equal((await startFront(store, cartId, a)).status, 200)
+  const stale = await reportFront(store, cartId, { result: 'cancelled', paymentKey: b })
+  assert.equal(stale.status, 409)
+  assert.equal(stale.body.status, 'paying')
+  assert.deepEqual(await releasedKeysOf(cartId), [b])
+
+  // 결제 중인 A가 손님 취소로 풀린 뒤에도, B의 늦은 /start는 이 주문을 잡지 못한다.
+  assert.equal((await reportFront(store, cartId, { result: 'cancelled', paymentKey: a })).status, 200)
+  const late = await startFront(store, cartId, b)
+  assert.equal(late.status, 409)
+  assert.equal(late.body.stale, true)
+
+  // 묘비가 있어도 결제 중인 키의 완료는 막지 않는다.
+  const c = newPaymentKey()
+  assert.equal((await startFront(store, cartId, c)).status, 200)
+  await reportFront(store, cartId, { result: 'cancelled', paymentKey: newPaymentKey() })
+  const paid = await reportFront(store, cartId, { result: 'paid', paymentKey: c, payment: SAMPLE_CARD_PAYMENT })
+  assert.equal(paid.status, 200, JSON.stringify(paid.body))
+  assert.equal(paid.body.status, 'paid')
+})
+
+// body를 실행하는 동안 erpCart[method]의 다음 호출 한 번이 끝난 직후 race()를 실행한다(그 사이 다른 요청이 끼어든 것처럼).
+async function withRaceAfterNext(method, race, body) {
+  const original = prisma.erpCart[method]
+  let fired = false
+  prisma.erpCart[method] = async (...args) => {
+    const result = await original.apply(prisma.erpCart, args)
+    if (!fired) {
+      fired = true
+      await race(result)
+    }
+    return result
+  }
+  try {
+    return await body()
+  } finally {
+    prisma.erpCart[method] = original
+  }
+}
+
+testSerial('묘비 목록: /start가 목록을 읽은 직후 그 키의 포기 보고가 기록되면 /start는 결제 중을 잡지 못한다(확인과 전이가 한 번에)', async () => {
+  const { store, cartId } = await frontCart('tombstone-start-race')
+  const key = newPaymentKey()
+  const res = await withRaceAfterNext('findUnique', async () => {
+    assert.equal((await reportFront(store, cartId, { result: 'cancelled', paymentKey: key })).status, 200)
+  }, () => startFront(store, cartId, key))
+  assert.equal(res.status, 409, JSON.stringify(res.body))
+  assert.equal(res.body.stale, true)
+  const row = await rowOf(cartId)
+  assert.equal(row.status, 'pending')
+  assert.equal(row.frontPaymentKey, null)
+})
+
+testSerial('묘비 목록: 포기 보고의 첫 되돌리기가 실패한 직후 그 키의 /start가 먼저 잡았으면, 기록 뒤 다시 되돌린다', async () => {
+  const { store, cartId } = await frontCart('tombstone-release-race')
+  const key = newPaymentKey()
+  const res = await withRaceAfterNext('updateMany', async (first) => {
+    assert.equal(first.count, 0) // 아직 pending이라 되돌릴 게 없었다
+    assert.equal((await startFront(store, cartId, key)).status, 200)
+  }, () => reportFront(store, cartId, { result: 'cancelled', paymentKey: key }))
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal(res.body.status, 'pending')
+  const row = await rowOf(cartId)
+  assert.equal(row.status, 'pending')
+  assert.equal(row.frontPaymentKey, null)
+  assert.deepEqual(await releasedKeysOf(cartId), [key])
+})
+
+testSerial('묘비 목록: 최근 10개만 남긴다', async () => {
+  const { store, cartId } = await frontCart('tombstone-limit')
+  const keys = Array.from({ length: 12 }, () => newPaymentKey())
+  for (const key of keys) {
+    assert.equal((await reportFront(store, cartId, { result: 'failed', paymentKey: key })).status, 200)
+  }
+  assert.deepEqual(await releasedKeysOf(cartId), keys.slice(-10))
+  assert.equal((await startFront(store, cartId, keys[11])).body.stale, true)
 })
 
 testSerial('비상구: 결제 중·취소 중이 아닌 주문은 409, 다른 매장 토큰은 404', async () => {
@@ -908,9 +1129,27 @@ testSerial('정리: 취소가 진행 중인 건은 숨길 수도 없다(409)', a
 
 testSerial('POS 결제 통보: 프론트 결제 대기 주문은 결제 완료로 기록할 수 없다(409)', async () => {
   const { store, cartId } = await frontCart('pos-paid-front')
-  const res = await posPost(store, `/api/pos/erp-carts/${cartId}/paid`, { paymentId: 'p-1' })
-  assert.equal(res.status, 409)
+  const logs = await captureLoggerErrors(async () => {
+    const res = await posPost(store, `/api/pos/erp-carts/${cartId}/paid`, { paymentId: 'p-1' })
+    assert.equal(res.status, 409)
+  })
+  // POS에서 돈이 나갔다는 통보이므로 대사가 필요하다고 남긴다.
+  assert.ok(logs.some((l) => l.message.includes('프론트 결제 주문에 POS 결제 통보')))
   assert.equal((await rowOf(cartId)).status, 'pending')
+})
+
+testSerial('POS 결제 통보: 프론트에서 이미 결제된 주문에 온 POS 결제는 처리됨이 아니라 409 ALREADY_PAID_OTHER(이중 결제)', async () => {
+  const { store, cartId } = await paidFrontCart('pos-paid-after-front')
+  const logs = await captureLoggerErrors(async () => {
+    const res = await posPost(store, `/api/pos/erp-carts/${cartId}/paid`, { paymentId: 'pos-pay-2' })
+    assert.equal(res.status, 409, JSON.stringify(res.body))
+    assert.equal(res.body.code, 'ALREADY_PAID_OTHER')
+    assert.equal(res.body.status, 'paid')
+  })
+  const log = logs.find((l) => l.message.includes('이미 결제된 주문에 다른 결제 통보'))
+  assert.ok(log, '대사 필요 로그가 남지 않았다')
+  assert.equal(log.meta.payTarget, 'front')
+  assert.equal(log.meta.reportedPaymentId, 'pos-pay-2')
 })
 
 testSerial('삭제 되살리기: 삭제 표시된 주문이 프론트 결제 완료로 확정되면 다시 보인다', async () => {

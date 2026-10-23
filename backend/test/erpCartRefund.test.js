@@ -561,7 +561,93 @@ testSerial('취소 시도: 결제 완료(paid) 상태에서 온 포기 보고도
   const b = attemptId('b')
   const early = await refundResult(store, cartId, { result: 'cancelled', attemptId: b })
   assert.equal(early.status, 200)
-  assert.equal((await row(cartId)).refundReleasedAttemptId, b)
+  // 묘비는 목록이다 -- 새 시도(b)를 남겨도 앞의 시도(a) 기록이 지워지지 않는다.
+  assert.deepEqual(releasedAttemptsOf(await row(cartId)), [a, b])
+  assert.equal((await refundStart(store, cartId, a)).body.stale, true)
+  assert.equal((await refundStart(store, cartId, b)).body.stale, true)
+})
+
+const releasedAttemptsOf = (cart) => (cart.refundReleasedAttemptId || '').split(',').filter(Boolean)
+
+// body를 실행하는 동안 erpCart[method]의 다음 호출 한 번이 끝난 직후 race()를 실행한다(그 사이 다른 요청이 끼어든 것처럼).
+// findUnique면 읽은 옛 값을, updateMany면 그 결과를 그대로 돌려준다. race 안의 호출은 원래대로 동작한다.
+async function withRaceAfterNext(method, race, body) {
+  const original = prisma.erpCart[method]
+  let fired = false
+  prisma.erpCart[method] = async (...args) => {
+    const result = await original.apply(prisma.erpCart, args)
+    if (!fired) {
+      fired = true
+      await race(result)
+    }
+    return result
+  }
+  try {
+    return await body()
+  } finally {
+    prisma.erpCart[method] = original
+  }
+}
+const withRaceAfterNextRead = (race, body) => withRaceAfterNext('findUnique', race, body)
+
+testSerial('취소 시도: refund-start가 읽은 뒤 같은 시도의 포기 보고가 끼어들어도 취소 중으로 갇히지 않는다(전이와 함께 확인)', async () => {
+  const store = await createStore('attempt-start-race')
+  const cartId = await requestedRefund(store)
+  const a = attemptId('race')
+  const res = await withRaceAfterNextRead(
+    // refund-start(A)가 주문(refund_requested, 묘비 없음)을 읽은 직후, 시간 초과로 포기한 프론트의 cancelled(A)가 먼저 처리된다.
+    async () => {
+      const early = await refundResult(store, cartId, { result: 'cancelled', attemptId: a })
+      assert.equal(early.status, 200, JSON.stringify(early.body))
+    },
+    () => refundStart(store, cartId, a),
+  )
+  assert.equal(res.status, 409, JSON.stringify(res.body))
+  assert.equal(res.body.stale, true)
+  const cart = await row(cartId)
+  assert.equal(cart.status, 'refund_requested')
+  assert.equal(cart.refundAttemptId, null)
+  // 새 시도는 평소처럼 시작한다.
+  assert.equal((await refundStart(store, cartId, attemptId('next'))).status, 200)
+})
+
+testSerial('취소 시도: 다른 시도가 취소 중일 때 온 포기 보고도 남겨, 그 시도의 늦은 refund-start가 다음 취소 요청을 가로채지 못한다', async () => {
+  const store = await createStore('attempt-release-while-other')
+  const cartId = await requestedRefund(store)
+  const a = attemptId('a')
+  const b = attemptId('b')
+  assert.equal((await refundStart(store, cartId, a)).status, 200)
+  const stale = await refundResult(store, cartId, { result: 'cancelled', attemptId: b })
+  assert.equal(stale.status, 409)
+  assert.equal(stale.body.stale, true)
+  assert.deepEqual(releasedAttemptsOf(await row(cartId)), [b])
+
+  // A가 손님 취소로 풀린 뒤 직원이 다시 요청했다. B의 늦은 start는 거절, 새 시도는 시작한다.
+  assert.equal((await refundResult(store, cartId, { result: 'cancelled', attemptId: a })).body.status, 'paid')
+  assert.equal((await pos(store, 'post', `/api/pos/erp-carts/${cartId}/refund-request`)).status, 200)
+  assert.equal((await refundStart(store, cartId, b)).body.stale, true)
+  assert.equal((await refundStart(store, cartId, attemptId('c'))).status, 200)
+})
+
+testSerial('취소 시도: 포기 보고가 refund-start와 엇갈려 그 시도가 먼저 취소 중을 잡았으면, 기록 뒤 다시 풀어 결제 완료로 돌린다', async () => {
+  const store = await createStore('attempt-release-race')
+  const cartId = await requestedRefund(store)
+  const a = attemptId('a')
+  const res = await withRaceAfterNext(
+    'updateMany',
+    // cancelled(A)의 첫 풀기가 (아직 refund_requested라) 실패한 직후, 늦은 refund-start(A)가 먼저 처리돼 refunding(A)가 된다.
+    // 예전에는 여기서 묘비 기록도 실패한 채 200을 줘, 프론트는 기록을 지우고 서버만 취소 중으로 갇혔다.
+    async (first) => {
+      assert.equal(first.count, 0)
+      assert.equal((await refundStart(store, cartId, a)).status, 200)
+    },
+    () => refundResult(store, cartId, { result: 'cancelled', attemptId: a }),
+  )
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal(res.body.status, 'paid')
+  const cart = await row(cartId)
+  assert.equal(cart.status, 'paid')
+  assert.deepEqual(releasedAttemptsOf(cart), [a])
 })
 
 testSerial('비상구(취소 중): 10분이 안 지났으면 409와 남은 시간을 주고, 지났으면 paid로 풀어 그 시도의 늦은 start·완료 보고를 막는다', async () => {
