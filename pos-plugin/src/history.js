@@ -116,14 +116,27 @@ function ownerLine(info) {
   return parts.length ? parts.map((p) => deps.escapeHtml(p)).join(' · ') : ''
 }
 
+// 손님이 접수 때 적은 차종(선택). 서버가 접수에 이어진 방문에만 carModel을 준다(없으면 null, 옛 서버는 필드 없음).
+function carModelOf(v) {
+  return v && typeof v.carModel === 'string' ? v.carModel.trim() : ''
+}
+
+// 차종을 차량번호 옆에 붙이는 작은 보조 글씨. 값이 없으면 아무것도 그리지 않는다.
+function carModelTag(model) {
+  return model ? `<span class="history-car-model">${deps.escapeHtml(model)}</span>` : ''
+}
+
 function renderVisits(carNumber, visits, info = {}) {
   const body = bodyEl()
   if (!body) return
   lastRendered = { carNumber, visits, info }
   const owner = ownerLine(info)
+  // 머리줄에는 가장 최근 방문의 차종을 쓴다(visits는 최근 것부터 온다). 방문 카드에는 그와 다를 때만 따로 보여 준다(연락처와 같은 방식).
+  const latestModel = carModelOf(visits.find((v) => carModelOf(v)))
   const head = `
     <div class="history-owner">
       <strong class="history-owner-car">${deps.escapeHtml(carNumber)}</strong>
+      ${carModelTag(latestModel)}
       ${owner ? `<span class="history-owner-contact">${owner}</span>` : '<span class="history-owner-contact">연락처 기록 없음</span>'}
       ${info.phoneSearch ? `<span class="history-owner-note">${deps.escapeHtml(info.phoneSearch)} 번호로 찾음</span>` : ''}
     </div>
@@ -150,11 +163,13 @@ function renderVisits(carNumber, visits, info = {}) {
     const visitContact = v.contact && v.contact !== info.contact ? v.contact : ''
     const visitName = orders.map((o) => o.customerName).find((n) => n && n !== info.customerName) || ''
     const visitOwner = [visitContact, visitName].filter(Boolean).map((p) => deps.escapeHtml(p)).join(' · ')
+    const visitModel = carModelOf(v) && carModelOf(v) !== latestModel ? carModelOf(v) : ''
 
     return `
       <article class="history-visit">
         <div class="history-visit-top">
           <strong class="history-date">${deps.escapeHtml(v.date || formatDate(v.at))}</strong>
+          ${carModelTag(visitModel)}
           ${v.status ? `<span class="history-badge">${deps.escapeHtml(STATUS_LABEL[v.status] || '기타')}</span>` : ''}
           ${paid ? '<span class="history-badge paid">결제 완료</span>' : ''}
         </div>
@@ -312,7 +327,7 @@ function renderRecent(visits) {
       const owner = ownerLine(v)
       return `
         <button class="history-recent-row" type="button" data-car="${deps.escapeHtml(v.carNumber || '')}">
-          <span class="history-recent-car">${deps.escapeHtml(v.carNumber || '-')}</span>
+          <span class="history-recent-car">${deps.escapeHtml(v.carNumber || '-')}${carModelTag(carModelOf(v))}</span>
           <span class="history-recent-mid">
             <span class="history-recent-desc">${deps.escapeHtml(v.serviceType || names || '정비')}</span>
             <span class="history-recent-date">${deps.escapeHtml(formatDate(v.at))}${owner ? ` · ${owner}` : ''}</span>

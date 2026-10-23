@@ -717,6 +717,19 @@
     white-space: nowrap;
   }
 
+  /* 손님이 적은 차종(선택). 차량번호 옆의 보조 글씨 -- 30자까지 올 수 있어 한 줄을 넘으면 말줄임한다. */
+  .car-model {
+    min-width: 0;
+    max-width: 100%;
+    overflow: hidden;
+    color: var(--sub);
+    font-size: 14px;
+    font-weight: 650;
+    letter-spacing: -0.03em;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
   /* 접수 시각·경과 시간('09:12 접수 · 23분째'). 30분이 넘은 대기 손님은 주황으로 눈에 띄게 한다. */
   .queue-meta {
     margin-top: 4px;
@@ -1089,6 +1102,26 @@
   .history-owner-contact { font-size: 14px; color: var(--ink); }
   .history-owner-note { font-size: 12px; color: var(--sub); }
   .history-service { margin-top: 5px; color: var(--sub); font-size: 13px; letter-spacing: -0.03em; }
+
+  /* 손님이 적은 차종(선택). 차량번호·방문 날짜 옆의 작은 보조 글씨 -- 30자까지 올 수 있어 넘치면 말줄임한다. */
+  .history-car-model {
+    min-width: 0;
+    max-width: 100%;
+    overflow: hidden;
+    color: var(--sub);
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: -0.03em;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* 최근 목록에서는 차량번호 칸이 좁아 그 아래 줄에 둔다. */
+  .history-recent-car .history-car-model {
+    display: block;
+    max-width: 140px;
+    margin-top: 2px;
+    font-size: 12px;
+  }
 
   .history-items { margin: 8px 0 0; padding-left: 18px; color: var(--sub); font-size: 13px; line-height: 1.7; }
   .history-qty { color: var(--muted); }

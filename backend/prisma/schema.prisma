@@ -57,6 +57,9 @@ model Reservation {
   storeId        String
   store          Store     @relation(fields: [storeId], references: [id])
   carNumber      String
+  // 손님이 접수 때 직접 적은 차종(예: 트랙스, 말리부). 선택 입력이라 비우면 null. 자유 문자열이라 서버가 공백·제어문자를 정리하고
+  // 30자까지만 받는다(server.js normalizeCarModel). 옛 프론트·웹 접수는 보내지 않는다.
+  carModel       String?
   phone          String
   serviceType    String
   queueNumber    Int

@@ -83,6 +83,13 @@
         return String(value || '').replace(/[\s-]/g, '')
       }
 
+      // 차종(선택 입력, 예: 트랙스). POS 대기 카드·관리자 표에 차량번호 옆에 작게 뜬다. 입력칸은 30자까지만 받는다(서버도 30자까지 --
+      // server.js normalizeCarModel). 여기서는 화면에 다시 보여 줄 값만 정리한다(앞뒤 공백, 안쪽 여러 칸 공백). 비면 null(차종 없음)이다.
+      const CAR_MODEL_MAX_LENGTH = 30
+      function normalizeCarModel(value) {
+        return String(value || '').replace(/\s+/g, ' ').trim() || null
+      }
+
       function showCarNumberInput() {
         armIdleTimer()
         sdk.template.renderInputPage({
@@ -105,23 +112,63 @@
               toast({ message: '차량번호를 다시 확인해주세요. 예) 12가3456', icon: 'error' })
               return
             }
-            showServiceTypeSelect(carNumber)
+            showCarModelInput(carNumber)
           },
           onBack: goIdle,
         })
       }
 
-      function showServiceTypeSelect(carNumber) {
+      // 차종 입력(선택). 차량번호 다음, 정비 항목 전에 묻는다. 큰 제목(top.title)이 질문, 작은 줄(top.subtitle)이 예시와 건너뛰는 법이다.
+      //
+      // SDK의 텍스트 입력은 빈 값을 낼 수 없다 -- CDN 번들의 TextInputForm이 입력칸에 required를 걸고, 비어 있으면 [다음] 버튼을 끈다
+      // (disabled: !isValid). 입력칸에 처음 값을 넣는 방법도 없다(useForm defaultValues가 ''로 고정). 그래서 "비워 두고 넘어가기" 대신
+      // 상단 오른쪽 버튼(navbarButton -- 공식 문서의 네비바 공통 파라미터, 글자는 9자까지 보인다)을 [건너뛰기]로 둔다. 화면이 하나로 끝나고,
+      // 공백 한 칸을 넣고 넘기라는 식의 숨은 규칙이 없다. 이 버튼은 뒤로가기와 달리 SDK가 화면을 지우지 않고 부르므로(CDN 번들로 확인)
+      // 바로 다음 화면을 그린다(onSubmit에서 다음 화면을 그리는 것과 같다).
+      //
+      // 다음 화면(정비 항목)에서 뒤로 오면 이 화면으로 돌아온다. 입력칸은 SDK 때문에 비어 있지만 적었던 차종은 그대로 들고 있다 -- 작은 줄에
+      // 보여 주고, 오른쪽 위 버튼이 [그대로 다음]이 된다. 새로 적고 [다음]을 누르면 그 값으로 바뀐다(공백만 넣고 [다음]이면 차종 없음).
+      function showCarModelInput(carNumber, carModel = null) {
+        armIdleTimer()
+        const kept = normalizeCarModel(carModel)
+        sdk.template.renderInputPage({
+          type: 'text',
+          top: {
+            title: '차종을 입력해주세요',
+            subtitle: kept
+              ? `입력한 차종: ${kept} · 그대로 두려면 오른쪽 위 [그대로 다음]`
+              : '예) 트랙스, 말리부 · 모르면 오른쪽 위 [건너뛰기]를 눌러주세요',
+          },
+          input: {
+            placeholder: '차종 입력',
+            maxLength: CAR_MODEL_MAX_LENGTH,
+          },
+          button: { label: '다음' },
+          navbarButton: {
+            label: kept ? '그대로 다음' : '건너뛰기',
+            onClick: () => showServiceTypeSelect(carNumber, kept),
+          },
+          onSubmit: async (value) => {
+            showServiceTypeSelect(carNumber, normalizeCarModel(value))
+          },
+          onBack: () => {
+            showCarNumberInput()
+          },
+        })
+      }
+
+      // 작은 줄(title)에 차량번호와, 적었으면 차종을 함께 보여 준다(손님이 방금 넣은 값을 한 번 더 본다).
+      function showServiceTypeSelect(carNumber, carModel = null) {
         armIdleTimer()
         sdk.template.renderSelectPage({
-          title: '차량번호 ' + carNumber,
+          title: '차량번호 ' + carNumber + (carModel ? ' · ' + carModel : ''),
           subtitle: '어떤 정비가 필요하세요?',
           options: SERVICE_TYPES.map((service) => ({
             title: service.title,
-            onClick: () => showConsent(carNumber, service.value),
+            onClick: () => showConsent(carNumber, carModel, service.value),
           })),
           onBack: () => {
-            showCarNumberInput()
+            showCarModelInput(carNumber, carModel)
           },
         })
       }
@@ -137,6 +184,8 @@
       // 보유기간은 임의로 채우지 않았다(개인정보보호법 제15조, 정보통신망법 제50조 대응).
       // TODO(법무 검토·동의 문구 버전): 고지의 '목적: 예약·…'은 화면의 다른 곳처럼 '접수'로 바꿀 대상이지만, 법정 고지 문구라
       // 법무 확인과 동의 문구 버전 기록(consentVersion)이 들어간 뒤에 바꾼다. 선택지 문구도 같은 이유로 그대로 둔다.
+      // TODO(법무 검토·동의 문구 버전): 차종(선택 입력, 2026-10-23 추가)이 고지의 '수집' 항목에 아직 없다. 넣을지(예: '차종(선택)')는
+      // 같은 이유로 법무 확인 뒤 동의 문구 버전과 함께 정한다. 차종은 이 동의를 받은 뒤 접수 요청에 실려 나간다.
       //
       // 차량번호·전화번호를 실제로 입력받기 직전에 반드시 이 동의 화면을 거치게 한다. 필수
       // (개인정보 수집·이용) 동의와 선택(광고성 정보 수신) 동의를 분리해서, 광고 수신을 거부해도
@@ -152,7 +201,7 @@
       // 바꿀 수 없어서(토스 Template API만 허용) 줄 길이를 비슷하게 맞춰 한쪽으로 쏠려 보이지 않게 한다.
       // 목적에 "정비 완료·결제 안내"를 넣었다 -- [완료] 안내 문자와 결제 영수증을 이 번호로 보낸다.
       // 예전엔 고지 3줄이 큰 제목(subtitle, 28px)으로 나오고 질문이 작은 줄이었다. 질문을 큰 제목으로, 고지를 작은 줄로 맞바꿨다.
-      function showConsent(carNumber, serviceType) {
+      function showConsent(carNumber, carModel, serviceType) {
         armIdleTimer()
         sdk.template.renderSelectPage({
           title:
@@ -164,12 +213,12 @@
             {
               title: '동의하고 계속',
               subtitle: '필수 항목만',
-              onClick: () => showPhoneInput(carNumber, serviceType, { privacyConsent: true, marketingConsent: false }),
+              onClick: () => showPhoneInput(carNumber, carModel, serviceType, { privacyConsent: true, marketingConsent: false }),
             },
             {
               title: '홍보 문자 수신까지 동의',
               subtitle: '선택 · 할인·이벤트 소식(광고성 정보)',
-              onClick: () => showPhoneInput(carNumber, serviceType, { privacyConsent: true, marketingConsent: true }),
+              onClick: () => showPhoneInput(carNumber, carModel, serviceType, { privacyConsent: true, marketingConsent: true }),
             },
             {
               title: '동의하지 않음',
@@ -207,7 +256,7 @@
       //
       // phone 타입은 SDK가 '010'을 미리 넣어 두고 11자리가 되면 바로 제출한다. 버튼은 그리지 않는다(문서의 PhoneInputPage에 button이
       // 없다). 그래서 작은 줄에 '010 다음 8자리만'을 늘 보여 준다. 형식이 틀리면 화면을 다시 그려 '010'부터 다시 누르게 한다(같은 키).
-      function showPhoneInput(carNumber, serviceType, consent, hint, idempotencyKey = crypto.randomUUID()) {
+      function showPhoneInput(carNumber, carModel, serviceType, consent, hint, idempotencyKey = crypto.randomUUID()) {
         armIdleTimer()
         sdk.template.renderInputPage({
           type: 'phone',
@@ -230,19 +279,20 @@
                 nextHint = '다른 번호는 직원에게 말씀해주세요'
               }
               toast({ message, icon: 'error' })
-              showPhoneInput(carNumber, serviceType, consent, nextHint, idempotencyKey)
+              showPhoneInput(carNumber, carModel, serviceType, consent, nextHint, idempotencyKey)
               return
             }
-            await submitReservation(carNumber, phone, serviceType, consent, idempotencyKey)
+            await submitReservation(carNumber, carModel, phone, serviceType, consent, idempotencyKey)
           },
           onBack: () => {
-            showConsent(carNumber, serviceType)
+            showConsent(carNumber, carModel, serviceType)
           },
         })
       }
 
       // failures: 응답을 못 받은(또는 5xx) 연속 횟수. 두 번째 실패부터 [처음부터 새로 접수]를 보인다(showNetworkErrorRetry).
-      async function submitReservation(carNumber, phone, serviceType, consent, idempotencyKey, failures = 0) {
+      // carModel: 손님이 적은 차종(건너뛰었으면 null). 다시 시도할 때도 같은 키·같은 본문으로 보낸다.
+      async function submitReservation(carNumber, carModel, phone, serviceType, consent, idempotencyKey, failures = 0) {
         disarmIdleTimer() // 서버에 보내는 동안은 걸지 않는다. 결과·오류 화면은 자체 타이머가 있고, 다시 입력 화면을 그리면 다시 건다
         let res
         let json
@@ -259,6 +309,7 @@
             headers: { 'Content-Type': 'application/json', 'Idempotency-Key': idempotencyKey },
             body: JSON.stringify({
               carNumber,
+              carModel,
               phone,
               serviceType,
               merchantId,
@@ -275,10 +326,10 @@
           // 대기번호가 두 개 발급됐다(실제 장애). 그래서 여기서는 입력값과 키를 그대로 들고 있는
           // showNetworkErrorRetry로 보낸다 — 손님이 다시 접수를 원하면 같은 키로 재시도하고, 정말
           // 처음부터 새로 넣고 싶을 때만 명시적으로 그걸 선택하게 한다.
-          showNetworkErrorRetry(carNumber, phone, serviceType, consent, idempotencyKey, failures + 1)
+          showNetworkErrorRetry(carNumber, carModel, phone, serviceType, consent, idempotencyKey, failures + 1)
           return
         }
-        const retry = () => submitReservation(carNumber, phone, serviceType, consent, idempotencyKey)
+        const retry = () => submitReservation(carNumber, carModel, phone, serviceType, consent, idempotencyKey)
 
         if (res.status === 429) {
           // 접수 한도(매장·전화번호 기준)에 걸렸다. 예전엔 3초 오류 화면 뒤 처음 화면으로 돌아가 손님이 모든 걸 다시 입력해야 했다.
@@ -289,7 +340,7 @@
         if (res.status >= 500) {
           // 서버·게이트웨이 오류는 처리가 됐는지 알 수 없다(게이트웨이 시간 초과는 서버가 접수를 끝냈을 수도 있다). 응답을 못 받은
           // 경우와 같이 같은 키로 다시 시도하게 한다.
-          showNetworkErrorRetry(carNumber, phone, serviceType, consent, idempotencyKey, failures + 1)
+          showNetworkErrorRetry(carNumber, carModel, phone, serviceType, consent, idempotencyKey, failures + 1)
           return
         }
         if (!res.ok || !json.ok) {
@@ -415,12 +466,12 @@
       // 두 번째 실패부터 [처음부터 새로 접수]를 보인다(새로 접수하면 번호가 두 개 생길 수 있다).
       // 뒤로가기는 showRateLimited와 같은 이유(SDK가 onBack 전에 화면을 지운다)로 이 화면을 먼저 다시 그린다. 예전엔 [다시 시도]를 누른 뒤
       // 응답을 기다리는 중에 뒤로가기를 누르면 picked 때문에 아무것도 그리지 않아, 응답이 올 때까지(시간 제한 없음) 흰 화면이었다.
-      function showNetworkErrorRetry(carNumber, phone, serviceType, consent, idempotencyKey, failures = 1) {
+      function showNetworkErrorRetry(carNumber, carModel, phone, serviceType, consent, idempotencyKey, failures = 1) {
         let picked = false
         const retry = () => {
           if (picked) return
           picked = true
-          submitReservation(carNumber, phone, serviceType, consent, idempotencyKey, failures)
+          submitReservation(carNumber, carModel, phone, serviceType, consent, idempotencyKey, failures)
         }
         const options = [{ title: '다시 시도', subtitle: '이미 접수됐다면 같은 번호를 알려드려요', onClick: retry }]
         if (failures >= 2) {

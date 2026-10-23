@@ -733,10 +733,33 @@ async function notifyQueueTurn(reservation) {
 // "앞에 몇 명 있는지"(peopleAhead)는 오늘 접수분 중 아직 호출되지 않은 waiting만 센다(store.countWaitingAhead). 예전에는 이미
 // 호출된 손님까지 세어 손님에게 실제보다 긴 대기를 안내했다(2026-10-23 회의 결정으로 바꿈).
 // 같은 차·같은 번호가 오늘 이미 대기열에 있으면 새 번호 없이 그 접수를 duplicate:true로 돌려준다(store.createReservation 주석) -- 알림도
-// 다시 보내지 않는다. 번호가 다르면 새 접수를 만든다.
+// 다시 보내지 않는다. 이번에 차종을 적었으면 그 값으로 기존 접수의 차종을 고친다(비워 두면 그대로 둔다). 번호가 다르면 새 접수를 만든다.
+// 차종(carModel)은 선택이다 -- 보내지 않는 옛 프론트·웹 접수도 그대로 접수된다(normalizeCarModel).
 // 예약 접수 시에는 앞에 사람이 없더라도 항상 waiting 상태로 두고 접수 알림톡만 보낸다.
 // 실제 호출은 직원이 POS/관리자 화면에서 명시적으로 눌렀을 때만 발생한다.
 // 한도: IP 폭주 차단(메모리) → 매장 확인 → 본문 검증 → 매장+IP 한도 → 같은 번호 한도(위 reservation*Limiter 주석).
+
+// 손님이 직접 적는 차종(선택, 예: 트랙스). 자유 문자열이라 POS 카드·관리자 표에 그대로 뜬다 -- 줄바꿈·탭 같은 공백은 띄어쓰기 하나로
+// 모으고, 제어·서식 문자(NUL, 글자 방향을 뒤집는 문자, 폭 없는 공백 등)와 짝 없는 서로게이트는 지운다(NUL은 PostgreSQL에 저장되지 않아 500이
+// 났고, 방향 문자는 다른 줄의 표시를 뒤집는다). 자모가 분리된 채(NFD) 들어오면 글자 수가 늘고 화면에서 깨져 보여 NFC로 맞춘다.
+// 비우거나 공백뿐이면 null(차종 없음)이다. 30자는 글자(코드 포인트) 수로 센다. 옛 프론트처럼 보내지 않으면(undefined·null) null이다.
+// 반환: { value } 또는 { error }(손님 화면에 뜨는 문구).
+const CAR_MODEL_MAX_LENGTH = 30
+function normalizeCarModel(raw) {
+  if (raw === undefined || raw === null) return { value: null }
+  if (typeof raw !== 'string') return { error: '차종을 다시 확인해주세요. 예) 트랙스' }
+  const value = raw
+    .normalize('NFC')
+    .replace(/\s/g, ' ')
+    .replace(/[\p{Cc}\p{Cf}\p{Cs}]/gu, '')
+    .replace(/ {2,}/g, ' ')
+    .trim()
+  if (!value) return { value: null }
+  if (Array.from(value).length > CAR_MODEL_MAX_LENGTH) {
+    return { error: `차종은 ${CAR_MODEL_MAX_LENGTH}자 안으로 입력해주세요. 예) 트랙스` }
+  }
+  return { value }
+}
 
 // 접수 본문 검증. 한도보다 앞에 둬서, 검증에 실패한 요청(400)은 매장+IP·번호 한도를 쓰지 않는다. 통과하면 정규화한 값을
 // req.reservationInput에 담아 넘긴다(번호 한도 키는 req.body.phone으로 만든다 -- reservationPhoneRateKey).
@@ -757,6 +780,10 @@ function validateReservationBody(req, res, next) {
     return res.status(400).json({ ok: false, error: '정비 항목을 선택해주세요.' })
   }
   const serviceType = SERVICE_TYPES[serviceTypeKey]
+  const carModel = normalizeCarModel(req.body?.carModel)
+  if (carModel.error) {
+    return res.status(400).json({ ok: false, error: carModel.error })
+  }
 
   // 개인정보보호법 제15조: 수집·이용 동의 없이는 접수 자체를 막는다(계약 §3.1). 광고 수신
   // 동의(marketingConsent)는 선택 항목이라 false/누락이어도 접수는 진행하되, 그 손님은 나중에
@@ -774,19 +801,20 @@ function validateReservationBody(req, res, next) {
     return res.status(400).json({ ok: false, error: '요청 정보가 올바르지 않아요. 처음부터 다시 시도해주세요.' })
   }
 
-  req.reservationInput = { carNumber, phone, serviceType, privacyConsentAt, marketingConsentAt, idempotencyKey }
+  req.reservationInput = { carNumber, carModel: carModel.value, phone, serviceType, privacyConsentAt, marketingConsentAt, idempotencyKey }
   return next()
 }
 
 app.post('/api/reservations', publicCors, reservationIpFloodLimiter, requireStore, validateReservationBody, reservationStoreLimiter, reservationPhoneLimiter, asyncHandler(async (req, res) => {
   const storeId = req.store.id
-  const { carNumber, phone, serviceType, privacyConsentAt, marketingConsentAt, idempotencyKey } = req.reservationInput
+  const { carNumber, carModel, phone, serviceType, privacyConsentAt, marketingConsentAt, idempotencyKey } = req.reservationInput
 
   let reservation, peopleAhead, duplicate
   try {
     ;({ reservation, peopleAhead, duplicate } = await createReservation({
       storeId,
       carNumber,
+      carModel,
       phone,
       serviceType,
       idempotencyKey,
@@ -1334,6 +1362,8 @@ app.get('/api/pos/queue', posIpFloodLimiter, posQueueReadLimiter, requireStoreTo
       id: r.id,
       queueNumber: r.queueNumber,
       carNumber: r.carNumber,
+      // 손님이 적은 차종(없으면 null). 구버전 탭앱은 이 필드를 무시한다.
+      carModel: r.carModel || null,
       serviceType: r.serviceType,
       status: r.status,
       phoneMasked: maskPhone(r.phone),
@@ -3131,6 +3161,8 @@ app.get('/api/pos/history/recent', posIpFloodLimiter, posQueueReadLimiter, requi
     visits.push({
       kind: 'order',
       carNumber: c.carNumber,
+      // 이 주문이 이어진 접수에 손님이 적은 차종(없거나 접수 없이 온 주문이면 null) -- store.listRecentRepairHistory
+      carModel: c.carModel || null,
       contact: contactOf(c.carNumber),
       customerName: customerNameFromMemo(c.memo, c.carNumber),
       at: c.paidAt || c.createdAt,
@@ -3144,6 +3176,7 @@ app.get('/api/pos/history/recent', posIpFloodLimiter, posQueueReadLimiter, requi
     visits.push({
       kind: 'reservation',
       carNumber: r.carNumber,
+      carModel: r.carModel || null,
       contact: contactOf(r.carNumber),
       customerName: null,
       at: r.completedAt,
@@ -3229,10 +3262,12 @@ app.get('/api/pos/history', posIpFloodLimiter, posQueueReadLimiter, requireStore
     }
   }
 
+  // carModel: 그 접수 때 손님이 적은 차종(없으면 null). 주문만 있는 방문(아래 standalone)에는 접수가 없어 싣지 않는다.
   const visits = reservations.map((r) => ({
     kind: 'reservation',
     reservationId: r.id,
     date: r.serviceDate,
+    carModel: r.carModel || null,
     serviceType: r.serviceType,
     status: r.status,
     at: r.completedAt || r.createdAt,
@@ -3246,7 +3281,7 @@ app.get('/api/pos/history', posIpFloodLimiter, posQueueReadLimiter, requireStore
     if (!visibleReservationIds.has(reservationId)) standalone.push(...orders)
   }
   for (const c of standalone) {
-    visits.push({ kind: 'order', date: null, serviceType: null, status: null, at: c.at, contact: null, orders: [c] })
+    visits.push({ kind: 'order', date: null, carModel: null, serviceType: null, status: null, at: c.at, contact: null, orders: [c] })
   }
   // 최근 방문이 위로.
   visits.sort((a, b) => new Date(b.at) - new Date(a.at))

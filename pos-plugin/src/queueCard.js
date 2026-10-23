@@ -161,12 +161,16 @@ export function queueCardHtml(r, { todayServiceDate = null, now = Date.now(), co
     meta.overdue ? 'is-overdue' : '',
     carried ? 'is-carried' : '',
   ].filter(Boolean).join(' ')
+  // 손님이 접수 때 적은 차종(선택, 예: 트랙스). 차량번호 바로 옆에 작은 보조 글씨로 둔다 -- 일은 여전히 차량번호로 식별한다.
+  // 적지 않았거나 옛 서버라 값이 없으면 아무것도 그리지 않는다. 손님이 자유롭게 적는 값이라 다른 서버 값처럼 이스케이프한다.
+  const carModel = typeof r.carModel === 'string' ? r.carModel.trim() : ''
   return `
     <article class="${classes}" data-reservation-id="${e(r.id)}">
       <div class="queue-number">#${e(r.queueNumber)}</div>
       <div class="queue-main">
         <div class="queue-top">
           <strong class="car-number">${e(r.carNumber)}</strong>
+          ${carModel ? `<span class="car-model">${e(carModel)}</span>` : ''}
           ${carriedBadge}
           <span class="badge ${statusClass}">${e(statusLabel)}</span>
         </div>

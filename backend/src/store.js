@@ -440,9 +440,12 @@ async function setPosToken(storeId, posToken) {
 // 새 값으로 덮어쓰지도 않는다(merchantId는 공개값이라, 차량번호만 알면 남의 알림을 가로챌 수 있다).
 // 중복일 때는 이번 요청의 광고 수신 선택을 기존 접수에 반영한다(동의 → 동의 시각을 지금으로, 거절 → 지운다). 홍보 발송은 "가장 최근
 // 기록 = 지금의 의사"로 판단하므로(findMarketingContactByCarNumber), 반영하지 않으면 방금 거절한 손님에게도 광고가 나간다.
+// 차종(carModel, 선택)도 같이 반영한다: 이번 요청에 차종이 있고 기존 접수에 없거나 다르면 이번 값으로 고친다. 이번에 비워 두면(건너뛰기·옛 프론트)
+// 기존 값을 지우지 않는다 -- 처음 접수 때 적은 차종이 다시 접수하면서 건너뛴 것 때문에 사라지면 안 된다. 같은 휴대폰 번호의 손님 본인이 고치는
+// 것이라 번호와 달리 덮어써도 남의 알림을 가로챌 일이 없다.
 // 두 요청이 동시에 와도 하나만 새로 만들도록, 그 매장·차량번호 단위의 트랜잭션 잠금(pg_advisory_xact_lock -- 커밋하면 풀린다)을
 // 먼저 잡고 확인한다. 다른 차의 접수는 서로 기다리지 않는다.
-async function createReservation({ storeId, carNumber, phone, serviceType, idempotencyKey, privacyConsentAt, marketingConsentAt }) {
+async function createReservation({ storeId, carNumber, carModel = null, phone, serviceType, idempotencyKey, privacyConsentAt, marketingConsentAt }) {
   const today = kstDateString()
   try {
     return await prisma.$transaction(async (tx) => {
@@ -470,7 +473,10 @@ async function createReservation({ storeId, carNumber, phone, serviceType, idemp
       if (sameCar) {
         const consented = await tx.reservation.update({
           where: { id: sameCar.id },
-          data: { marketingConsentAt: marketingConsentAt || null },
+          data: {
+            marketingConsentAt: marketingConsentAt || null,
+            ...(carModel && carModel !== sameCar.carModel ? { carModel } : {}),
+          },
         })
         return { reservation: consented, peopleAhead: await countWaitingAhead(tx, consented), duplicate: true, sameCar: true }
       }
@@ -493,6 +499,7 @@ async function createReservation({ storeId, carNumber, phone, serviceType, idemp
         data: {
           storeId,
           carNumber,
+          carModel: carModel || null,
           phone,
           serviceType,
           queueNumber,
@@ -2439,22 +2446,34 @@ async function listRecentRepairHistory(storeId, limit = 20) {
     },
   })
 
-  // 전산 주문 없이 정비만 끝난 건도 이력이다(부품 없이 점검만 한 경우).
-  const reservations = await prisma.reservation.findMany({
-    where: {
-      storeId,
-      status: 'completed',
-      anonymizedAt: null,
-      historyHiddenAt: null,
-      completedAt: { gte: since },
-      id: { notIn: carts.map((c) => c.reservationId).filter(Boolean) },
-    },
-    orderBy: { completedAt: 'desc' },
-    take,
-    select: { id: true, carNumber: true, serviceType: true, serviceDate: true, completedAt: true },
-  })
+  const linkedIds = [...new Set(carts.map((c) => c.reservationId).filter(Boolean))]
+  const [reservations, linked] = await Promise.all([
+    // 전산 주문 없이 정비만 끝난 건도 이력이다(부품 없이 점검만 한 경우).
+    prisma.reservation.findMany({
+      where: {
+        storeId,
+        status: 'completed',
+        anonymizedAt: null,
+        historyHiddenAt: null,
+        completedAt: { gte: since },
+        id: { notIn: linkedIds },
+      },
+      orderBy: { completedAt: 'desc' },
+      take,
+      select: { id: true, carNumber: true, carModel: true, serviceType: true, serviceDate: true, completedAt: true },
+    }),
+    // 전산 주문에 이어진 접수의 차종(손님이 적은 값). 이어진 접수는 위 목록에서 빠지고 주문 줄이 그 방문을 대신하므로, 차종은
+    // 여기서 따로 읽어 주문에 붙인다. 파기(익명화)된 접수의 값은 쓰지 않는다.
+    linkedIds.length
+      ? prisma.reservation.findMany({ where: { id: { in: linkedIds }, anonymizedAt: null }, select: { id: true, carModel: true } })
+      : [],
+  ])
+  const carModelOf = new Map(linked.map((r) => [r.id, r.carModel]))
 
-  return { carts, reservations }
+  return {
+    carts: carts.map((c) => ({ ...c, carModel: (c.reservationId && carModelOf.get(c.reservationId)) || null })),
+    reservations,
+  }
 }
 
 async function findRepairHistoryByCarNumber(storeId, carNumber, limit = 10) {
@@ -2466,7 +2485,7 @@ async function findRepairHistoryByCarNumber(storeId, carNumber, limit = 10) {
     orderBy: { createdAt: 'desc' },
     take: Math.min(Math.max(Number(limit) || 10, 1), 50),
     select: {
-      id: true, serviceType: true, serviceDate: true, status: true,
+      id: true, carModel: true, serviceType: true, serviceDate: true, status: true,
       createdAt: true, completedAt: true, phone: true,
     },
   })
@@ -2617,6 +2636,7 @@ const PURGE_BATCH_SIZE = 1000
 const PURGE_MAX_ITERATIONS = 10
 // Reservation.phone은 NOT NULL 컬럼이라(예약 화면은 항상 전화번호를 받는다) null로 지울 수 없다 —
 // 식별 불가능한 더미값으로 대체한다. Payment.phone은 nullable이라 그냥 null로 지운다.
+// 차종(carModel)도 함께 지운다 -- 손님이 자유롭게 적는 칸이라 이름 같은 다른 내용이 들어 있을 수 있다.
 const ANONYMIZED_RESERVATION_PHONE = '0100000000'
 const ANONYMIZED_CAR_NUMBER = '삭제됨'
 
@@ -2631,7 +2651,7 @@ async function purgeExpiredReservations(cutoff) {
     if (!targets.length) break
     const result = await prisma.reservation.updateMany({
       where: { id: { in: targets.map((t) => t.id) } },
-      data: { phone: ANONYMIZED_RESERVATION_PHONE, carNumber: ANONYMIZED_CAR_NUMBER, anonymizedAt: new Date() },
+      data: { phone: ANONYMIZED_RESERVATION_PHONE, carNumber: ANONYMIZED_CAR_NUMBER, carModel: null, anonymizedAt: new Date() },
     })
     total += result.count
     if (targets.length < PURGE_BATCH_SIZE) break

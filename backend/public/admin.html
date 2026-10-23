@@ -1889,10 +1889,11 @@ function renderReservations(list, total, hasMore) {
     const canRetryIntake = !canRetryNotify && r.intakeNotifyStatus === 'failed' && r.status !== 'completed' && r.status !== 'cancelled'
     const canCancel = r.status === 'waiting' || r.status === 'called' || r.status === 'notify_failed'
     const intakeFailMark = r.intakeNotifyStatus === 'failed' ? '<span class="intake-fail-mark">접수 알림 실패</span>' : ''
+    // 차종은 손님이 접수 때 적은 자유 문자열(선택)이라 차량번호 밑에 작게 둔다. 적지 않았거나 옛 서버면 아무것도 그리지 않는다.
     return `
     <tr>
       <td>${r.queueNumber}번</td>
-      <td>${escapeHtml(r.carNumber)}</td>
+      <td>${escapeHtml(r.carNumber)}${r.carModel ? `<br><span class="muted">${escapeHtml(r.carModel)}</span>` : ''}</td>
       <td>${escapeHtml(r.serviceType || '-')}</td>
       <td>${escapeHtml(r.phone)}</td>
       <td><span class="badge ${escapeHtml(r.status)}">${escapeHtml(STATUS_LABEL[r.status] || r.status)}</span>${intakeFailMark}</td>
@@ -1908,7 +1909,7 @@ function renderReservations(list, total, hasMore) {
     </tr>
   `}).join('')
   view.innerHTML = `<table>
-    <thead><tr><th>대기번호</th><th>차량번호</th><th>정비항목</th><th>전화번호</th><th>상태</th><th>접수시간</th><th>동작</th></tr></thead>
+    <thead><tr><th>대기번호</th><th>차량번호·차종</th><th>정비항목</th><th>전화번호</th><th>상태</th><th>접수시간</th><th>동작</th></tr></thead>
     <tbody>${rows}</tbody>
   </table>${hasMore ? '<div class="load-more-wrap"><button class="row-btn load-more" id="res-load-more" type="button">더 보기 (' + list.length + ' / ' + total + ')</button></div>' : ''}`
 }
