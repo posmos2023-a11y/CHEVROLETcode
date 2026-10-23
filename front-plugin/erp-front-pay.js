@@ -198,7 +198,9 @@
         retryAfterMs: parseRetryAfter(res.headers?.get?.('Retry-After')),
       }
     } catch (e) {
-      return { ok: false, status: 0, body: { error: '서버에 연결할 수 없습니다.' } }
+      // 이 문구는 설정 화면·결제 화면에 그대로 보인다(settings.html과 같은 문구). 결제 화면의 image 결과 화면은 줄을 자동으로
+      // 바꾸지 않아 두 줄로 나눠 둔다.
+      return { ok: false, status: 0, body: { error: '서버에 연결하지 못했어요\n인터넷 연결을 확인해주세요' } }
     } finally {
       if (timer) clearTimeout(timer)
     }
@@ -206,6 +208,19 @@
 
   function listCarts(token) {
     return api('GET', '/api/front/erp-carts', token)
+  }
+
+  // 대기화면의 주문 확인 간격. 서버가 목록 응답에 pollMs를 실어 보내면 그 값을 쓴다 -- 400대 ZIP을 다시 배포하지 않고 서버 배포만으로
+  // 요청 수를 줄이거나 늘릴 수 있게 하려는 것이다. 잘못된 값 하나가 모든 매장에 퍼지지 않게 2~30초로 자르고, 없거나 숫자가 아니면 3초다.
+  const POLL_DEFAULT_MS = 3000
+  const POLL_MIN_MS = 2000
+  const POLL_MAX_MS = 30000
+
+  function pollIntervalOf(body) {
+    const raw = body?.pollMs
+    const ms = raw === null || raw === undefined || raw === '' ? NaN : Number(raw)
+    if (!Number.isFinite(ms)) return POLL_DEFAULT_MS
+    return Math.min(POLL_MAX_MS, Math.max(POLL_MIN_MS, Math.round(ms)))
   }
 
   function startCart(token, cartId, paymentKey) {
@@ -561,6 +576,16 @@
     return postWithRetry(`/api/front/erp-carts/${encodeURIComponent(cartId)}/refund-result`, token, body)
   }
 
+  // 카드 없이 취소하는 건인지(NICE VAN 카드 결제이고 이 단말기 SDK에 무카드 취소가 있을 때). 취소창 앞의 안내 문구(erp-pay.html)도
+  // 이 값으로 '카드를 준비해주세요'를 붙일지 정한다 -- 실제 취소 방식(requestRefund)과 안내가 어긋나지 않게 한 곳에서 판단한다.
+  function isCardlessRefund(refund) {
+    return Boolean(refund
+      && refund.paymentMethod === 'CARD'
+      && refund.van === 'NICE'
+      && refund.vanTransactionKey
+      && typeof window.sdk?.payment?.requestCardlessPaymentCancel === 'function')
+  }
+
   // 원거래와 같은 값으로 취소를 요청한다. NICE VAN 카드 결제는 카드 없이(무카드) 취소할 수 있다.
   function requestRefund(refund) {
     const base = {
@@ -574,7 +599,7 @@
       timeoutMs: 60000,
       localeCode: 'ko',
     }
-    if (refund.paymentMethod === 'CARD' && refund.van === 'NICE' && refund.vanTransactionKey && sdk.payment.requestCardlessPaymentCancel) {
+    if (isCardlessRefund(refund)) {
       return sdk.payment.requestCardlessPaymentCancel({ ...base, paymentMethod: 'CARD', vanTransactionKey: refund.vanTransactionKey })
     }
     const params = { ...base, paymentMethod: refund.paymentMethod }
@@ -831,7 +856,7 @@
   // --- 확인이 안 끝난 지난 기록이 걸린 주문 쉬게 하기 ----------------------------------
   // 지난 시도 기록이 확인되지 않은 주문은 결제·취소창을 띄울 수 없다(그 기록을 덮으면 승인 여부를 영영 모른다). 그런데 대기화면은
   // 그 주문을 보면 곧바로 결제 화면으로 넘기고, 결제 화면은 또 확인하지 못해 돌아오는 일을 쉬지 않고 되풀이했다(그동안 다른 손님은
-  // [예약하기]도 못 쓴다). 그래서 그 주문(그 취소 건)만 1분 쉬게 하고, 다시 막히면 2분·4분·8분, 최대 10분으로 늘린다. 다른 주문과
+  // [접수하기]도 못 쓴다). 그래서 그 주문(그 취소 건)만 1분 쉬게 하고, 다시 막히면 2분·4분·8분, 최대 10분으로 늘린다. 다른 주문과
   // 취소는 그대로 진행한다. 쉬는 동안에도 대기화면의 뒤 복구(index.html)가 기록을 계속 확인하고, 기록이 정리되면
   // (clearInflight·clearRefundInflight) 바로 풀린다. 직원이 주문을 다시 보내도 풀리지 않는다 -- 기록은 그대로 남아 있다.
   // 페이지를 옮겨도 남아야 해서 sessionStorage에 둔다(snooze와 같다).
@@ -926,6 +951,7 @@
     setToken,
     clearToken,
     listCarts,
+    pollIntervalOf,
     startCart,
     reportResult,
     isFinalRejection,
@@ -940,6 +966,7 @@
     recoverInflight,
     startRefund,
     reportRefund,
+    isCardlessRefund,
     requestRefund,
     claimRefundInflight,
     clearRefundInflight,

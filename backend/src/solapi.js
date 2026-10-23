@@ -159,20 +159,40 @@ function sendFailureLog(error) {
 // Phase 4: 발신번호/카카오채널은 브랜드 전체 공용(SOLAPI_SENDER/SOLAPI_KAKAO_PFID 그대로) — 매장 구분은
 // #{매장명} 변수로만 한다. 매장별 발신번호가 필요해지면(프랜차이즈 개별 사업자 전환 시) 이 함수들에
 // storeId 인자를 추가해 store.phone_sender를 조회하도록 확장하면 된다.
+//
+// ⚠️ 본문(text) 문구 규칙(2026-10-23): 템플릿 ID 환경변수가 설정된 메시지는 kakaoOptions와 함께 나가므로, text가 카카오에 승인된
+// 템플릿 문구와 글자 하나까지 같아야 한다(다르면 발송이 실패한다). 그래서 템플릿이 설정돼 있으면 지금까지의 문구를 그대로 쓰고,
+// 템플릿이 없어 일반 문자(SMS/LMS)로만 나갈 때만 새 문구('예약' 대신 '접수')를 쓴다. 승인 문구를 바꾸려면 새 템플릿을
+// 신청해 승인받은 뒤 템플릿 ID와 이 함수의 템플릿 문구를 같은 날 함께 바꾼다.
+function usesTemplate(templateId) {
+  return Boolean(templateId)
+}
 
 // 예약 접수 완료 (대기번호 발급). 앞에 대기자가 없어도 호출 알림은 보내지 않고
 // 모든 예약에 접수 알림만 보낸다. 순서 호출은 직원의 명시적인 호출 동작에서만 보낸다.
+// peopleAhead는 아직 호출되지 않은 대기 손님 수다(store.countWaitingAhead).
 async function sendReservationAlimtalk({ phone, carNumber, queueNumber, peopleAhead, serviceType, storeName, storeId, reservationId }) {
-  const waitingMessage = peopleAhead === 0
-    ? '현재 대기 중이며 직원 호출 후 순서 안내를 드립니다.'
-    : `앞으로 ${peopleAhead}명 남았습니다.`
+  const templateId = process.env.SOLAPI_KAKAO_TEMPLATE_RESERVATION
+  let text
+  if (usesTemplate(templateId)) {
+    // 템플릿 문구 그대로(위 규칙). 바꾸지 않는다.
+    const waitingMessage = peopleAhead === 0
+      ? '현재 대기 중이며 직원 호출 후 순서 안내를 드립니다.'
+      : `앞으로 ${peopleAhead}명 남았습니다.`
+    text = `[${storeName || '예약 접수'}]\n차량번호 ${carNumber} · ${serviceType} 예약이 접수되었습니다.\n대기번호 ${queueNumber}번, ${waitingMessage}`
+  } else {
+    const waitingMessage = peopleAhead === 0
+      ? '바로 다음 순서예요. 순서가 되면 다시 알려드릴게요.'
+      : `고객님 앞에 ${peopleAhead}명이 기다리고 있어요.`
+    text = `[${storeName || '정비 접수'}]\n차량번호 ${carNumber} · ${serviceType} 접수했어요.\n대기번호 ${queueNumber}번, ${waitingMessage}`
+  }
   return sendAlimtalk({
     phone,
     storeId,
     recordId: reservationId,
     recordType: 'reservation',
-    text: `[${storeName || '예약 접수'}]\n차량번호 ${carNumber} · ${serviceType} 예약이 접수되었습니다.\n대기번호 ${queueNumber}번, ${waitingMessage}`,
-    templateId: process.env.SOLAPI_KAKAO_TEMPLATE_RESERVATION,
+    text,
+    templateId,
     variables: {
       '#{매장명}': storeName || '',
       '#{차량번호}': carNumber,
@@ -222,15 +242,19 @@ async function sendRepairDoneAlimtalk({ phone, carNumber, serviceType, storeName
 
 // 결제 완료 전자영수증. carNumber/serviceType은 결제 화면에서 다시 입력받는 게 아니라
 // 전화번호로 찾은 예약 기록에서 가져온 값이라 없을 수도 있다(예약 없이 바로 결제한 손님).
+// 전산 주문 영수증은 serviceType 자리에 품목 요약('엔진오일 5W30 (4L) 외 3건')이 들어온다(server.js sendErpCartReceiptInner) --
+// 그래서 일반 문자 본문은 '정비내역'이라고 쓴다. 템플릿이 설정돼 있으면 승인 문구('정비항목') 그대로다(위 본문 문구 규칙).
 async function sendReceiptAlimtalk({ phone, carNumber, serviceType, amount, storeName, storeId, paymentId }) {
   const amountText = amount != null ? `${Number(amount).toLocaleString('ko-KR')}원` : ''
+  const templateId = process.env.SOLAPI_KAKAO_TEMPLATE_RECEIPT
+  const serviceLabel = usesTemplate(templateId) ? '정비항목' : '정비내역'
   return sendAlimtalk({
     phone,
     storeId,
     recordId: paymentId,
     recordType: 'payment',
-    text: `[${storeName || '전자영수증'}]\n결제가 완료되었습니다.${carNumber ? `\n차량번호 ${carNumber}` : ''}${serviceType ? `\n정비항목 ${serviceType}` : ''}${amountText ? `\n결제금액 ${amountText}` : ''}`,
-    templateId: process.env.SOLAPI_KAKAO_TEMPLATE_RECEIPT,
+    text: `[${storeName || '전자영수증'}]\n결제가 완료되었습니다.${carNumber ? `\n차량번호 ${carNumber}` : ''}${serviceType ? `\n${serviceLabel} ${serviceType}` : ''}${amountText ? `\n결제금액 ${amountText}` : ''}`,
+    templateId,
     variables: {
       '#{매장명}': storeName || '',
       '#{차량번호}': carNumber || '',
@@ -253,9 +277,14 @@ function promoOptOutText() {
 
 // 문자(SMS/LMS)로 나갈 때의 본문. 알림톡으로 나갈 때는 카카오에 승인된 템플릿 문구가 쓰인다.
 // "(광고)" 바로 뒤에 전송자 명칭(매장명)을 둔다(정보통신망법 시행령 제61조 명시사항).
+// 일반 문자 본문은 둘째 줄에 매장명을 다시 넣지 않는다 -- `${name}을`은 매장명이 모음으로 끝나면('…서비스센터') 조사가 틀렸다.
+// 매장명은 바로 윗줄 "(광고) 매장명"에 이미 있다. 템플릿이 설정돼 있으면 승인 문구 그대로 둔다(위 본문 문구 규칙).
 function buildPromoText(storeName) {
   const name = storeName || '저희 매장'
-  return `(광고) ${name}\n그동안 ${name}을 이용해주셔서 감사합니다. 지금 다시 방문하시면 혜택을 드립니다.\n\n${promoOptOutText()}`
+  const body = usesTemplate(process.env.SOLAPI_KAKAO_TEMPLATE_PROMO)
+    ? `그동안 ${name}을 이용해주셔서 감사합니다. 지금 다시 방문하시면 혜택을 드립니다.`
+    : '그동안 저희 매장을 이용해주셔서 감사합니다. 지금 다시 방문하시면 혜택을 드립니다.'
+  return `(광고) ${name}\n${body}\n\n${promoOptOutText()}`
 }
 
 async function sendPromoAlimtalk({ phone, carNumber, storeName, storeId, paymentId }) {

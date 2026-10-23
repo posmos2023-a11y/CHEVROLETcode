@@ -82,6 +82,12 @@ model Reservation {
   @@index([storeId, createdAt])
   @@index([storeId, phone])
   @@index([storeId, intakeNotifyStatus])
+  // POS 대기열의 이월 조회(store.listActiveQueueForStore: 날짜와 무관한 called/notify_failed)가 이 접두어를 쓴다.
+  @@index([storeId, status])
+  // 본사 전체 요약(getDailySummary, storeId 없이 serviceDate+status로 센다)
+  @@index([serviceDate, status])
+  // 개인정보 파기 배치(purgeExpiredReservations, createdAt < cutoff)
+  @@index([createdAt])
 }
 
 model Payment {
@@ -108,6 +114,8 @@ model Payment {
   @@index([storeId, createdAt])
   @@index([storeId, phone])
   @@index([promoAt, promoSent, promoClaimedAt])
+  // 본사 결제 목록·요약(매장을 고르지 않은 전체 조회)과 파기 배치
+  @@index([createdAt])
 }
 
 // Design Ref: Phase 4 결제 웹훅 수신. x-toss-webhook-id로 중복 수신을 막는다
@@ -259,8 +267,9 @@ model ErpCart {
   refundRequestedAt DateTime?
   refundedAt        DateTime?
   refundNote        String?   // 누가 어떻게 취소했는지(POS 취소 / 프론트 취소 / 현금 환불 / 토스 취소 확인)
-  // 쓰지 않음. 페이스페이를 카드 취소 화면으로 띄우는 실험(2026-10-22)에 썼다가 실패해 코드를 뺐다. 배포 중 옛 인스턴스가
-  // 이 컬럼을 읽을 수 있어 바로 지우지 않았다 -- 다음 정리 때 DROP COLUMN 해도 된다.
+  // 쓰지 않음. 페이스페이를 카드 취소 화면으로 띄우는 실험(2026-10-22)에 썼다가 실패해 코드를 뺐다. 마지막까지 남아 있던
+  // 쓰기(store.js 취소 요청·철회의 refundMode: null)도 2026-10-23에 지웠다 -- 이제 읽는 곳도 쓰는 곳도 없다. 그 코드가 나간
+  // 리비전만 남은 뒤(옛 리비전이 아직 이 컬럼을 쓰면 DROP 뒤 그 쓰기가 실패한다) 다음 정리 때 DROP COLUMN 한다.
   refundMode        String?
   // 프론트 취소 시도 구분. 프론트가 취소창을 띄울 때마다 새로 만든 attemptId를 refund-start에 실어 보내고 refund-result에
   // 같은 값을 돌려보낸다. refundAttemptId는 지금 취소를 쥐고 있는 시도, refundStartedAt은 그 시작 시각(직원이 10분 넘게
@@ -289,6 +298,11 @@ model ErpCart {
   @@index([tossPaymentId])
   // POS 폴링(/api/pos/queue frontOrphans)이 5초마다 "최근 7일 미반영 승인 흔적"을 찾는다. 대부분 null이라 작다.
   @@index([storeId, frontOrphanAt])
+  // POS 폴링의 최근 결제(store.listSettledErpCartsForPos, paidAt >= 7일 전)와 웹훅 현금 매칭(최근 paidAt). 이 인덱스가 없으면
+  // 폴링마다 그 매장의 결제 행을 전부 읽고 paidAt으로 거른다.
+  @@index([storeId, paidAt])
+  // 본사 전체 요약(getDailySummary, 매장을 고르지 않은 createdAt 하루 범위)과 파기·만료 배치(createdAt < cutoff)
+  @@index([createdAt])
 }
 
 // 토스 결제 웹훅으로 받은 결제 기록. 토스 Open API에는 "결제 목록 조회"가 없어서(단건·주문별 조회만

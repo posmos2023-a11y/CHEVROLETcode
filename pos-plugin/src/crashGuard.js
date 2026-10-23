@@ -40,11 +40,12 @@ function show(title, detail) {
 
   const h = document.createElement('div')
   h.style.cssText = 'font-size:18px;font-weight:800;letter-spacing:-0.04em'
-  h.textContent = '화면을 그리는 중 문제가 생겼습니다'
+  h.textContent = '화면을 그리는 중 문제가 생겼어요'
 
+  // 다시 불러오기가 늘 복구해 주지는 않는다 -- 할 일의 순서(먼저 다시 불러오기, 반복되면 전달)와 전달 방법을 알려 준다.
   const p = document.createElement('div')
-  p.style.cssText = 'font-size:13px;color:#6b7684;line-height:1.6'
-  p.textContent = '아래 내용을 그대로 담당자에게 전달해주세요. [다시 불러오기]를 누르면 복구됩니다.'
+  p.style.cssText = 'font-size:13px;color:#4e5968;line-height:1.6'
+  p.textContent = '[다시 불러오기]를 눌러주세요. 계속 이 화면이 나오면 아래 내용을 사진으로 찍어 본사에 보내주세요.'
 
   const pre = document.createElement('pre')
   pre.style.cssText = [

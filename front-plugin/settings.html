@@ -17,7 +17,7 @@
       플러그인 설정 화면(프론트 설정 > 플러그인 선택 > 플러그인 설정).
       전산 주문을 이 프론트에서 결제하려면 매장 토큰(X-Store-Token)이 필요하다. POS 탭앱과 같은
       값이며, 관리자 웹 [매장 개통 설정] > 해당 매장 > POS 토큰 [보기]에서 확인한다.
-      매장 토큰을 넣지 않은 프론트는 기존 기능(예약/결제)만 쓴다.
+      매장 토큰을 넣지 않은 프론트는 접수 기능만 쓴다(대기화면은 앱을 켤 때 한 번만 토큰 안내를 띄운다).
     -->
     <div id="app"></div>
     <script>
@@ -29,14 +29,14 @@
 
       async function showMenu(notice) {
         const token = await pay.getToken()
-        let subtitle = '전산 주문 결제를 쓰려면 매장 토큰을 넣어주세요.'
+        let subtitle = '전산 주문 결제를 쓰려면 매장 토큰을 넣어주세요'
         if (token) {
           const { ok, status, body } = await pay.listCarts(token)
           subtitle = ok
             ? `연결됨: ${body.storeName || '매장'}`
             : status === 401
-              ? '저장된 매장 토큰이 올바르지 않습니다. 다시 넣어주세요.'
-              : '서버에 연결하지 못했습니다. 인터넷 연결을 확인해주세요.'
+              ? '저장된 매장 토큰이 올바르지 않아요. 다시 넣어주세요'
+              : body.error || '서버에 연결하지 못했어요\n인터넷 연결을 확인해주세요' // 연결 실패는 api()가 같은 문구를 준다
         }
         const options = [
           { title: '매장 토큰 직접 입력', onClick: () => showTokenInput() },
@@ -47,7 +47,7 @@
             title: '매장 토큰 지우기',
             onClick: async () => {
               await pay.clearToken()
-              showMenu('매장 토큰을 지웠습니다. 전산 주문 결제가 꺼졌습니다.')
+              showMenu('매장 토큰을 지웠어요. 전산 주문 결제가 꺼졌어요')
             },
           })
         }
@@ -66,7 +66,7 @@
           type: 'text',
           top: {
             title: '매장 토큰을 입력해주세요',
-            subtitle: errorText || '관리자 웹 [매장 개통 설정]의 POS 토큰과 같은 값입니다.',
+            subtitle: errorText || '관리자 웹 [매장 개통 설정]의 POS 토큰을 넣어주세요',
           },
           input: { placeholder: '매장 토큰', type: 'password' },
           button: { label: '저장' },
@@ -77,8 +77,16 @@
 
       function showTokenScan() {
         sdk.template.renderQRScanPage({
-          title: '매장 토큰 QR을 화면에 비춰주세요',
-          onSuccess: (data) => saveToken(data?.value, () => showMenu('QR에서 올바른 매장 토큰을 읽지 못했습니다.')),
+          title: '매장 토큰 QR을 카메라에 비춰주세요',
+          // QR에 값이 없을 때만 'QR을 못 읽었다'고 한다. 값은 읽었는데 서버가 거절했거나 연결이 안 되면 그 사유를 그대로 보여 준다
+          // (예전엔 어떤 실패든 'QR을 못 읽었다'고 해서 직원이 엉뚱한 곳을 봤다).
+          onSuccess: (data) => {
+            if (!String(data?.value ?? '').trim()) {
+              showMenu('QR에서 매장 토큰을 읽지 못했어요')
+              return
+            }
+            saveToken(data.value, (reason) => showMenu(reason))
+          },
           onBack: () => showMenu(),
         })
       }
@@ -88,20 +96,20 @@
       async function saveToken(raw, onInvalid) {
         const token = String(raw || '').trim()
         if (!token) {
-          onInvalid('매장 토큰을 입력해주세요.')
+          onInvalid('매장 토큰을 입력해주세요')
           return
         }
         const { ok, status, body } = await pay.listCarts(token)
         if (!ok) {
-          onInvalid(status === 401 ? '매장 토큰이 올바르지 않습니다.' : (body.error || '서버에 연결하지 못했습니다.'))
+          onInvalid(status === 401 ? '매장 토큰이 올바르지 않아요' : (body.error || '서버에 연결하지 못했어요\n인터넷 연결을 확인해주세요'))
           return
         }
         await pay.setToken(token)
         sdk.template.renderResultPage({
           type: 'image',
           status: 'success',
-          title: '매장 토큰을 저장했습니다',
-          description: `${body.storeName || '매장'}의 전산 주문을 이 프론트에서 결제합니다.`,
+          title: '매장 토큰을 저장했어요',
+          description: `${body.storeName || '매장'}\n전산 주문을 이 단말기에서 결제해요`, // image 타입은 줄을 자동으로 바꾸지 않는다
           timerMs: 4000,
           onTimeout: goHome,
           localeCode: 'ko',

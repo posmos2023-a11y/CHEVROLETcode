@@ -156,6 +156,9 @@
   .row-btn.call:disabled, .row-btn.complete:disabled, .row-btn.cancel:disabled { color: #b0b8c1; border-color: var(--border); background: var(--surface); cursor: not-allowed; }
   .row-btn.del { color: var(--error); }
   .row-btn:hover:not(:disabled) { filter: brightness(0.96); }
+  /* 흰 바탕 .row-btn은 위 button:hover(진파랑 바탕)를 그대로 받아 검은 글씨가 진파랑 위에 놓여 읽기 어려웠다. 색이 있는 버튼
+     (call·complete·retry·cancel)은 자기 바탕을 지키므로 흰 바탕 버튼만 옅은 회색으로 둔다. */
+  .row-btn:not(.call):not(.complete):not(.retry):not(.cancel):hover:not(:disabled) { background: var(--surface); }
   .load-more-wrap { padding: 12px; text-align: center; }
   .row-btn.load-more { padding: 8px 16px; }
   .refresh-note { font-size: 12px; color: var(--muted); margin: 10px 2px 0; }
@@ -201,6 +204,8 @@
   .summary-card .summary-item { display: flex; align-items: baseline; gap: 4px; }
   .summary-card .summary-sub { color: var(--muted); font-size: 12px; }
   .summary-card .summary-alert { color: var(--error); font-weight: 700; }
+  /* 예전 기준(4자 이상)으로 직접 지정한 짧은 POS 토큰. 지금은 12자 이상·영문+숫자만 지정할 수 있다(server.js validatePosToken). */
+  .weak-token { display: inline-block; margin-left: 6px; padding: 2px 6px; border-radius: 6px; background: #fff0f1; color: #d93025; font-size: 11px; font-weight: 700; }
   .pos-token-value {
     font-family: "Consolas", monospace;
     font-size: 12px;
@@ -296,7 +301,6 @@
 <div id="login-wrap">
   <div id="login-card">
     <h1>관리자 로그인</h1>
-    <p>이메일/비밀번호로 로그인하세요.</p>
     <input type="email" id="email-input" placeholder="이메일" autocomplete="username" style="width:100%;padding:14px 16px;font-size:16px;background:var(--surface);border:1.5px solid transparent;border-radius:12px;outline:none;margin-bottom:10px;box-sizing:border-box;" />
     <input type="password" id="password-input" placeholder="비밀번호" autocomplete="current-password" />
     <div class="err" id="login-err"></div>
@@ -315,9 +319,9 @@
 
 <main id="main">
   <details class="testform" id="store-add">
-    <summary>가맹점 관리 (본사) — 매장 등록</summary>
+    <summary>매장 관리 (본사) — 매장 등록</summary>
     <div class="testform-body">
-      <input type="text" id="store-merchant-id" placeholder="merchantId (토스 SDK merchant.id)" />
+      <input type="text" id="store-merchant-id" placeholder="토스 가맹점 ID (merchantId)" />
       <input type="text" id="store-name" placeholder="매장명" />
       <input type="text" id="store-biz" placeholder="사업자번호 (선택)" />
       <button id="store-add-btn">매장 등록</button>
@@ -326,9 +330,9 @@
   </details>
 
   <details class="testform" id="store-admin-add">
-    <summary>가맹점 관리 (본사) — 매장 관리자 계정 발급</summary>
+    <summary>매장 관리 (본사) — 매장 관리자 계정 발급</summary>
     <div class="testform-body">
-      <input type="text" id="sa-merchant-id" placeholder="merchantId (등록된 매장)" />
+      <input type="text" id="sa-merchant-id" placeholder="토스 가맹점 ID (등록된 매장)" />
       <input type="email" id="sa-email" placeholder="이메일" />
       <input type="password" id="sa-password" placeholder="비밀번호 (8자 이상)" />
       <button id="sa-add-btn">계정 발급</button>
@@ -339,14 +343,15 @@
   <details class="testform" id="pos-token-panel">
     <summary>매장 개통 설정 (POS 토큰 · 전산 코드)</summary>
     <p style="font-size:12px;color:var(--muted);margin:8px 2px 12px;">
-      <strong>POS 토큰</strong>은 POS 탭앱이 매장을 인증하는 값입니다. 외부에 노출되지 않도록 주의하세요.<br>
+      <strong>POS 토큰</strong>은 POS 탭앱과 토스 프론트(손님 단말기)가 매장을 인증하는 값이에요. 외부에 노출되지 않도록 주의하세요.
+      직접 지정할 때는 12자 이상으로 영문과 숫자를 섞어주세요. <span class="weak-token">약한 토큰</span>이 붙은 매장은 예전 기준의 짧은 토큰이라 새로 발급하는 것이 좋아요.<br>
       <strong>전산 코드</strong>는 쉐보레 전산이 이 매장을 부르는 이름(예: CHV-001)입니다.
       전산은 매장을 이 코드로 지정하므로, 값이 없으면 그 매장으로는 전산 주문이 들어오지 못합니다.<br>
       <strong>사업자번호</strong>를 채워두면 전산 코드를 손으로 넣지 않아도 됩니다 — 전산이 주문에
       사업자번호를 함께 보내오면 서버가 매장을 찾아 코드를 자동으로 붙입니다.
     </p>
     <div class="erp-cart-filter" id="store-mgmt-filter" style="display:none">
-      <input type="search" id="store-search-input" placeholder="매장명 또는 merchantId 검색" />
+      <input type="search" id="store-search-input" placeholder="매장명 또는 토스 가맹점 ID 검색" />
       <button class="row-btn" id="store-search-btn" type="button">검색</button>
       <button class="row-btn" id="store-search-clear-btn" type="button">지우기</button>
     </div>
@@ -356,8 +361,7 @@
   <details class="testform" id="password-panel">
     <summary>내 비밀번호 변경</summary>
     <p style="font-size:12px;color:var(--muted);margin:8px 2px 12px;">
-      비밀번호를 잊으면 스스로 복구할 방법이 없습니다(재설정 메일 기능이 없습니다).
-      정기적으로 바꾸시고, 잊지 않도록 안전한 곳에 보관하세요.
+      비밀번호를 잊으면 되찾을 방법이 없어요. 안전한 곳에 보관해주세요.
     </p>
     <div class="testform-body">
       <input type="password" id="pw-current" placeholder="지금 쓰는 비밀번호" autocomplete="current-password" />
@@ -371,7 +375,7 @@
   <details class="testform" id="promo-campaign-panel">
     <summary>기간 지정 홍보 문자 보내기</summary>
     <p style="font-size:12px;color:var(--muted);margin:8px 2px 12px;">
-      지정한 기간에 방문(예약·결제)한 손님 중 <strong>가장 최근 방문에서 광고 수신에 동의한 번호</strong>에게만
+      지정한 기간에 방문(접수·결제)한 손님 중 <strong>가장 최근 방문에서 광고 수신에 동의한 번호</strong>에게만
       홍보 문자를 보냅니다. 같은 번호는 한 번만 보내고, 수신거부를 등록한 번호, 동의한 지 2년이 지난 번호,
       최근 30일 안에 홍보(자동 발송 포함)를 받은 번호는 빠집니다. 야간(21시~8시)에는 보낼 수 없습니다.
       문구는 등록된 홍보 템플릿("(광고)"·수신거부 안내 포함)을 씁니다. 본사 관리자는 상단에서 매장을 먼저 고르세요.
@@ -399,21 +403,22 @@
     <summary>전산 주문 이력</summary>
     <p style="font-size:12px;color:var(--muted);margin:8px 2px 12px;">
       쉐보레 전산이 보낸 주문이 어디까지 갔는지 확인합니다. 매장이 "전산에서 보냈는데 POS에
-      안 떴어요"라고 할 때 접수는 됐는지, POS가 가져갔는지, 실패했는지를 여기서 봅니다.
+      안 떴어요"라고 할 때 서버에 들어왔는지, POS가 가져갔는지, 실패했는지를 여기서 봅니다.
     </p>
     <div class="erp-cart-filter">
       <select id="erp-cart-status">
         <option value="">전체 상태</option>
-        <option value="pending">대기중 (POS·프론트가 아직 안 가져감)</option>
-        <option value="loaded">담김</option>
+        <option value="pending">대기 중 (POS·프론트가 아직 안 가져감)</option>
+        <option value="loaded">POS에 담김</option>
         <option value="paying">프론트 결제 중</option>
-        <option value="paid">결제완료</option>
-        <option value="refund_requested">취소 요청됨</option>
+        <option value="paid">결제 완료</option>
+        <option value="refund_requested">결제 취소 요청됨</option>
+        <option value="refunding">프론트에서 결제 취소 중</option>
         <option value="refunded">결제 취소됨</option>
         <option value="failed">담기 실패</option>
         <option value="dismissed">매장이 지움</option>
         <option value="expired">만료됨</option>
-        <option value="cancelled">전산이 취소</option>
+        <option value="cancelled">전산에서 취소함</option>
       </select>
       <button class="row-btn" id="erp-cart-reload" type="button">조회</button>
     </div>
@@ -421,17 +426,18 @@
   </details>
 
   <div class="callnext">
-    <div id="callnext-info">대기중인 다음 손님을 호출하고 순서 알림을 보냅니다.</div>
+    <div id="callnext-info">대기 중인 다음 손님을 호출하고 순서 알림을 보냅니다.</div>
     <button id="callnext-btn">다음 손님 호출</button>
   </div>
 
-  <details class="testform">
-    <summary>테스트 예약 생성 (실제 손님 예약과 동일하게 접수 알림이 발송됩니다)</summary>
+  <!-- 본사 계정에만 보인다(showApp). 매장 관리자가 시험 삼아 누르면 실제 대기번호·문자가 나가고 오늘 집계와 POS 대기열에 섞였다. -->
+  <details class="testform" id="test-intake-panel">
+    <summary>테스트 접수 만들기 (실제 손님처럼 접수 알림이 발송됩니다)</summary>
     <div class="testform-body">
       <input type="text" id="test-car" placeholder="차량번호 (예: 12가3456)" maxlength="8" />
       <select id="test-service"></select>
       <input type="text" id="test-phone" placeholder="전화번호 (예: 01012345678)" maxlength="11" />
-      <button id="test-submit-btn">테스트 예약 등록</button>
+      <button id="test-submit-btn">테스트 접수 등록</button>
     </div>
     <div class="testform-msg" id="test-msg"></div>
   </details>
@@ -439,15 +445,15 @@
   <div class="summary-card" id="summary-card"></div>
 
   <div class="tabs">
-    <div class="tab active" data-tab="reservations">예약 (<span id="count-res">0</span>)</div>
+    <div class="tab active" data-tab="reservations">접수 (<span id="count-res">0</span>)</div>
     <div class="tab" data-tab="payments">결제 (<span id="count-pay">0</span>)</div>
   </div>
 
   <div class="filterbar">
     <label class="filter-label">날짜 <input type="date" id="date-filter" /></label>
-    <button class="ghost" id="date-all-btn" type="button">전체기간</button>
+    <button class="ghost" id="date-all-btn" type="button">전체 기간</button>
     <select id="status-filter"></select>
-    <button class="ghost" id="failed-toggle-btn" type="button">발송실패만 보기</button>
+    <button class="ghost" id="failed-toggle-btn" type="button">발송 실패만 보기</button>
     <input type="search" id="search-input" placeholder="전화번호/차량번호 검색" />
     <button class="ghost" id="search-btn" type="button">검색</button>
     <button class="ghost" id="search-clear-btn" type="button">지우기</button>
@@ -462,15 +468,17 @@
 </main>
 
 <script>
+// 화면 표시 이름. '접수'는 손님 정비 접수(Reservation)에만 쓴다 -- 결제(Payment) requested는 '영수증 대기'(결제를 기록했고 영수증을
+// 아직 보내지 않은 상태, store.createPayment)로 부른다. 상태 필터(statusOptionsFor)도 이 표를 그대로 쓴다.
 const STATUS_LABEL = {
-  waiting: '대기중',
-  called: '호출완료',
-  notify_failed: '알림실패',
+  waiting: '대기 중',
+  called: '호출됨', // '호출완료'는 옆 [정비완료] 버튼과 섞여 정비가 끝난 것으로 읽혔다
+  notify_failed: '호출 알림 실패',
   completed: '정비완료',
   cancelled: '취소됨',
-  requested: '결제접수',
-  receipt_sent: '영수증발송',
-  receipt_failed: '영수증실패',
+  requested: '영수증 대기',
+  receipt_sent: '영수증 보냄',
+  receipt_failed: '영수증 발송 실패',
   erp_linked: '전산 결제와 연결됨', // 웹훅 백업 기록이 전산 주문과 이어져 결제 합계에서 빠진 건
 }
 
@@ -489,7 +497,7 @@ const SERVICE_TYPES = [
 let token = sessionStorage.getItem('admin_token') || ''
 let adminRole = sessionStorage.getItem('admin_role') || ''
 let adminStoreId = sessionStorage.getItem('admin_store_id') || ''
-let myMerchantId = '' // store_admin 로그인 시 /api/admin/me로 채워짐 (테스트 예약용)
+let myMerchantId = '' // store_admin 로그인 시 /api/admin/me로 채워짐
 let myStoreInfo = null // store_admin 로그인 시 /api/admin/me의 store 객체(posToken 포함)
 let currentTab = 'reservations'
 let pollTimer = null
@@ -540,6 +548,7 @@ const testServiceSelect = document.getElementById('test-service')
 const testPhoneInput = document.getElementById('test-phone')
 const testSubmitBtn = document.getElementById('test-submit-btn')
 const testMsg = document.getElementById('test-msg')
+const testIntakePanel = document.getElementById('test-intake-panel')
 const storeSelect = document.getElementById('store-select')
 const storeMerchantIdInput = document.getElementById('store-merchant-id')
 const storeNameInput = document.getElementById('store-name')
@@ -605,6 +614,7 @@ async function showApp() {
   const isHq = adminRole === 'hq_admin'
   storeAddPanel.style.display = isHq ? '' : 'none'
   storeAdminAddPanel.style.display = isHq ? '' : 'none'
+  testIntakePanel.style.display = isHq ? '' : 'none'
   // store_admin은 매장이 자기 것 하나뿐이라 검색/더보기가 필요 없다(renderPosTokens의 else 분기).
   storeMgmtFilter.style.display = isHq ? '' : 'none'
 
@@ -625,8 +635,17 @@ async function showApp() {
   if (pollTimer) clearInterval(pollTimer)
   // 15초마다 폴링하되, 'refresh' 모드는 이미 로드된 페이지 크기만큼만 다시 받아온다
   // (필터가 바뀐 게 아니므로 "더 보기"로 불러온 뒷페이지까지 매번 새로 긁어오지 않는다).
-  pollTimer = setInterval(() => loadAll({ mode: 'refresh' }), 15000)
+  // 탭이 숨겨져 있으면 건너뛴다 -- 본사 전체 요약은 한 번에 쿼리 14개라, 백그라운드 탭에 열어 둔 화면이 15초마다 DB를 두드렸다.
+  // 다시 보이면 visibilitychange에서 바로 한 번 새로 고친다.
+  pollTimer = setInterval(() => {
+    if (document.hidden) return
+    loadAll({ mode: 'refresh' })
+  }, 15000)
 }
+
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && pollTimer && token) loadAll({ mode: 'refresh' })
+})
 
 // mode: 'reset' -- 검색어 변경/최초 진입 등으로 offset 0부터 다시 불러온다(기존 목록 교체).
 // mode: 'append' -- "더 보기"로 다음 페이지를 이어붙인다.
@@ -654,23 +673,11 @@ async function loadStores({ mode = 'reset' } = {}) {
 }
 
 function statusOptionsFor(kind) {
-  if (kind === 'reservations') {
-    return [
-      ['', '전체 상태'],
-      ['waiting', '대기중'],
-      ['called', '호출완료'],
-      ['completed', '정비완료'],
-      ['cancelled', '취소됨'],
-      ['notify_failed', '알림실패'],
-    ]
-  }
-  return [
-    ['', '전체 상태'],
-    ['requested', '결제접수'],
-    ['receipt_sent', '영수증발송'],
-    ['receipt_failed', '영수증실패'],
-    ['cancelled', '취소됨'],
-  ]
+  // 라벨은 STATUS_LABEL 하나에서 가져온다 -- 따로 적어 두면 표의 배지와 필터 이름이 어긋난다.
+  const keys = kind === 'reservations'
+    ? ['waiting', 'called', 'completed', 'cancelled', 'notify_failed']
+    : ['requested', 'receipt_sent', 'receipt_failed', 'cancelled']
+  return [['', '전체 상태'], ...keys.map((k) => [k, STATUS_LABEL[k]])]
 }
 
 function renderStatusOptions() {
@@ -680,7 +687,7 @@ function renderStatusOptions() {
   const vm = currentTab === 'reservations' ? resViewMode : payViewMode
   statusFilterSelect.disabled = vm === 'failed'
   failedToggleBtn.classList.toggle('active', vm === 'failed')
-  failedToggleBtn.textContent = vm === 'failed' ? '전체 보기로 전환' : '발송실패만 보기'
+  failedToggleBtn.textContent = vm === 'failed' ? '전체 보기로 전환' : '발송 실패만 보기'
 }
 
 function updateFilterNote() {
@@ -688,7 +695,7 @@ function updateFilterNote() {
   parts.push(currentDateFilter ? `날짜: ${currentDateFilter}` : '전체 기간')
   const sf = currentTab === 'reservations' ? resStatusFilter : payStatusFilter
   const vm = currentTab === 'reservations' ? resViewMode : payViewMode
-  if (vm === 'failed') parts.push(currentTab === 'reservations' ? '알림실패만' : '영수증실패만')
+  if (vm === 'failed') parts.push(currentTab === 'reservations' ? '알림 실패만' : '영수증 발송 실패만')
   else if (sf) parts.push(`상태: ${STATUS_LABEL[sf] || sf}`)
   if (currentSearchQuery) parts.push(`검색: ${currentSearchQuery}`)
   filterNote.textContent = parts.join(' · ')
@@ -771,7 +778,7 @@ if (pwSave) {
       document.getElementById('pw-new').value = ''
       document.getElementById('pw-new2').value = ''
     } catch (err) {
-      pwMsg.textContent = '요청 중 오류가 발생했습니다.'
+      pwMsg.textContent = '서버에 연결하지 못했어요. 잠시 후 다시 시도해주세요.'
     } finally {
       pwSave.disabled = false
     }
@@ -785,14 +792,15 @@ const erpCartPanel = document.getElementById('erp-cart-panel')
 const erpCartStatus = document.getElementById('erp-cart-status')
 const erpCartReload = document.getElementById('erp-cart-reload')
 
+// 상태 필터(#erp-cart-status)의 option 문구와 같게 둔다.
 const ERP_STATUS_LABEL = {
-  pending: '대기중', loaded: '담김', paying: '프론트 결제 중', paid: '결제완료',
-  refund_requested: '취소 요청됨', refunding: '프론트 취소 중', refunded: '결제 취소됨',
-  failed: '담기 실패', dismissed: '매장이 지움', expired: '만료됨', cancelled: '전산이 취소',
+  pending: '대기 중', loaded: 'POS에 담김', paying: '프론트 결제 중', paid: '결제 완료',
+  refund_requested: '결제 취소 요청됨', refunding: '프론트에서 결제 취소 중', refunded: '결제 취소됨',
+  failed: '담기 실패', dismissed: '매장이 지움', expired: '만료됨', cancelled: '전산에서 취소함',
 }
-// 결제 후 전자영수증 결과(ErpCart.receiptStatus). 예약과 이어져야 손님 번호를 안다.
+// 결제 후 전자영수증 결과(ErpCart.receiptStatus). 접수와 이어져야 손님 번호를 안다.
 const RECEIPT_STATUS_LABEL = {
-  sent: '보냄', failed: '발송 실패', no_reservation: '예약과 이어지지 않아 못 보냄', no_phone: '연락처 없음',
+  sent: '보냄', failed: '발송 실패', no_reservation: '접수와 연결되지 않아 못 보냄', no_phone: '연락처 없음',
 }
 
 function formatWhen(v) {
@@ -817,8 +825,8 @@ function renderErpCarts() {
   }
   erpCartBody.innerHTML = `<table>
       <thead><tr>
-        <th>접수</th><th>참조번호</th><th>매장</th><th>차량</th>
-        <th>금액</th><th>상태</th><th>담김/결제</th>
+        <th>받은 시각</th><th>주문번호</th><th>매장</th><th>차량</th>
+        <th>금액</th><th>상태</th><th>담은 시각/결제 시각</th>
       </tr></thead>
       <tbody>${erpCartsList.map((c) => `<tr>
         <td>${escapeHtml(formatWhen(c.createdAt))}</td>
@@ -827,7 +835,7 @@ function renderErpCarts() {
         <td>${escapeHtml(c.storeName || '-')}<br>
             <span class="muted">${escapeHtml(c.erpStoreCode || '')}</span></td>
         <td>${escapeHtml(c.carNumber || '-')}
-            ${c.linkedReservation ? '<br><span class="muted">예약 연결됨</span>' : ''}</td>
+            ${c.linkedReservation ? '<br><span class="muted">접수와 연결됨</span>' : ''}</td>
         <td>${Number(c.totalAmount).toLocaleString('ko-KR')}원</td>
         <td><span class="erp-status ${escapeHtml(c.status)}">${escapeHtml(ERP_STATUS_LABEL[c.status] || c.status)}</span>
             <br><span class="muted">${c.payTarget === 'front' ? '프론트 결제' : 'POS 결제'}</span>
@@ -837,7 +845,7 @@ function renderErpCarts() {
             ${c.status === 'paid' ? `<br><button class="row-btn" type="button" data-resend-receipt="${escapeHtml(c.id)}">${c.receiptStatus === 'sent' ? '영수증 다시 보내기' : '영수증 보내기'}</button>` : ''}
             ${c.refundNote ? `<br><span class="muted">${escapeHtml(c.refundNote)}</span>` : ''}
             ${c.errorMessage ? `<br><span class="muted">${escapeHtml(c.errorMessage)}</span>` : ''}
-            ${c.frontOrphan ? `<br><span class="erp-orphan${c.frontOrphan.ackAt ? ' acked' : ''}">⚠ 프론트 승인 미반영 · ${escapeHtml(formatWhen(c.frontOrphan.at))}${c.frontOrphan.approvalNo ? ` · 승인번호 ${escapeHtml(c.frontOrphan.approvalNo)}` : ''}${c.frontOrphan.amount !== null && c.frontOrphan.amount !== undefined ? ` · ${Number(c.frontOrphan.amount).toLocaleString('ko-KR')}원` : ''} · 대사 필요${c.frontOrphan.ackAt ? ` · 매장 확인함(${escapeHtml(formatWhen(c.frontOrphan.ackAt))})` : ''}</span>` : ''}</td>
+            ${c.frontOrphan ? `<br><span class="erp-orphan${c.frontOrphan.ackAt ? ' acked' : ''}">⚠ 프론트에서 승인됐지만 주문에 반영 안 됨 · ${escapeHtml(formatWhen(c.frontOrphan.at))}${c.frontOrphan.approvalNo ? ` · 승인번호 ${escapeHtml(c.frontOrphan.approvalNo)}` : ''}${c.frontOrphan.amount !== null && c.frontOrphan.amount !== undefined ? ` · ${Number(c.frontOrphan.amount).toLocaleString('ko-KR')}원` : ''} · 토스 결제내역과 대조 필요${c.frontOrphan.ackAt ? ` · 매장 확인함(${escapeHtml(formatWhen(c.frontOrphan.ackAt))})` : ''}</span>` : ''}</td>
         <td>${escapeHtml(formatWhen(c.loadedAt))}<br>
             <span class="muted">${escapeHtml(formatWhen(c.paidAt))}</span></td>
       </tr>`).join('')}</tbody>
@@ -861,7 +869,7 @@ async function loadErpCarts({ mode = 'reset' } = {}) {
     })
     if (res.status === 401) {
       clearSession()
-      showLogin('세션이 만료되었습니다. 다시 로그인해주세요.')
+      showLogin('로그인 시간이 지났어요. 다시 로그인해주세요.')
       return
     }
     const body = await res.json().catch(() => ({}))
@@ -874,7 +882,7 @@ async function loadErpCarts({ mode = 'reset' } = {}) {
     erpCartsHasMore = !!body.hasMore
     renderErpCarts()
   } catch (err) {
-    erpCartBody.innerHTML = '<div class="empty">요청 중 오류가 발생했습니다.</div>'
+    erpCartBody.innerHTML = '<div class="empty">서버에 연결하지 못했어요. 잠시 후 다시 시도해주세요.</div>'
   }
 }
 
@@ -882,7 +890,7 @@ erpCartBody.addEventListener('click', async (e) => {
   if (e.target.id === 'erp-cart-load-more') loadErpCarts({ mode: 'append' })
   const id = e.target.dataset?.resendReceipt
   if (!id) return
-  if (!window.confirm('예약 손님 번호로 전자영수증을 보냅니다. 보낼까요?')) return
+  if (!window.confirm('접수할 때 손님이 입력한 번호로 전자영수증을 보냅니다. 보낼까요?')) return
   e.target.disabled = true
   try {
     const { body } = await apiPost(`/api/admin/erp-carts/${id}/resend-receipt`)
@@ -891,10 +899,10 @@ erpCartBody.addEventListener('click', async (e) => {
   } catch (err) {
     if (err.message === 'UNAUTHORIZED') {
       clearSession()
-      showLogin('세션이 만료되었습니다. 다시 로그인해주세요.')
+      showLogin('로그인 시간이 지났어요. 다시 로그인해주세요.')
       return
     }
-    alert('요청 중 오류가 발생했습니다.')
+    alert('서버에 연결하지 못했어요. 잠시 후 다시 시도해주세요.')
   } finally {
     e.target.disabled = false
   }
@@ -995,9 +1003,12 @@ async function previewPromoCampaign() {
   const blocked = body.night
     ? '<p class="testform-msg err">지금은 야간이라 보낼 수 없습니다(21시~8시). 낮에 다시 보내주세요.</p>'
     : ''
+  // 서버 설정 이름(PROMO_OPT_OUT_TEXT)은 본사에만 보여준다 -- 매장 관리자는 설정을 바꿀 수 없어 본사에 요청할 일만 알면 된다.
   const optOutWarn = body.optOutConfigured
     ? ''
-    : '<p class="testform-msg err">수신거부 안내가 기본 문구("매장으로 연락")입니다. 080 무료수신거부 번호처럼 손님에게 비용이 들지 않는 방법을 서버 설정 PROMO_OPT_OUT_TEXT에 넣어 주세요.</p>'
+    : (adminRole === 'hq_admin'
+      ? '<p class="testform-msg err">수신거부 안내가 기본 문구("매장으로 연락")입니다. 080 무료수신거부 번호처럼 손님에게 비용이 들지 않는 방법을 서버 설정 PROMO_OPT_OUT_TEXT에 넣어 주세요.</p>'
+      : '<p class="testform-msg err">수신거부 안내가 아직 기본 문구("매장으로 연락")예요. 080 무료수신거부 번호 등록을 본사에 요청해 주세요.</p>')
   // 시연 모드가 30일 제한을 푸는 곳은 정비 이력의 차량별 수동 발송뿐이다. 이 화면(기간 발송)과 자동 홍보는 켜져 있어도
   // 30일 제한이 그대로라, "바로 다시 보낼 수 있다"고 쓰면 직원이 같은 번호에 다시 보내려다 헷갈린다.
   // 켜기는 본사 관리자만 할 수 있다(서버가 매장 관리자의 켜기를 403으로 막는다) -- 매장 관리자에게는 켜져 있을 때 끄기만 보인다.
@@ -1034,7 +1045,7 @@ async function previewPromoCampaign() {
 // 결과 문구. failed는 확실히 안 나간 것(나중에 다시 보낼 수 있다), uncertain은 결과를 모르는 것
 // (나갔을 수 있어 30일 동안 다시 보내지 않는다). failedProvider는 failed 중 발송사 계정·설정 탓(잔액·발신번호·템플릿) --
 // 다시 보내도 똑같이 실패하므로 "30분 뒤 다시"를 권하지 않는다. reason은 멈춘 이유(남은 대상이 없어도 보여준다).
-const PROMO_PROVIDER_STOP_TEXT = '문자 발송 계정(잔액·발신번호·템플릿) 문제로 멈췄습니다. 본사 확인이 필요합니다'
+const PROMO_PROVIDER_STOP_TEXT = '문자 발송 계정(잔액·발신번호·템플릿) 문제로 멈췄습니다. 본사 확인이 필요합니다.'
 
 function promoSummary(t, remaining, reason) {
   const lines = [`보냄 ${t.sent}건`]
@@ -1084,7 +1095,7 @@ async function sendPromoCampaign() {
       if (!remaining || !progressed) break
     }
   } catch (e) {
-    errorText = e.message === 'UNAUTHORIZED' ? '로그인이 만료됐습니다.' : '연결이 끊겼습니다.'
+    errorText = e.message === 'UNAUTHORIZED' ? '로그인 시간이 지났어요. 다시 로그인해주세요.' : '연결이 끊겼어요.'
   } finally {
     lockPromo(false)
   }
@@ -1135,19 +1146,32 @@ async function registerPromoOptOut() {
   }
 }
 
+// 홍보 패널 버튼의 예외 처리. 예전에는 e.message를 그대로 보여 'UNAUTHORIZED'·'Failed to fetch'가 영문으로 떴다.
+function promoFailure(show) {
+  return (e) => {
+    if (e && e.message === 'UNAUTHORIZED') {
+      clearSession()
+      showLogin('로그인 시간이 지났어요. 다시 로그인해주세요.')
+      return
+    }
+    show('연결이 끊겼어요. 잠시 후 다시 시도해주세요.')
+  }
+}
+
 if (promoPanel) {
   promoFrom.value = shiftKstDate(-30)
   promoTo.value = shiftKstDate(0)
   promoFrom.max = promoTo.max = shiftKstDate(0)
-  promoPreviewBtn.addEventListener('click', () => previewPromoCampaign().catch((e) => setPromoMsg(e.message, 'err')))
+  const promoError = promoFailure((text) => setPromoMsg(text, 'err'))
+  promoPreviewBtn.addEventListener('click', () => previewPromoCampaign().catch(promoError))
   promoResult.addEventListener('click', (e) => {
-    if (e.target.id === 'promo-send-btn') sendPromoCampaign().catch((err) => setPromoMsg(err.message, 'err'))
-    if (e.target.id === 'promo-demo-btn') togglePromoDemo(e.target.dataset.enable === '1').catch((err) => setPromoMsg(err.message, 'err'))
+    if (e.target.id === 'promo-send-btn') sendPromoCampaign().catch(promoError)
+    if (e.target.id === 'promo-demo-btn') togglePromoDemo(e.target.dataset.enable === '1').catch(promoError)
   })
-  promoOptOutBtn.addEventListener('click', () => registerPromoOptOut().catch((e) => {
-    promoOptOutMsg.textContent = e.message
+  promoOptOutBtn.addEventListener('click', () => registerPromoOptOut().catch(promoFailure((text) => {
+    promoOptOutMsg.textContent = text
     promoOptOutMsg.className = 'testform-msg err'
-  }))
+  })))
   // 기간이나 매장을 바꾸면 이전 미리보기로 보내지 않게 지운다(보내는 중에는 잠겨 있어 바뀌지 않는다).
   for (const el of [promoFrom, promoTo, storeSelect]) {
     el.addEventListener('change', () => {
@@ -1223,7 +1247,9 @@ function deviceSeenCell(seen) {
 // 한 번 "보기"/"복사"로 이미 받아온 매장). hasToken: 목록 응답의 hasPosToken -- 값 자체는
 // 없지만 토큰이 있기는 한지(빈 매장과 구분)는 알아야 "(없음)"과 "불러와야 함"을 구분할 수 있다.
 // seen: { lastPosSeenAt, lastFrontSeenAt } (없으면 칸에 "-").
-function posTokenRow(storeId, name, merchantId, posToken, hasToken, canRegen, erpStoreCode, businessNumber, seen) {
+// weak: 예전 기준(4자 이상)으로 직접 지정한 짧은 토큰(서버 목록의 weakPosToken, 매장 관리자는 자기 토큰 길이로 계산) -- 배지로 재발급을 권한다.
+const POS_TOKEN_MIN_LENGTH = 12 // server.js validatePosToken과 같은 기준
+function posTokenRow(storeId, name, merchantId, posToken, hasToken, canRegen, erpStoreCode, businessNumber, seen, weak) {
   return `<tr data-store-id="${escapeHtml(storeId)}">
     <td>${escapeHtml(name)}</td>
     <td>${escapeHtml(merchantId)}</td>
@@ -1234,17 +1260,18 @@ function posTokenRow(storeId, name, merchantId, posToken, hasToken, canRegen, er
       <code class="pos-token-value" data-token="${escapeHtml(posToken || '')}" data-visible="false" data-has-token="${hasToken ? 'true' : 'false'}">${maskedToken()}</code>
       <button class="row-btn pos-token-toggle" type="button">보기</button>
       <button class="row-btn pos-token-copy" type="button">복사</button>
+      ${weak ? '<span class="weak-token" title="12자 미만의 짧은 토큰이에요. 새로 발급해주세요.">약한 토큰</span>' : ''}
     </td>
     <td>${canRegen ? `
       <div class="pos-token-actions">
-        <button class="row-btn pos-token-regen" type="button">무작위 재발급</button>
+        <button class="row-btn pos-token-regen" type="button">새로 발급</button>
         <!--
           직접 지정: 무작위 64자 hex는 안전하지만 POS 단말기에서 손으로 입력하기가 사실상 불가능해서,
           매장에 불러주거나 적어 전달할 수 있는 값을 관리자가 정할 수 있게 한다.
-          단 이 값이 곧 POS API의 비밀번호이므로 서버가 길이/문자/단순함을 강제한다(400으로 거부).
+          단 이 값이 곧 POS API의 비밀번호이므로 서버가 길이(12자 이상)/영문+숫자/단순함을 강제한다(400으로 거부).
         -->
         <div class="pos-token-set">
-          <input type="text" class="pos-token-input" placeholder="직접 지정 (4자 이상)" maxlength="128" autocomplete="off" spellcheck="false" />
+          <input type="text" class="pos-token-input" placeholder="직접 지정 (12자 이상, 영문+숫자)" maxlength="128" autocomplete="off" spellcheck="false" />
           <button class="row-btn pos-token-save" type="button">저장</button>
         </div>
       </div>` : ''}</td>
@@ -1260,8 +1287,9 @@ function renderPosTokens() {
       return
     }
     posTokenBody.innerHTML = `<table>
-      <thead><tr><th>매장</th><th>merchantId</th><th>단말 연결</th><th>사업자번호</th><th>전산 코드</th><th>POS 토큰</th><th>동작</th></tr></thead>
-      <tbody>${stores.map(s => posTokenRow(s.id, s.name, s.merchantId, s.posToken, s.hasPosToken, true, s.erpStoreCode, s.businessNumber, s)).join('')}</tbody>
+      <thead><tr><th>매장</th><th>토스 가맹점 ID</th><th>단말 연결</th><th>사업자번호</th><th>전산 코드</th><th>POS 토큰</th><th>동작</th></tr></thead>
+      <tbody>${stores.map(s => posTokenRow(s.id, s.name, s.merchantId, s.posToken, s.hasPosToken, true, s.erpStoreCode, s.businessNumber, s,
+        s.posToken ? s.posToken.length < POS_TOKEN_MIN_LENGTH : Boolean(s.weakPosToken))).join('')}</tbody>
     </table>${storesHasMore ? '<div class="load-more-wrap"><button class="row-btn load-more" id="store-load-more" type="button">더 보기 (' + stores.length + ' / ' + storesTotal + ')</button></div>' : ''}`
   } else {
     if (!myStoreInfo) {
@@ -1272,7 +1300,8 @@ function renderPosTokens() {
     // 버튼 대신 현재 값만 보여준다. /api/admin/me가 이미 실제 토큰 값을 포함해 주므로
     // (자기 매장뿐이라 안전) hq_admin 목록처럼 따로 불러올 필요가 없다.
     posTokenBody.innerHTML = `<table>
-      <tbody>${posTokenRow(myStoreInfo.id, myStoreInfo.name, myStoreInfo.merchantId, myStoreInfo.posToken, Boolean(myStoreInfo.posToken), false, myStoreInfo.erpStoreCode, myStoreInfo.businessNumber, myStoreInfo)}</tbody>
+      <tbody>${posTokenRow(myStoreInfo.id, myStoreInfo.name, myStoreInfo.merchantId, myStoreInfo.posToken, Boolean(myStoreInfo.posToken), false, myStoreInfo.erpStoreCode, myStoreInfo.businessNumber, myStoreInfo,
+        Boolean(myStoreInfo.posToken) && myStoreInfo.posToken.length < POS_TOKEN_MIN_LENGTH)}</tbody>
     </table>`
   }
 }
@@ -1319,7 +1348,7 @@ posTokenBody.addEventListener('click', async (e) => {
     } catch (err) {
       if (err.message === 'UNAUTHORIZED') {
         clearSession()
-        showLogin('세션이 만료되었거나 권한이 없습니다. 다시 로그인해주세요.')
+        showLogin('로그인 시간이 지났거나 권한이 없어요. 다시 로그인해주세요.')
         return
       }
       alert('토큰을 불러오지 못했습니다.')
@@ -1338,7 +1367,7 @@ posTokenBody.addEventListener('click', async (e) => {
       e.target.disabled = false
       if (err.message === 'UNAUTHORIZED') {
         clearSession()
-        showLogin('세션이 만료되었거나 권한이 없습니다. 다시 로그인해주세요.')
+        showLogin('로그인 시간이 지났거나 권한이 없어요. 다시 로그인해주세요.')
         return
       }
       alert('토큰을 불러오지 못했습니다.')
@@ -1370,7 +1399,7 @@ posTokenBody.addEventListener('click', async (e) => {
       const body = await res.json().catch(() => ({}))
       if (res.status === 401) {
         clearSession()
-        showLogin('세션이 만료되었습니다. 다시 로그인해주세요.')
+        showLogin('로그인 시간이 지났어요. 다시 로그인해주세요.')
         return
       }
       if (!res.ok || !body.ok) {
@@ -1386,7 +1415,7 @@ posTokenBody.addEventListener('click', async (e) => {
       e.target.textContent = '저장됨'
       setTimeout(() => { e.target.textContent = original }, 1500)
     } catch (err) {
-      alert('요청 중 오류가 발생했습니다.')
+      alert('서버에 연결하지 못했어요. 잠시 후 다시 시도해주세요.')
     } finally {
       e.target.disabled = false
     }
@@ -1410,7 +1439,7 @@ posTokenBody.addEventListener('click', async (e) => {
       const body = await res.json().catch(() => ({}))
       if (res.status === 401) {
         clearSession()
-        showLogin('세션이 만료되었습니다. 다시 로그인해주세요.')
+        showLogin('로그인 시간이 지났어요. 다시 로그인해주세요.')
         return
       }
       if (!res.ok || !body.ok) {
@@ -1424,7 +1453,7 @@ posTokenBody.addEventListener('click', async (e) => {
       e.target.textContent = '저장됨'
       setTimeout(() => { e.target.textContent = original }, 1500)
     } catch (err) {
-      alert('요청 중 오류가 발생했습니다.')
+      alert('서버에 연결하지 못했어요. 잠시 후 다시 시도해주세요.')
     } finally {
       e.target.disabled = false
     }
@@ -1445,7 +1474,8 @@ posTokenBody.addEventListener('click', async (e) => {
         return
       }
     }
-    if (!confirm('토큰을 바꾸면 기존 POS 단말기에 등록된 토큰은 즉시 무효화됩니다. POS 탭앱에서 토큰을 다시 입력해야 합니다. 계속할까요?')) return
+    // 프론트도 같은 토큰을 쓴다(/api/front/*) -- 영업 중에 바꾸면 손님 결제 단말기가 조용히 멈추므로 두 단말 모두 다시 연결해야 한다고 알린다.
+    if (!confirm('토큰을 바꾸면 이 매장의 POS 탭앱과 토스 프론트(손님 단말기)가 바로 끊겨요.\n두 단말기 모두 새 토큰을 다시 입력해야 해요(토스 프론트는 프론트 설정 → 플러그인 설정에서 다시 연결).\n계속할까요?')) return
     e.target.disabled = true
     try {
       const res = await fetch(`/api/admin/stores/${storeId}/pos-token`, {
@@ -1456,7 +1486,7 @@ posTokenBody.addEventListener('click', async (e) => {
       const body = await res.json().catch(() => ({}))
       if (res.status === 401) {
         clearSession()
-        showLogin('세션이 만료되었습니다. 다시 로그인해주세요.')
+        showLogin('로그인 시간이 지났어요. 다시 로그인해주세요.')
         return
       }
       if (!res.ok || !body.ok) {
@@ -1465,11 +1495,14 @@ posTokenBody.addEventListener('click', async (e) => {
         return
       }
       const store = stores.find(s => s.id === storeId)
-      if (store) store.posToken = body.posToken
+      if (store) {
+        store.posToken = body.posToken
+        store.weakPosToken = String(body.posToken || '').length < POS_TOKEN_MIN_LENGTH
+      }
       if (myStoreInfo && myStoreInfo.id === storeId) myStoreInfo.posToken = body.posToken
       renderPosTokens()
     } catch (err) {
-      alert('요청 중 오류가 발생했습니다.')
+      alert('서버에 연결하지 못했어요. 잠시 후 다시 시도해주세요.')
     } finally {
       e.target.disabled = false
     }
@@ -1479,6 +1512,11 @@ posTokenBody.addEventListener('click', async (e) => {
 function renderStoreSelect() {
   const options = ['<option value="">전체 매장</option>']
     .concat(stores.map((s) => `<option value="${s.id}">${escapeHtml(s.name)}</option>`))
+  // 목록은 불러온 페이지(100곳)만 담는다. 나머지 매장이 있다는 것과 찾는 방법을 알려준다 -- 예전에는 101번째 이후 매장을 고를 방법이
+  // 화면 어디에도 안내되지 않았다. [매장 개통 설정]에서 검색하거나 [더 보기]를 누르면 이 목록에도 들어온다.
+  if (storesHasMore) {
+    options.push(`<option value="" disabled>… 외 ${Math.max(0, storesTotal - stores.length)}곳: [매장 개통 설정]에서 검색하면 여기에 보여요</option>`)
+  }
   storeSelect.innerHTML = options.join('')
   storeSelect.value = currentStoreId
 }
@@ -1513,7 +1551,7 @@ storeAddBtn.addEventListener('click', async () => {
   storeAddMsg.textContent = ''
   storeAddMsg.className = 'testform-msg'
   if (!merchantId || !name) {
-    storeAddMsg.textContent = 'merchantId와 매장명은 필수입니다.'
+    storeAddMsg.textContent = '토스 가맹점 ID와 매장명을 입력해주세요.'
     storeAddMsg.className = 'testform-msg err'
     return
   }
@@ -1526,19 +1564,19 @@ storeAddBtn.addEventListener('click', async () => {
     })
     const body = await res.json().catch(() => ({}))
     if (!res.ok || !body.ok) {
-      storeAddMsg.textContent = body.error || '등록 실패'
+      storeAddMsg.textContent = body.error || '매장을 등록하지 못했어요.'
       storeAddMsg.className = 'testform-msg err'
       return
     }
     // 등록 응답에 posToken이 포함되므로 등록 직후 화면에 바로 보여준다(POS 탭앱에 입력해야 하는 값).
-    storeAddMsg.innerHTML = `등록 완료: ${escapeHtml(body.store.name)} · POS 토큰: <code class="pos-token-value">${escapeHtml(body.store.posToken || '(발급 안됨)')}</code>`
+    storeAddMsg.innerHTML = `등록 완료: ${escapeHtml(body.store.name)} · POS 토큰: <code class="pos-token-value">${escapeHtml(body.store.posToken || '(발급 안 됨)')}</code>`
     storeAddMsg.className = 'testform-msg ok'
     storeMerchantIdInput.value = ''
     storeNameInput.value = ''
     storeBizInput.value = ''
     await loadStores()
   } catch (e) {
-    storeAddMsg.textContent = '요청 중 오류가 발생했습니다.'
+    storeAddMsg.textContent = '서버에 연결하지 못했어요. 잠시 후 다시 시도해주세요.'
     storeAddMsg.className = 'testform-msg err'
   } finally {
     storeAddBtn.disabled = false
@@ -1550,6 +1588,7 @@ function showLogin(message) {
   topBar.style.display = 'none'
   main.style.display = 'none'
   if (pollTimer) clearInterval(pollTimer)
+  pollTimer = null
   if (message) loginErr.textContent = message
 }
 
@@ -1602,7 +1641,7 @@ async function tryResumeSession() {
     showApp()
   } catch (e) {
     clearSession()
-    showLogin('세션이 만료되었습니다. 다시 로그인해주세요.')
+    showLogin('로그인 시간이 지났어요. 다시 로그인해주세요.')
   }
 }
 
@@ -1627,7 +1666,7 @@ saAddBtn.addEventListener('click', async () => {
   saAddMsg.textContent = ''
   saAddMsg.className = 'testform-msg'
   if (!merchantId || !email || !password) {
-    saAddMsg.textContent = 'merchantId/이메일/비밀번호는 필수입니다.'
+    saAddMsg.textContent = '토스 가맹점 ID, 이메일, 비밀번호를 모두 입력해주세요.'
     saAddMsg.className = 'testform-msg err'
     return
   }
@@ -1640,7 +1679,7 @@ saAddBtn.addEventListener('click', async () => {
     })
     const body = await res.json().catch(() => ({}))
     if (!res.ok || !body.ok) {
-      saAddMsg.textContent = body.error || '발급 실패'
+      saAddMsg.textContent = body.error || '계정을 발급하지 못했어요.'
       saAddMsg.className = 'testform-msg err'
       return
     }
@@ -1650,7 +1689,7 @@ saAddBtn.addEventListener('click', async () => {
     saEmailInput.value = ''
     saPasswordInput.value = ''
   } catch (e) {
-    saAddMsg.textContent = '요청 중 오류가 발생했습니다.'
+    saAddMsg.textContent = '서버에 연결하지 못했어요. 잠시 후 다시 시도해주세요.'
     saAddMsg.className = 'testform-msg err'
   } finally {
     saAddBtn.disabled = false
@@ -1681,17 +1720,17 @@ document.getElementById('reservations-view').addEventListener('click', async (e)
 
   if (btn.classList.contains('call')) {
     btn.disabled = true
-    btn.textContent = '호출중...'
+    btn.textContent = '호출 중...'
     try {
       const { ok, body } = await apiPost(`/api/reservations/${id}/call`)
       if (!ok) alert(body.error || '호출에 실패했습니다.')
     } catch (err) {
       if (err.message === 'UNAUTHORIZED') {
         clearSession()
-        showLogin('세션이 만료되었습니다. 다시 로그인해주세요.')
+        showLogin('로그인 시간이 지났어요. 다시 로그인해주세요.')
         return
       }
-      alert('호출 중 오류가 발생했습니다.')
+      alert('호출 중 오류가 발생했어요. 잠시 후 다시 시도해주세요.')
     }
     await loadAll({ mode: 'refresh' })
     return
@@ -1699,7 +1738,7 @@ document.getElementById('reservations-view').addEventListener('click', async (e)
 
   if (btn.classList.contains('complete')) {
     btn.disabled = true
-    btn.textContent = '처리중...'
+    btn.textContent = '처리 중...'
     try {
       const { ok, body } = await apiPost(`/api/reservations/${id}/complete`)
       if (!ok) alert(body.error || '처리에 실패했습니다.')
@@ -1707,7 +1746,7 @@ document.getElementById('reservations-view').addEventListener('click', async (e)
     } catch (err) {
       if (err.message === 'UNAUTHORIZED') {
         clearSession()
-        showLogin('세션이 만료되었습니다. 다시 로그인해주세요.')
+        showLogin('로그인 시간이 지났어요. 다시 로그인해주세요.')
         return
       }
       alert('처리 중 오류가 발생했습니다.')
@@ -1717,16 +1756,16 @@ document.getElementById('reservations-view').addEventListener('click', async (e)
   }
 
   if (btn.classList.contains('cancel')) {
-    if (!confirm('이 예약을 취소할까요?')) return
+    if (!confirm('이 접수를 취소할까요? 손님에게는 따로 알림이 가지 않아요.')) return
     btn.disabled = true
-    btn.textContent = '취소중...'
+    btn.textContent = '취소 중...'
     try {
       const { ok, body } = await apiPost(`/api/reservations/${id}/cancel`)
       if (!ok) alert(body.error || '취소에 실패했습니다.')
     } catch (err) {
       if (err.message === 'UNAUTHORIZED') {
         clearSession()
-        showLogin('세션이 만료되었습니다. 다시 로그인해주세요.')
+        showLogin('로그인 시간이 지났어요. 다시 로그인해주세요.')
         return
       }
       alert('취소 중 오류가 발생했습니다.')
@@ -1737,21 +1776,21 @@ document.getElementById('reservations-view').addEventListener('click', async (e)
 
   if (btn.classList.contains('retry')) {
     btn.disabled = true
-    btn.textContent = '재발송중...'
+    btn.textContent = '재발송 중...'
     try {
       const { ok, body } = await apiPost(`/api/reservations/${id}/retry-notify`)
       if (!ok) {
         alert(body.error || '재발송 요청에 실패했습니다.')
       } else if (body.sent === false) {
-        // HTTP 200이지만 sent:false — 재발송 자체는 실행됐고 다시 실패했다는 뜻이다.
-        alert('알림톡을 재발송했지만 다시 실패했습니다. 잠시 후 다시 시도해주세요.')
+        // HTTP 200이지만 sent:false — 재발송 자체는 실행됐고 다시 실패했다는 뜻이다. 같은 번호로 다시 보내도 대개 같은 결과다.
+        alert('호출 알림을 다시 보냈지만 또 실패했어요. 손님께 직접 연락해 주세요.')
       } else {
-        alert('알림톡이 재발송되었습니다.')
+        alert('호출 알림을 다시 보냈어요.')
       }
     } catch (err) {
       if (err.message === 'UNAUTHORIZED') {
         clearSession()
-        showLogin('세션이 만료되었습니다. 다시 로그인해주세요.')
+        showLogin('로그인 시간이 지났어요. 다시 로그인해주세요.')
         return
       }
       alert('재발송 중 오류가 발생했습니다.')
@@ -1762,21 +1801,21 @@ document.getElementById('reservations-view').addEventListener('click', async (e)
 
   if (btn.classList.contains('retry-intake')) {
     btn.disabled = true
-    btn.textContent = '재발송중...'
+    btn.textContent = '재발송 중...'
     try {
       const { ok, body } = await apiPost(`/api/reservations/${id}/retry-intake`)
       if (!ok) {
         alert(body.error || '재발송 요청에 실패했습니다.')
       } else if (body.sent === false) {
         // retry-notify와 동일한 패턴 — HTTP 200 + sent:false는 재발송을 시도했지만 다시 실패했다는 뜻.
-        alert('접수 알림톡을 재발송했지만 다시 실패했습니다. 잠시 후 다시 시도해주세요.')
+        alert('접수 알림을 다시 보냈지만 또 실패했어요. 손님 번호를 확인해 주세요.')
       } else {
-        alert('접수 알림톡이 재발송되었습니다.')
+        alert('접수 알림을 다시 보냈어요.')
       }
     } catch (err) {
       if (err.message === 'UNAUTHORIZED') {
         clearSession()
-        showLogin('세션이 만료되었습니다. 다시 로그인해주세요.')
+        showLogin('로그인 시간이 지났어요. 다시 로그인해주세요.')
         return
       }
       alert('재발송 중 오류가 발생했습니다.')
@@ -1786,7 +1825,7 @@ document.getElementById('reservations-view').addEventListener('click', async (e)
   }
 
   if (btn.classList.contains('del')) {
-    if (!confirm('이 예약을 삭제할까요?')) return
+    if (!confirm('이 접수를 완전히 삭제할까요? 삭제하면 되돌릴 수 없어요.')) return
     btn.disabled = true
     try {
       const { ok, body } = await apiPost(`/api/reservations/${id}`, 'DELETE')
@@ -1794,7 +1833,7 @@ document.getElementById('reservations-view').addEventListener('click', async (e)
     } catch (err) {
       if (err.message === 'UNAUTHORIZED') {
         clearSession()
-        showLogin('세션이 만료되었습니다. 다시 로그인해주세요.')
+        showLogin('로그인 시간이 지났어요. 다시 로그인해주세요.')
         return
       }
       alert('삭제 중 오류가 발생했습니다.')
@@ -1815,7 +1854,7 @@ document.getElementById('payments-view').addEventListener('click', async (e) => 
 
   if (btn.classList.contains('retry')) {
     btn.disabled = true
-    btn.textContent = '재발송중...'
+    btn.textContent = '재발송 중...'
     try {
       const { ok, body } = await apiPost(`/api/payments/${id}/retry-receipt`)
       if (!ok) {
@@ -1828,7 +1867,7 @@ document.getElementById('payments-view').addEventListener('click', async (e) => 
     } catch (err) {
       if (err.message === 'UNAUTHORIZED') {
         clearSession()
-        showLogin('세션이 만료되었습니다. 다시 로그인해주세요.')
+        showLogin('로그인 시간이 지났어요. 다시 로그인해주세요.')
         return
       }
       alert('재발송 중 오류가 발생했습니다.')
@@ -1840,7 +1879,7 @@ document.getElementById('payments-view').addEventListener('click', async (e) => 
 function renderReservations(list, total, hasMore) {
   const view = document.getElementById('reservations-view')
   if (!list.length) {
-    view.innerHTML = '<div class="empty">예약 내역이 없습니다.</div>'
+    view.innerHTML = '<div class="empty">접수 내역이 없습니다.</div>'
     return
   }
   const rows = list.map((r) => {
@@ -1849,10 +1888,10 @@ function renderReservations(list, total, hasMore) {
     const canRetryNotify = r.status === 'notify_failed'
     const canRetryIntake = !canRetryNotify && r.intakeNotifyStatus === 'failed' && r.status !== 'completed' && r.status !== 'cancelled'
     const canCancel = r.status === 'waiting' || r.status === 'called' || r.status === 'notify_failed'
-    const intakeFailMark = r.intakeNotifyStatus === 'failed' ? '<span class="intake-fail-mark">접수알림실패</span>' : ''
+    const intakeFailMark = r.intakeNotifyStatus === 'failed' ? '<span class="intake-fail-mark">접수 알림 실패</span>' : ''
     return `
     <tr>
-      <td>#${r.queueNumber}</td>
+      <td>${r.queueNumber}번</td>
       <td>${escapeHtml(r.carNumber)}</td>
       <td>${escapeHtml(r.serviceType || '-')}</td>
       <td>${escapeHtml(r.phone)}</td>
@@ -1860,8 +1899,8 @@ function renderReservations(list, total, hasMore) {
       <td>${fmtDate(r.createdAt)}</td>
       <td class="row-actions">
         <button class="row-btn call" data-id="${r.id}" ${r.status !== 'waiting' ? 'disabled' : ''}>호출</button>
-        <button class="row-btn complete" data-id="${r.id}" ${r.status !== 'called' && r.status !== 'notify_failed' ? 'disabled' : ''}>완료</button>
-        ${canRetryNotify ? `<button class="row-btn retry" data-id="${r.id}">재발송</button>` : ''}
+        <button class="row-btn complete" data-id="${r.id}" ${r.status !== 'called' && r.status !== 'notify_failed' ? 'disabled' : ''}>정비완료</button>
+        ${canRetryNotify ? `<button class="row-btn retry" data-id="${r.id}">호출 재발송</button>` : ''}
         ${canRetryIntake ? `<button class="row-btn retry-intake" data-id="${r.id}">접수 재발송</button>` : ''}
         <button class="row-btn cancel" data-id="${r.id}" ${canCancel ? '' : 'disabled'}>취소</button>
         <button class="row-btn del" data-id="${r.id}">삭제</button>
@@ -1869,7 +1908,7 @@ function renderReservations(list, total, hasMore) {
     </tr>
   `}).join('')
   view.innerHTML = `<table>
-    <thead><tr><th>순번</th><th>차량번호</th><th>정비항목</th><th>전화번호</th><th>상태</th><th>접수시간</th><th>동작</th></tr></thead>
+    <thead><tr><th>대기번호</th><th>차량번호</th><th>정비항목</th><th>전화번호</th><th>상태</th><th>접수시간</th><th>동작</th></tr></thead>
     <tbody>${rows}</tbody>
   </table>${hasMore ? '<div class="load-more-wrap"><button class="row-btn load-more" id="res-load-more" type="button">더 보기 (' + list.length + ' / ' + total + ')</button></div>' : ''}`
 }
@@ -1889,13 +1928,13 @@ function renderPayments(list, total, hasMore) {
       <td>${escapeHtml(p.phone)}</td>
       <td>${fmtAmount(p.amount)}</td>
       <td><span class="badge ${escapeHtml(p.status)}">${escapeHtml(STATUS_LABEL[p.status] || p.status)}</span></td>
-      <td>${p.promoSent ? (p.promoSentAt ? '발송완료' : '보내지 않음') : fmtDate(p.promoAt)}</td>
+      <td>${p.promoSent ? (p.promoSentAt ? '보냄' : '안 보냄') : `${fmtDate(p.promoAt)} 예정`}</td>
       <td>${fmtDate(p.createdAt)}</td>
       <td class="row-actions">${canRetry ? `<button class="row-btn retry" data-id="${p.id}">재발송</button>` : ''}</td>
     </tr>
   `}).join('')
   view.innerHTML = `<table>
-    <thead><tr><th>차량번호</th><th>정비항목</th><th>전화번호</th><th>결제금액</th><th>상태</th><th>프로모션</th><th>결제시간</th><th>동작</th></tr></thead>
+    <thead><tr><th>차량번호</th><th>정비항목</th><th>전화번호</th><th>결제금액</th><th>상태</th><th>홍보 문자</th><th>결제시간</th><th>동작</th></tr></thead>
     <tbody>${rows}</tbody>
   </table>${hasMore ? '<div class="load-more-wrap"><button class="row-btn load-more" id="pay-load-more" type="button">더 보기 (' + list.length + ' / ' + total + ')</button></div>' : ''}`
 }
@@ -1954,17 +1993,25 @@ async function loadSummary() {
   renderSummary(data)
 }
 
+// 지금 결제는 대부분 전산 주문(POS·프론트)으로 이뤄진다. 예전에는 옛 Payment 표('결제')만 그려 매일 '결제 0건'으로 보였다 --
+// 서버가 이미 내려주는 data.erpCarts로 전산 결제 줄을 맨 앞에 두고, 옛 표는 '전산 외 결제'로 부른다.
+// 전산 결제 건수·금액은 서버 기준과 같다: 그날 받은 전산 주문(createdAt) 중 지금 결제 완료(paid) 상태인 것(환불된 건은 빠진다).
 function renderSummary(data) {
   const r = data.reservations || {}
   const p = data.payments || {}
+  const e = data.erpCarts || {}
   const failedTotal = (r.notify_failed || 0) + (data.intakeFailed || 0)
+  const unhandled = e.unhandled || 0
   summaryCard.innerHTML = `
     <div class="summary-item"><b>${escapeHtml(data.date || '')}</b> 요약</div>
     <div class="summary-item">접수 ${r.total || 0}건
       <span class="summary-sub">(대기 ${r.waiting || 0}·호출 ${r.called || 0}·완료 ${r.completed || 0}·취소 ${r.cancelled || 0})</span>
     </div>
-    <div class="summary-item">결제 ${p.total || 0}건 · 합계 ${fmtAmount(p.amountSum || 0)}</div>
-    <div class="summary-item${failedTotal > 0 ? ' summary-alert' : ''}">발송실패 ${failedTotal}건</div>
+    <div class="summary-item">전산 결제 ${e.paid || 0}/${e.total || 0}건 · ${fmtAmount(e.paidAmount || 0)}
+      <span class="summary-sub${unhandled > 0 ? ' summary-alert' : ''}">· 미처리 ${unhandled}건</span>
+    </div>
+    <div class="summary-item">전산 외 결제 ${p.total || 0}건 · 합계 ${fmtAmount(p.amountSum || 0)}</div>
+    <div class="summary-item${failedTotal > 0 ? ' summary-alert' : ''}">발송 실패 ${failedTotal}건</div>
   `
 }
 
@@ -1997,9 +2044,9 @@ async function loadAll({ mode = 'reset' } = {}) {
   } catch (e) {
     if (e.message === 'UNAUTHORIZED') {
       clearSession()
-      showLogin('세션이 만료되었거나 권한이 없습니다. 다시 로그인해주세요.')
+      showLogin('로그인 시간이 지났거나 권한이 없어요. 다시 로그인해주세요.')
     } else {
-      connStatus.textContent = '연결 오류'
+      connStatus.textContent = '서버 연결이 끊겼어요 · 자동으로 다시 시도해요'
     }
   }
 }
@@ -2012,16 +2059,17 @@ async function loadMore(kind) {
   } catch (e) {
     if (e.message === 'UNAUTHORIZED') {
       clearSession()
-      showLogin('세션이 만료되었거나 권한이 없습니다. 다시 로그인해주세요.')
+      showLogin('로그인 시간이 지났거나 권한이 없어요. 다시 로그인해주세요.')
     } else {
       alert('추가 목록을 불러오지 못했습니다.')
     }
   }
 }
 
+// 탭에는 전체 건수만 둔다. 불러온 개수는 [더 보기 (100 / 250)] 버튼에 이미 나온다.
 function updateTabCounters() {
-  document.getElementById('count-res').textContent = `${reservationsList.length} / ${reservationsTotal}`
-  document.getElementById('count-pay').textContent = `${paymentsList.length} / ${paymentsTotal}`
+  document.getElementById('count-res').textContent = `${reservationsTotal}`
+  document.getElementById('count-pay').textContent = `${paymentsTotal}`
 }
 
 function updateCallnextInfo() {
@@ -2040,27 +2088,46 @@ function updateCallnextInfo() {
   // 서버가 매번 새로 계산하므로(§3.6) 여기 표시는 참고용 안내일 뿐이다.
   const waiting = reservationsList.filter((r) => r.status === 'waiting')
   callnextInfo.textContent = waiting.length
-    ? `대기중 ${waiting.length}건 · 다음 순번 #${[...waiting].sort((a, b) => a.queueNumber - b.queueNumber)[0].queueNumber}`
-    : '대기중인 예약이 없습니다.'
+    ? `대기 ${waiting.length}명 · 다음 대기번호 ${[...waiting].sort((a, b) => a.queueNumber - b.queueNumber)[0].queueNumber}번`
+    : '대기 중인 손님이 없어요.'
   callnextBtn.disabled = waiting.length === 0
 }
 
+// [다음 손님 호출]이 부를 손님. 서버(getNextWaitingReservation)와 같은 기준 -- 오늘 접수분 중 대기번호가 가장 작은 waiting.
+function nextWaitingReservation() {
+  const today = todayKST()
+  return reservationsList
+    .filter((r) => r.status === 'waiting' && r.serviceDate === today)
+    .sort((a, b) => a.queueNumber - b.queueNumber)[0] || null
+}
+
+// 누르는 즉시 손님에게 "고객님의 순서입니다" 알림이 나가므로 먼저 누구를 부르는지 확인받고, 끝나면 결과를 알려준다(예전에는 확인 없이
+// 바로 나갔고 성공해도 아무 안내가 없었다). 확인창의 손님은 화면 기준이라, 실제로 부른 손님은 서버 응답으로 다시 알린다.
 callnextBtn.addEventListener('click', async () => {
   if (!currentStoreId) return
+  const next = nextWaitingReservation()
+  const who = next ? `${next.queueNumber}번 ${next.carNumber} 손님을` : '다음 대기 손님을'
+  if (!confirm(`${who} 호출할까요? 손님에게 순서 알림이 바로 나가요.`)) return
   callnextBtn.disabled = true
   callnextBtn.textContent = '호출 중...'
   try {
     const { ok, body } = await apiPost(`/api/queue/call-next?storeId=${encodeURIComponent(currentStoreId)}`)
     if (!ok) {
-      alert(body.error || '호출에 실패했습니다.')
+      alert(body.error || '호출하지 못했어요.')
+    } else if (body.alreadyProcessed) {
+      alert(`${body.queueNumber}번 손님은 이미 호출된 상태예요.`)
+    } else if (body.status === 'notify_failed') {
+      alert(`${body.queueNumber}번 ${body.carNumber || ''} 손님을 호출했지만 순서 알림을 보내지 못했어요. 표의 [호출 재발송]을 누르거나 손님께 직접 연락해 주세요.`)
+    } else {
+      alert(`${body.queueNumber}번 ${body.carNumber || ''} 손님을 호출했어요.`)
     }
     await loadAll({ mode: 'refresh' })
   } catch (e) {
     if (e.message === 'UNAUTHORIZED') {
       clearSession()
-      showLogin('세션이 만료되었거나 권한이 없습니다. 다시 로그인해주세요.')
+      showLogin('로그인 시간이 지났거나 권한이 없어요. 다시 로그인해주세요.')
     } else {
-      alert('호출 중 오류가 발생했습니다.')
+      alert('호출 중 오류가 발생했어요. 잠시 후 다시 시도해주세요.')
     }
   } finally {
     callnextBtn.textContent = '다음 손님 호출'
@@ -2077,7 +2144,7 @@ testSubmitBtn.addEventListener('click', async () => {
   // hq_admin은 상단 드롭다운에서 선택한 매장, store_admin은 로그인 시 조회해둔 자기 매장(myMerchantId) 사용.
   const merchantId = adminRole === 'store_admin' ? myMerchantId : stores.find((s) => s.id === currentStoreId)?.merchantId
   if (!merchantId) {
-    testMsg.textContent = '상단에서 매장을 먼저 선택해주세요 ("전체 매장"으로는 테스트 예약을 만들 수 없습니다).'
+    testMsg.textContent = '상단에서 매장을 먼저 선택해주세요. "전체 매장"으로는 테스트 접수를 만들 수 없어요.'
     testMsg.className = 'testform-msg err'
     return
   }
@@ -2093,17 +2160,20 @@ testSubmitBtn.addEventListener('click', async () => {
     })
     const body = await res.json().catch(() => ({}))
     if (!res.ok || !body.ok) {
-      testMsg.textContent = body.error || '등록 실패'
+      testMsg.textContent = body.error || '접수하지 못했어요.'
       testMsg.className = 'testform-msg err'
       return
     }
-    testMsg.textContent = `등록 완료 (#${body.queueNumber} · ${body.serviceType}) · 앞으로 ${body.peopleAhead}명 남았다는 접수 알림이 발송됩니다. 호출은 POS/관리자 화면에서 직접 눌러주세요.`
+    // 같은 차가 오늘 이미 대기열에 있으면 서버가 기존 접수를 돌려주고 알림은 다시 보내지 않는다(duplicate).
+    testMsg.textContent = body.duplicate
+      ? `이미 접수된 차량이에요 (대기번호 ${body.queueNumber}번 · ${body.serviceType}). 알림은 다시 보내지 않았어요.`
+      : `접수 완료 (대기번호 ${body.queueNumber}번 · ${body.serviceType}) · 입력한 번호로 접수 알림을 보냈어요. 호출은 POS나 이 화면에서 직접 눌러주세요.`
     testMsg.className = 'testform-msg ok'
     testCarInput.value = ''
     testPhoneInput.value = ''
     await loadAll({ mode: 'refresh' })
   } catch (e) {
-    testMsg.textContent = '요청 중 오류가 발생했습니다.'
+    testMsg.textContent = '서버에 연결하지 못했어요. 잠시 후 다시 시도해주세요.'
     testMsg.className = 'testform-msg err'
   } finally {
     testSubmitBtn.disabled = false

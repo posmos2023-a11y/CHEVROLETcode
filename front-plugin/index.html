@@ -10,18 +10,18 @@
     <script src="./sdk.js"></script>
     <script src="./api-config.js"></script>
     <script src="./erp-front-pay.js"></script>
-    <title>쉐보레 예약/결제 - Toss Front Plugin</title>
+    <title>쉐보레 접수/결제 - Toss Front Plugin</title>
   </head>
   <body>
     <div id="app"></div>
     <script>
-      // 대기화면. 아래 두 버튼(예약/결제)과 별개로, 매장 토큰이 설정돼 있으면 전산이 이 프론트로
+      // 대기화면. 아래 [접수하기] 버튼과 별개로, 매장 토큰이 설정돼 있으면 전산이 이 프론트로
       // 보낸 정비 주문이 있는지 몇 초마다 확인해서, 있으면 결제 화면(erp-pay.html)으로 넘어간다.
-      const ERP_POLL_MS = 3000
+      // 확인 간격은 서버가 목록 응답의 pollMs로 정한다(erp-front-pay.js pollIntervalOf -- 2~30초, 없으면 3초).
       const ERP_RECOVER_TIMEOUT_MS = 15000 // 지난 결제 복구 한 번에 기다리는 최대 시간
-      const ERP_RECOVER_RETRY_TICKS = 20 // 복구가 끝나지 않았을 때 몇 번째 폴링마다 다시 시도할지(3초 x 20 = 약 1분)
+      const ERP_RECOVER_RETRY_MS = 60000 // 복구가 끝나지 않았을 때 다시 시도하는 간격(폴링 간격을 더해 센다)
       const ERP_RETRY_MS = 10000 // 토큰이 없거나 시작에 실패했을 때 다시 보는 간격
-      const ERP_TOKEN_TOAST_INTERVAL_MS = 60000 // 토큰 없음 안내를 다시 띄우는 최소 간격
+      const ERP_AUTH_RETRY_MS = 60000 // 목록이 401·403(토큰이 틀림·재발급됨, 매장 비활성)일 때의 확인 간격 -- 틀린 토큰으로 3초마다 두드리지 않는다
       const ERP_FILTER_TIMEOUT_MS = 12000 // 결제할 주문 거르기(저장소의 미기록 목록 읽기)를 기다리는 최대 시간
 
       function withTimeout(promise, ms, fallback) {
@@ -52,26 +52,53 @@
       }
 
       // 토스트는 안내일 뿐이다. 거부된 Promise를 돌려주는 SDK에서도 unhandledrejection이 되지 않게 삼킨다.
+      // 아이콘은 SDK가 그릴 수 있는 'success'·'error'만 넘긴다 -- CDN 번들의 ICON_NAME_MAP에 이 둘뿐이고, 다른 값(예: 'info')은
+      // 아이콘 이름이 없어 화면 전체가 하얗게 멈춘다(2026-10-23 확인). 아이콘 없이 넘기면 글자만 뜬다(공식 문서 예시).
+      const TOAST_ICONS = ['success', 'error']
       function toast(options) {
+        const { icon, ...rest } = options || {}
+        const safe = TOAST_ICONS.includes(icon) ? { ...rest, icon } : rest
         try {
-          Promise.resolve(sdk.template.openToast?.(options)).catch(() => {})
+          Promise.resolve(sdk.template.openToast?.(safe)).catch(() => {})
         } catch { /* 안내일 뿐 */ }
       }
 
-      // 프론트를 초기화하면 매장 토큰이 지워지는데, 아무 안내 없이 전산 결제만 조용히 안 받아져서 직원이 원인을 한참 찾았다.
-      // 대기화면은 손님 화면이라 처음 한 번만 띄우고, 그 뒤로는 토큰이 여전히 없을 때 1분에 한 번만 다시 띄운다. 토큰이 생기면
-      // 이 경로를 더 타지 않으므로 다시 띄우지 않는다.
-      // 지난 결제 보고가 401·403(토큰이 틀림·재발급됨, 매장 비활성)을 받았을 때도 같은 간격으로 안내한다(기록은 남아 있어 토큰을
-      // 바로잡고 대기화면이 다시 열리면 복구가 다시 보고한다).
-      let lastTokenToastAt = 0
-      function notifyTokenProblem(message) {
-        const now = Date.now()
-        if (now - lastTokenToastAt < ERP_TOKEN_TOAST_INTERVAL_MS) return
-        lastTokenToastAt = now
-        toast({ message, icon: 'error' })
+      // 직원용 매장 토큰 안내. 프론트를 초기화하면 매장 토큰이 지워지는데, 아무 안내 없이 전산 결제만 조용히 안 받아져서 직원이 원인을
+      // 한참 찾았다. 그런데 대기화면은 손님 화면이고 토큰은 선택 사항이라(접수만 쓰는 매장), 예전처럼 1분마다 빨간 알림을 띄우면 하루
+      // 종일 손님 앞에 오류가 보였다. 그래서 종류마다 **앱을 켠 뒤 한 번만** 띄운다. 대기화면은 다른 화면에 다녀올 때마다 다시 열리므로
+      // 띄운 사실은 sessionStorage에 남긴다(앱을 다시 켜면 비워진다. 쓸 수 없는 환경이면 이 화면이 열려 있는 동안 한 번).
+      // 토큰이 정상으로 확인되면(목록 200) 표시를 지운다 -- 나중에 새로 생긴 문제(토큰 재발급 등)는 한 번 더 알린다.
+      //   missing: 토큰이 없다(설정 전이거나 초기화로 지워짐).
+      //   auth: 서버가 401·403을 줬다(토큰이 틀림·재발급됨, 매장 비활성). 지난 결제 보고가 401·403일 때도 같다(기록은 남아 있어 토큰을
+      //         바로잡으면 복구가 다시 보고한다).
+      const TOKEN_NOTICE_KEY = 'chevrolet_front_token_notice'
+      const TOKEN_NOTICES = {
+        missing: { message: '[직원 확인] 플러그인 설정에서 매장 토큰을 넣어주세요' },
+        auth: { message: '[직원 확인] 매장 토큰이 맞지 않아요. 플러그인 설정에서 다시 넣어주세요', icon: 'error' },
       }
-      function notifyTokenMissing() {
-        notifyTokenProblem('매장 토큰이 없어 전산 결제를 받을 수 없습니다. 플러그인 설정에서 매장 토큰을 넣어주세요.')
+      const tokenNoticesShownHere = new Set()
+      function readTokenNotices() {
+        try {
+          const parsed = JSON.parse(sessionStorage.getItem(TOKEN_NOTICE_KEY) || '{}')
+          return parsed && typeof parsed === 'object' ? parsed : {}
+        } catch {
+          return {}
+        }
+      }
+      function notifyTokenProblem(kind) {
+        if (tokenNoticesShownHere.has(kind)) return
+        tokenNoticesShownHere.add(kind)
+        const shown = readTokenNotices()
+        if (shown[kind]) return
+        shown[kind] = true
+        try { sessionStorage.setItem(TOKEN_NOTICE_KEY, JSON.stringify(shown)) } catch { /* 이 화면이 열려 있는 동안만 한 번 */ }
+        toast(TOKEN_NOTICES[kind])
+      }
+      function clearTokenNotices() {
+        tokenNoticesShownHere.clear()
+        try {
+          if (sessionStorage.getItem(TOKEN_NOTICE_KEY) !== null) sessionStorage.removeItem(TOKEN_NOTICE_KEY)
+        } catch { /* 저장 불가 환경 */ }
       }
 
       // 승인(또는 취소)은 됐는데 서버가 기록을 받지 않은 건이 아직 안내되지 않았으면 true. 직원 안내 화면은 결제 화면(erp-pay.html
@@ -80,18 +107,19 @@
 
       // 지난번 결제·취소가 보고 없이 끝났으면(결제 도중 재시작 등) 마무리한다. 확인이 안 끝난 건('pending'·'auth')이 하나라도 있으면
       // 'pending'. 결제와 취소를 따로 돌린다 -- 한쪽이 늦어져도 다른 쪽은 진행되게(SDK 확인 호출은 erp-front-pay.js가 10초로 자른다).
-      // '알렸습니다' 토스트는 서버가 실제로 기록했을 때('paid'·'refunded')만 띄운다. 거절된 보고('orphan')는 성공이 아니다.
+      // 복구가 성공해도 토스트는 띄우지 않는다 -- 예전엔 '지난 결제 완료를 전산에 알렸습니다'가 손님 대기화면에 떠서, 앞에 있는 손님은
+      // '무슨 결제?'라고 헷갈리고 직원은 할 일이 없었다. 기록은 콘솔에만 남긴다. 거절된 보고('orphan')는 결제 화면이 직원 안내를 띄운다.
       async function runRecovery(pay, token) {
         const paid = pay.recoverInflight(token).then((r) => {
-          if (r === 'paid') toast({ message: '지난 결제 완료를 전산에 알렸습니다.', icon: 'success' })
+          if (r === 'paid') console.info('[index] 지난 결제 완료를 전산에 알렸습니다.')
           return r
         })
         const refunded = pay.recoverRefundInflight(token).then((r) => {
-          if (r === 'refunded') toast({ message: '지난 결제 취소 완료를 전산에 알렸습니다.', icon: 'success' })
+          if (r === 'refunded') console.info('[index] 지난 결제 취소 완료를 전산에 알렸습니다.')
           return r
         })
         const results = await Promise.all([paid, refunded])
-        if (results.includes('auth')) notifyTokenProblem('지난 결제 결과를 전산에 알리지 못했습니다. 플러그인 설정에서 매장 토큰을 확인해주세요.')
+        if (results.includes('auth')) notifyTokenProblem('auth')
         if (await pay.hasOrphanNotices()) orphanNoticePending = true
         return results.some((r) => r === 'pending' || r === 'auth') ? 'pending' : 'done'
       }
@@ -101,13 +129,14 @@
         const token = await pay.getToken()
         if (!token) {
           // 예전엔 여기서 그냥 끝나서, 토큰을 나중에 넣어도 프론트를 다시 켜기 전까지 전산 결제를 못 받았다.
-          notifyTokenMissing()
+          notifyTokenProblem('missing')
           setTimeout(startWatching, ERP_RETRY_MS)
           return
         }
 
         let stopped = false
-        let ticks = 0
+        let pollMs = pay.pollIntervalOf(null) // 첫 응답 전에는 기본값(3초)
+        let sinceRecoveryMs = 0 // 마지막 복구 시도 뒤로 지난 폴링 간격의 합
         let recoveryNeeded = true
         let recoveryRunning = false
 
@@ -135,9 +164,13 @@
 
         const tick = async () => {
           if (stopped) return
-          ticks += 1
-          // 복구가 끝나지 않은 동안(기록이 남아 있는 동안)은 20번째 폴링마다 다시 시도한다.
-          if (recoveryNeeded && ticks % ERP_RECOVER_RETRY_TICKS === 0) recoverInBackground()
+          // 복구가 끝나지 않은 동안(기록이 남아 있는 동안)은 약 1분마다 다시 시도한다. 시간은 폴링 간격을 더해 센다 -- 서버가 간격을
+          // 바꿔도(pollMs) 복구 주기는 그대로 약 1분이다(예전엔 '20번째 폴링마다'라 간격이 30초면 10분에 한 번이 됐다).
+          if (recoveryNeeded && sinceRecoveryMs >= ERP_RECOVER_RETRY_MS) {
+            sinceRecoveryMs = 0
+            recoverInBackground()
+          }
+          let delay = pollMs
           // 예외(SDK·저장소 오류 등)가 setTimeout 재예약을 끊으면 폴링이 영영 멈춘다 -- 잡아서 다음 폴링을 반드시 건다.
           try {
             if (orphanNoticePending) {
@@ -146,7 +179,18 @@
               location.href = './erp-pay.html'
               return
             }
-            const { ok, body } = await pay.listCarts(token)
+            const { ok, status, body } = await pay.listCarts(token)
+            if (status === 401 || status === 403) {
+              // 토큰이 틀렸거나 재발급됐다(또는 매장 비활성). 예전엔 아무 안내 없이 3초마다 같은 거절을 받으며 전산 결제를 조용히 놓쳤다.
+              // 직원 안내를 한 번 띄우고 확인 간격을 1분으로 늦춘다. 직원이 설정 화면에서 토큰을 다시 넣으면 대기화면이 새로 열리며
+              // 바로 정상 간격으로 돌아온다.
+              notifyTokenProblem('auth')
+              delay = ERP_AUTH_RETRY_MS
+            } else if (ok) {
+              clearTokenNotices()
+              pollMs = pay.pollIntervalOf(body)
+              delay = pollMs
+            }
             // 쉬는 주문과, 승인됐는데 전산이 받지 않은 결제가 걸린 주문(이중결제 위험 -- 이 단말기의 미기록 목록과 서버의 frontOrphan)은
             // 결제창을 자동으로 띄우지 않는다.
             // 지난 기록 확인이 안 끝나 결제 화면이 쉬게 한 주문(holdStuck)도 넘기지 않는다 -- 예전엔 그 주문을 보자마자 결제 화면으로
@@ -164,10 +208,11 @@
           } catch (e) {
             console.error('[index] 전산 주문 확인 오류', e)
           }
-          setTimeout(tick, ERP_POLL_MS)
+          sinceRecoveryMs += delay
+          setTimeout(tick, delay)
         }
 
-        // 손님이 예약/결제 버튼을 눌러 다른 화면으로 가는 순간 폴링을 멈춘다(페이지 이동으로 자연히
+        // 손님이 [접수하기]를 눌러 다른 화면으로 가는 순간 폴링을 멈춘다(페이지 이동으로 자연히
         // 멈추지만, 이동 중에 결제 화면으로 끼어드는 일을 확실히 막는다).
         window.addEventListener('pagehide', () => { stopped = true })
 
@@ -183,27 +228,30 @@
         })
       }
 
-      // [결제하기](금액을 직접 넣는 payment.html)는 뺐다. 정비 결제는 전산 주문이 들어오면 위 watchErpCarts가
-      // 결제 화면(erp-pay.html)으로 자동으로 넘기므로, 손님이 누를 버튼은 예약 하나면 된다.
+      // [결제하기](금액을 직접 넣는 payment.html)는 뺐다(ZIP에서도 뺐다 -- package.ps1·package.sh). 정비 결제는 전산 주문이
+      // 들어오면 위 watchErpCarts가 결제 화면(erp-pay.html)으로 자동으로 넘기므로, 손님이 누를 버튼은 [접수하기] 하나면 된다.
       // 전산 주문 확인을 화면 그리기보다 **먼저** 시작한다 -- 대기화면 그리기에서 오류가 나도 결제 주문은 받아 가야 한다.
       startWatching()
 
+      // 설명(description)은 계속 흐르는 자막이라 긴 문장은 읽기 어렵다 -- 짧게 쓴다. 순서 안내는 알림톡 템플릿이 승인되기 전까지 문자로
+      // 나가므로 '휴대폰으로'라고 쓴다. 버튼 아래 작은 글씨(button.subText)로 준비물을 알려 준다.
       try {
         sdk.template.renderIdlePage({
           type: 'oneButton',
           description: {
-            text: '쉐보레 정비 예약',
-            subText: '차량번호로 예약하면 순서를 알림톡으로 알려드려요',
+            text: '쉐보레 정비 접수',
+            subText: '순서가 되면 휴대폰으로 알려드려요',
           },
           button: {
-            text: '예약하기',
+            text: '접수하기',
+            subText: '차량번호만 있으면 돼요',
             onClick: () => {
               location.href = './reservation.html'
             },
           },
         })
       } catch (e) {
-        // 이 단말기 SDK가 oneButton을 못 그리면 기본 대기화면이라도 띄운다(예약은 직원에게 안내).
+        // 이 단말기 SDK가 oneButton을 못 그리면 기본 대기화면이라도 띄운다(접수는 직원에게 안내).
         console.error('[index] 대기화면(oneButton)을 그리지 못했습니다', e)
         try { sdk.template.renderIdlePage() } catch (e2) { console.error('[index] 기본 대기화면도 실패', e2) }
       }

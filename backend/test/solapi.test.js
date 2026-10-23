@@ -276,3 +276,68 @@ test('홍보 문자 본문은 "(광고) 매장명"으로 시작하고 수신거�
   assert.ok(text.startsWith('(광고) 쉐보레 테스트점\n'), text)
   assert.ok(text.endsWith(process.env.PROMO_OPT_OUT_TEXT || solapi.DEFAULT_PROMO_OPT_OUT_TEXT), text)
 })
+
+// 본문 문구 규칙(solapi.js usesTemplate 주석): 템플릿 ID가 설정된 메시지는 카카오 승인 문구 그대로, 일반 문자로만 나갈 때만 '접수' 문구.
+async function capturedText(envName, send) {
+  const previous = process.env[envName]
+  const previousPfId = process.env.SOLAPI_KAKAO_PFID
+  let sent = null
+  sendImpl = async (message) => { sent = message; return { groupId: 'captured' } }
+  try {
+    return await send(() => sent)
+  } finally {
+    if (previous === undefined) delete process.env[envName]
+    else process.env[envName] = previous
+    if (previousPfId === undefined) delete process.env.SOLAPI_KAKAO_PFID
+    else process.env.SOLAPI_KAKAO_PFID = previousPfId
+  }
+}
+
+const RESERVATION_ARGS = {
+  phone: '01000000000', carNumber: '12가3456', queueNumber: 5, peopleAhead: 2, serviceType: '엔진오일 교체', storeName: '테스트매장', storeId: 1, reservationId: 1,
+}
+
+test('접수 알림: 템플릿이 없으면 일반 문자 본문을 "접수" 문구로 보낸다', async () => {
+  await capturedText('SOLAPI_KAKAO_TEMPLATE_RESERVATION', async (sent) => {
+    delete process.env.SOLAPI_KAKAO_TEMPLATE_RESERVATION
+    await solapi.sendReservationAlimtalk(RESERVATION_ARGS)
+    assert.equal(sent().text, '[테스트매장]\n차량번호 12가3456 · 엔진오일 교체 접수했어요.\n대기번호 5번, 고객님 앞에 2명이 기다리고 있어요.')
+    assert.equal(sent().kakaoOptions, undefined)
+    await solapi.sendReservationAlimtalk({ ...RESERVATION_ARGS, peopleAhead: 0 })
+    assert.match(sent().text, /바로 다음 순서예요/)
+  })
+})
+
+test('접수 알림: 템플릿 ID가 설정돼 있으면 승인 문구(예약 접수) 그대로 보낸다', async () => {
+  await capturedText('SOLAPI_KAKAO_TEMPLATE_RESERVATION', async (sent) => {
+    process.env.SOLAPI_KAKAO_TEMPLATE_RESERVATION = 'TPL-RESERVATION'
+    process.env.SOLAPI_KAKAO_PFID = 'PF-TEST'
+    await solapi.sendReservationAlimtalk(RESERVATION_ARGS)
+    assert.equal(sent().text, '[테스트매장]\n차량번호 12가3456 · 엔진오일 교체 예약이 접수되었습니다.\n대기번호 5번, 앞으로 2명 남았습니다.')
+    assert.equal(sent().kakaoOptions.templateId, 'TPL-RESERVATION')
+  })
+})
+
+test('영수증: 일반 문자는 "정비내역", 템플릿이 있으면 승인 문구 "정비항목"을 쓴다', async () => {
+  const args = { phone: '01000000000', carNumber: '12가3456', serviceType: '엔진오일 외 1건', amount: 1000, storeName: '테스트매장', storeId: 1, paymentId: 1 }
+  await capturedText('SOLAPI_KAKAO_TEMPLATE_RECEIPT', async (sent) => {
+    delete process.env.SOLAPI_KAKAO_TEMPLATE_RECEIPT
+    await solapi.sendReceiptAlimtalk(args)
+    assert.match(sent().text, /\n정비내역 엔진오일 외 1건/)
+    process.env.SOLAPI_KAKAO_TEMPLATE_RECEIPT = 'TPL-RECEIPT'
+    process.env.SOLAPI_KAKAO_PFID = 'PF-TEST'
+    await solapi.sendReceiptAlimtalk(args)
+    assert.match(sent().text, /\n정비항목 엔진오일 외 1건/)
+  })
+})
+
+test('홍보 문자: 일반 문자 본문은 매장명 뒤 조사를 쓰지 않고, 템플릿이 있으면 승인 문구 그대로다', async () => {
+  await capturedText('SOLAPI_KAKAO_TEMPLATE_PROMO', async () => {
+    delete process.env.SOLAPI_KAKAO_TEMPLATE_PROMO
+    const plain = solapi.buildPromoText('강남서비스센터')
+    assert.ok(!plain.includes('강남서비스센터을'), plain)
+    assert.match(plain, /그동안 저희 매장을 이용해주셔서/)
+    process.env.SOLAPI_KAKAO_TEMPLATE_PROMO = 'TPL-PROMO'
+    assert.match(solapi.buildPromoText('강남점'), /그동안 강남점을 이용해주셔서/)
+  })
+})

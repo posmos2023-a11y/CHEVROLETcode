@@ -5,7 +5,8 @@
 // 이 화면은 들어오자마자(기간을 바꿀 때마다) 그 기간에 방문한 손님 전체 목록을 상태와 함께 보여주고,
 // 보낼 수 있는 수를 [N명에게 보내기]로 두 번 눌러 확정해야 보낸다. 예전에는 [대상 확인]을 눌러야 숫자와
 // 샘플 몇 명만 보여서, 직원이 "누가 왜 빠졌는지"를 볼 수 없었다.
-// 아래쪽 [수신거부 등록]은 손님이 거부를 알려왔을 때 번호를 등록한다.
+// 아래쪽 [수신거부 등록]은 손님이 거부를 알려왔을 때 번호를 등록한다. 목록 행의 [홍보 제외(계속)]은 그 번호를 홍보 대상에서
+// 영구히 뺀다(예전 이름 [삭제]는 "이번 목록에서만 지우기"로 읽혔다).
 //
 // 확인을 window.confirm 대신 두 번 누르기로 하는 이유: POS 탭 화면(iframe)에서는 브라우저 확인창이
 // 막히거나 POS 화면을 멈출 수 있다. 대기열의 호출·완료와 같은 방식이라 직원에게도 익숙하다.
@@ -21,7 +22,7 @@ let dateTimer = null
 let confirmTimer = null
 let sending = false
 let optOutConfirmTimer = null
-// 목록 행 [삭제] 두 번 누르기. phone -> timeoutId
+// 목록 행 [홍보 제외(계속)] 두 번 누르기. phone -> timeoutId
 const rowDeleteConfirm = new Map()
 const rowDeleting = new Set()
 
@@ -107,7 +108,7 @@ function setLoading(on) {
   el('promo-campaign-result')?.classList.toggle('is-loading', on)
 }
 
-// 보내는 동안에는 기간·새로고침·탭·더 보기를 잠근다(같은 매장에 발송이 겹치거나 화면이 바뀌지 않게).
+// 보내는 동안에는 기간·[대상 다시 보기]·탭·더 보기를 잠근다(같은 매장에 발송이 겹치거나 화면이 바뀌지 않게).
 function lockForm(locked) {
   for (const id of ['promo-campaign-from', 'promo-campaign-to', 'promo-campaign-preview']) {
     const node = el(id)
@@ -154,7 +155,7 @@ export function initPromoCampaign(injected) {
   to.value = autoTo
   from.max = to.max = autoTo
 
-  // 폼 submit(버튼 라벨은 '새로고침')은 같은 기간을 처음부터 다시 불러온다.
+  // 폼 submit(버튼 라벨은 '대상 다시 보기')은 같은 기간을 처음부터 다시 불러온다.
   form.addEventListener('submit', (e) => {
     e.preventDefault()
     if (sending) return
@@ -216,12 +217,14 @@ function renderDemo(body) {
   const status = el('promo-demo-status')
   const btn = el('promo-demo-toggle')
   if (!card || !status || !btn) return
+  // 카드는 켜져 있을 때만 보이고 탭앱에서는 끄기만 된다(서버가 탭앱의 켜기를 403으로 막는다). 꺼짐 문구·'켜기' 글자는 화면에
+  // 나올 일이 없어 두지 않는다.
   card.hidden = !demoMode
   card.classList.toggle('is-on', demoMode)
   status.textContent = demoMode
-    ? `켜짐 — 정비 이력의 차량별 홍보 발송만 30일 제한 없이 보낼 수 있습니다. 기간 발송은 30일 제한 그대로입니다. ${formatTime(body.demoUntil)}에 저절로 꺼집니다.`
-    : '꺼짐 — 같은 번호에는 30일에 한 번만 보냅니다. 시연할 때만 켜세요(오늘 밤 12시에 저절로 꺼짐).'
-  btn.textContent = demoMode ? '끄기' : '켜기'
+    ? `켜짐 — 정비 이력에서 차량별로 보낼 때만 30일 제한이 꺼져요(${formatTime(body.demoUntil)}에 자동으로 꺼짐).`
+    : ''
+  btn.textContent = '끄기'
   btn.classList.remove('confirming')
   btn.disabled = false
 }
@@ -266,23 +269,27 @@ async function handleDemoToggle() {
     }
     btn.disabled = false
     btn.classList.remove('confirming')
-    btn.textContent = demoMode ? '끄기' : '켜기'
-    deps.notify('error', res.body.error || '시연 모드를 바꾸지 못했습니다.')
+    btn.textContent = '끄기'
+    deps.notify('error', res.body.error || '시연 모드를 끄지 못했어요. 다시 시도해주세요.')
     return
   }
   renderDemo(res.body)
-  deps.notify('success', res.body.demoMode ? '시연 모드를 켰습니다. 오늘 밤 12시에 저절로 꺼집니다.' : '시연 모드를 껐습니다.')
+  // 끄기만 보내므로 켜짐으로 답하는 일은 없어야 한다. 그래도 그렇게 오면 껐다고 하지 않는다.
+  if (res.body.demoMode) deps.notify('error', '시연 모드가 아직 켜져 있어요. 본사에 알려주세요.')
+  else deps.notify('success', '시연 모드를 껐어요.')
   // 대상 수가 바뀌므로(30일 제외가 풀리거나 다시 걸림) 목록을 다시 불러온다.
   if (listState && !sending) startLoad()
 }
 
+// 서버는 기간 발송 미리보기에 시연 모드여도 30일 제한(minIntervalDays)을 그대로 보낸다 -- 그래서 예전의
+// '(시연 모드: 30일 제한 꺼짐)' 꼬리는 나올 수 없었고, 나왔다면 '기간 발송은 30일 제한 그대로'와 모순이라 뺐다.
 function excludedText(ex, days) {
   return [
-    ex.optedOut ? `수신거부 ${ex.optedOut}` : '',
-    `광고 미동의 ${ex.noConsent}`,
-    ex.consentExpired ? `동의 2년 경과 ${ex.consentExpired}` : '',
-    days > 0 ? `최근 ${days}일 내 받은 번호 ${ex.recentlySent}` : '',
-  ].filter(Boolean).join(' · ') + ' 제외' + (days > 0 ? '' : ' (시연 모드: 30일 제한 꺼짐)')
+    ex.optedOut ? `수신거부 ${ex.optedOut}명` : '',
+    `광고 미동의 ${ex.noConsent}명`,
+    ex.consentExpired ? `동의 2년 경과 ${ex.consentExpired}명` : '',
+    days > 0 ? `최근 ${days}일 내 받은 번호 ${ex.recentlySent}명` : '',
+  ].filter(Boolean).join(' · ') + ' 제외'
 }
 
 // 날짜 입력은 달력에서 연속으로 바뀌기도 하므로 300ms 모아서 한 번만 부른다.
@@ -364,7 +371,7 @@ async function loadList({ append = false, quiet = false } = {}) {
     }
     // 새 기간/탭의 목록을 못 받았으면 옛 목록을 남겨두지 않는다(기간 표시와 어긋난다).
     clearList()
-    if (quiet) deps.notify('error', `${text} [새로고침]을 눌러 다시 불러오세요.`)
+    if (quiet) deps.notify('error', `${text} [대상 다시 보기]를 눌러 다시 불러와주세요.`)
     else setMessage(text, 'error')
     return
   }
@@ -399,7 +406,8 @@ function renderBadge(row) {
   const e = deps.escapeHtml
   // 방금 확실히 실패한 번호(서버가 잠시 보내기 목록에서 빼 둔다). 영영 못 보내는 게 아니라 시간이 지나면 다시 대상이
   // 되므로 '제외' 사유 라벨 대신 언제 다시 되는지를 알려준다.
-  if (row.recentFailure) return '<span class="promo-campaign-badge">방금 실패 · 30분 뒤 재시도</span>'
+  // 자동으로 다시 보내지 않는다 -- 직원이 30분 뒤 다시 보내야 한다(예전 '30분 뒤 재시도'는 자동 재발송처럼 읽혔다).
+  if (row.recentFailure) return '<span class="promo-campaign-badge">방금 실패 · 30분 뒤 다시 보낼 수 있음</span>'
   if (row.status === 'recently_sent') {
     const day = formatMonthDay(row.lastSentAt)
     return `<span class="promo-campaign-badge">${e(day ? `최근 받음 ${day}` : '최근 받음')}</span>`
@@ -426,7 +434,7 @@ function renderList() {
     ? ''
     : '<div class="promo-campaign-note blocked">수신거부 안내가 기본 문구("매장으로 연락")입니다. 080 무료수신거부처럼 손님에게 비용이 들지 않는 방법으로 바꾸도록 본사에 알려주세요.</div>'
   const action = body.night
-    ? '<div class="promo-campaign-note blocked">지금은 야간이라 보낼 수 없습니다(21시~8시). 낮에 다시 보내주세요.</div>'
+    ? '<div class="promo-campaign-note blocked">밤 9시~아침 8시에는 보낼 수 없어요. 아침 8시 이후에 보내주세요.</div>'
     : eligible > 0
       ? `<button class="history-promo-button" id="promo-campaign-send" type="button">${num(eligible)}명에게 보내기</button>
          <div class="promo-campaign-note">한 번 더 눌러야 보내집니다. 보낸 뒤에는 취소할 수 없습니다.</div>`
@@ -446,7 +454,7 @@ function renderList() {
         <span class="promo-campaign-visit">${e(formatVisit(r.lastVisitAt))}</span>
         ${renderBadge(r)}
         <button type="button" class="promo-campaign-row-delete${rowDeleteConfirm.has(r.phone) ? ' confirming' : ''}"
-                data-promo-delete="${e(r.phone || '')}" ${rowDeleting.has(r.phone) || sending ? 'disabled' : ''}>${rowDeleteConfirm.has(r.phone) ? '정말 삭제?' : '삭제'}</button>
+                data-promo-delete="${e(r.phone || '')}" ${rowDeleting.has(r.phone) || sending ? 'disabled' : ''}>${rowDeleteConfirm.has(r.phone) ? '앞으로 이 번호에는 홍보가 나가지 않아요. 제외할까요?' : '홍보 제외(계속)'}</button>
       </li>`)
     .join('')
   const shown = listState.rowsTotal === null ? '' : ` (${num(rows.length)}/${num(listState.rowsTotal)})`
@@ -469,8 +477,8 @@ function renderList() {
   `
 }
 
-// 목록에서 번호 삭제. 지운 번호는 홍보 목록에서 사라지고 차량별·자동 발송도 막힌다(서버 PromoExclusion).
-// 두 번 눌러야 지워진다(되돌리는 화면은 없다).
+// 목록에서 번호를 홍보 대상에서 영구히 뺀다([홍보 제외(계속)]). 뺀 번호는 홍보 목록에서 사라지고 차량별·자동 발송도 막힌다
+// (서버 PromoExclusion). 두 번 눌러야 빠진다(되돌리는 화면은 없다 -- 그래서 확인 문구에 결과를 적어 둔다).
 function handleRowDelete(phone) {
   if (!phone || sending) return
   if (!rowDeleteConfirm.has(phone)) {
@@ -497,13 +505,13 @@ async function deleteRow(phone) {
     }
     if (!res.ok) {
       if (res.status === 401) return deps.onUnauthorized(res.body.error)
-      return deps.notify('error', res.body.error || '삭제하지 못했습니다.')
+      return deps.notify('error', res.body.error || '홍보 대상에서 빼지 못했어요. 다시 시도해주세요.')
     }
-    deps.notify('success', `${phone} 번호를 홍보 목록에서 삭제했습니다.`)
+    deps.notify('success', `${phone} 번호를 홍보 대상에서 뺐어요. 앞으로 이 번호에는 홍보 문자가 나가지 않아요.`)
     startLoad({ append: false })
   } finally {
     rowDeleting.delete(phone)
-    // 시작할 때 [삭제]를 잠근 채 다시 그렸다. 실패하면(서버 오류·네트워크) 목록을 다시 불러오지 않으므로 여기서 그려
+    // 시작할 때 [홍보 제외(계속)]을 잠근 채 다시 그렸다. 실패하면(서버 오류·네트워크) 목록을 다시 불러오지 않으므로 여기서 그려
     // 풀어주지 않으면 그 버튼이 영영 잠긴 채 남는다. 성공이면 곧 새 목록이 와서 덮어쓴다.
     if (listState) renderList()
   }
@@ -529,13 +537,14 @@ function handleSendClick(btn) {
 
 // 발송사(솔라피) 계정 쪽 문제(선불 잔액 부족·발신번호 차단·템플릿 등)로 서버가 발송을 멈췄을 때의 안내. 이때는 30분 뒤 다시 보내도
 // 똑같이 실패한다 -- "다시 보내세요"가 아니라 본사 확인이 필요하다고 알린다(서버 stopped:'provider', 수동 발송 reason 'send_failed_provider').
-export const PROVIDER_STOP_MESSAGE = '문자 발송 계정(잔액·발신번호·템플릿) 문제로 멈췄습니다. 본사 확인이 필요합니다'
+// '잔액·발신번호·템플릿'은 본사 운영자가 쓰는 말이라 매장 직원에게는 할 일(본사에 알리기)만 남긴다.
+export const PROVIDER_STOP_MESSAGE = '문자 발송이 멈췄어요(발송 계정 문제). 본사에 알려주세요.'
 
 // 결과 문구. failed는 확실히 안 나간 것(나중에 다시 보낼 수 있다), uncertain은 결과를 모르는 것
 // (나갔을 수 있어 30일 동안 다시 보내지 않는다).
 function summary(t, remaining, reason) {
   const parts = [`보냄 ${t.sent}건`]
-  if (t.failed) parts.push(`실패 ${t.failed}건(30분 뒤 [새로고침] 후 다시 보낼 수 있습니다)`)
+  if (t.failed) parts.push(`실패 ${t.failed}건(30분 뒤 [대상 다시 보기]를 누르면 다시 보낼 수 있어요)`)
   if (t.uncertain) parts.push(`결과 확인 안 됨 ${t.uncertain}건(이미 나갔을 수 있어 30일 동안 다시 보내지 않습니다)`)
   if (t.skipped) parts.push(`보내기 직전 제외 ${t.skipped}건`)
   if (remaining) parts.push(`아직 ${remaining}명 남음 — ${reason || '아래 [보내기]를 다시 눌러 이어서 보내세요.'}`)
@@ -662,12 +671,13 @@ async function handleOptOutSubmit() {
   const btn = el('promo-optout-submit')
   const phone = String(input?.value || '').replace(/\D/g, '')
   if (!/^01[0-9]{8,9}$/.test(phone)) {
-    setOptOutMessage('전화번호를 01012345678 형식으로 입력하세요.', 'error')
+    // 하이픈·공백은 위에서 지우고 받는다 -- 실제로 막히는 건 휴대폰 번호가 아닐 때다.
+    setOptOutMessage('휴대폰 번호를 입력해주세요(예: 01012345678).', 'error')
     return
   }
   if (!optOutConfirmTimer) {
     btn.classList.add('confirming')
-    btn.textContent = '한 번 더 누르면 등록'
+    btn.textContent = '정말 등록할까요?'
     optOutConfirmTimer = setTimeout(() => {
       optOutConfirmTimer = null
       btn.classList.remove('confirming')

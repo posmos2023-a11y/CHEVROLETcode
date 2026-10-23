@@ -57,6 +57,15 @@ STATUS_COLOR_SUCCESS = "#0F9D58"
 STATUS_COLOR_ERROR = "#D93025"
 STATUS_COLOR_NEUTRAL = "#5F6B7A"
 
+# 폴링이 끝난 상태 중 _on_poll_status_changed가 따로 다루지 않는 값의 화면 문구. 키는 서버 ErpCart.status 값이다.
+FINAL_STATUS_TEXT = {
+    "dismissed": "매장에서 주문을 지웠어요",
+    "expired": "처리되지 않아 만료됐어요",
+    "refunded": "결제가 취소됐어요",
+    "refund_requested": "결제 취소가 진행 중이에요",
+    "refunding": "결제 취소가 진행 중이에요",
+}
+
 
 def format_won(amount):
     return f"{amount:,.0f}원"
@@ -86,15 +95,12 @@ class SettingsDialog(QDialog):
         form.setSpacing(12)
         form.addRow("API 서버 주소", self.base_url_edit)
         form.addRow("ERP 토큰", self.token_edit)
-        form.addRow("매장코드", self.store_code_edit)
+        form.addRow("매장코드(전산 코드)", self.store_code_edit)
         form.addRow("사업자번호", self.business_number_edit)
 
+        # 환경변수(CHEVROLET_*)가 여기 값보다 우선한다는 개발자용 안내는 README에 있다 -- 화면에는 직원이 할 일만 둔다.
         note = QLabel(
-            "환경변수(CHEVROLET_API_BASE_URL / CHEVROLET_ERP_TOKEN / "
-            "CHEVROLET_STORE_CODE / CHEVROLET_BUSINESS_NUMBER)가 설정되어 있으면 "
-            "여기 값보다 우선 적용됩니다. "
-            "사업자번호를 채워두면 서버가 이 값으로 매장을 찾아 매장코드를 자동으로 "
-            "연결합니다 — 매장코드가 아직 등록되지 않았어도 첫 전송에서 이어집니다."
+            "사업자번호를 넣으면 매장코드가 아직 등록되지 않았어도 서버가 매장을 찾아 자동으로 연결해요."
         )
         note.setWordWrap(True)
         note.setObjectName("HintLabel")
@@ -254,11 +260,11 @@ class MainWindow(QMainWindow):
         plate_label.setObjectName("FieldLabel")
         self.plate_edit = QLineEdit()
         self.plate_edit.setPlaceholderText("예: 12가3456")
-        # 이 값은 POS 화면 표시뿐 아니라 "그날 대기 중인 예약 손님"을 찾는 데도 쓰인다.
+        # 이 값은 POS 화면 표시뿐 아니라 "그날 접수한 대기 손님"을 찾는 데도 쓰인다.
         # 직원이 왜 채워야 하는지 모르면 비워두게 되므로 툴팁으로 알려준다.
         self.plate_edit.setToolTip(
-            "POS 화면에 표시되고, 그날 대기 중인 예약 손님과 자동으로 이어집니다. "
-            "이어지면 결제가 끝났을 때 정비완료 처리까지 자동으로 됩니다."
+            "POS 화면에 표시되고, 그날 접수한 대기 손님과 자동으로 연결돼요. "
+            "연결되면 결제가 끝날 때 정비완료까지 자동으로 처리돼요."
         )
         customer_label = QLabel("고객명")
         customer_label.setObjectName("FieldLabel")
@@ -416,7 +422,8 @@ class MainWindow(QMainWindow):
         status_bar = self.statusBar()
         status_bar.setSizeGripEnabled(False)
 
-        self.status_label = QLabel("대기 중")
+        # 아무것도 보내지 않은 상태다. '대기 중'이라고 쓰면 전송 뒤의 'POS 대기 중'과 같은 말이라 무언가 기다리는 것처럼 보였다.
+        self.status_label = QLabel("준비됨")
         self.status_label.setObjectName("StatusLabel")
         status_bar.addWidget(self.status_label, 1)
 
@@ -631,11 +638,15 @@ class MainWindow(QMainWindow):
         # 돈이 걸린 경로라 조용히 넘기지 않고, 장바구니를 그대로 둔 채 다시 누르게 한다.
         if result.get("duplicate"):
             self._update_send_button_enabled()
+            # 버튼 이름은 결제 위치에 따라 [POS로 전송]/[프론트로 전송]으로 바뀐다 -- 지금 화면의 이름으로 안내한다.
             self._set_status(
-                "❌ 주문번호가 중복됐습니다. 전송되지 않았으니 [POS로 전송]을 한 번 더 눌러주세요.",
+                f"❌ 주문번호가 중복돼 전송되지 않았어요. [{self._send_button_label()}]을 한 번 더 눌러주세요.",
                 STATUS_COLOR_ERROR,
             )
             return
+
+        # 아래에서 입력칸을 비우기 전에 차량번호를 기억해 둔다 -- 예전에는 비운 뒤에 확인해서 '연결된 접수 없음'이 한 번도 안 나왔다.
+        sent_plate = self.plate_edit.text().strip()
 
         # 비우기 직전에 보낸 내용을 그대로 보관한다. POS가 담기에 실패하면 그 건은 서버에서
         # 끝난 상태라 전산이 다시 보내야 하는데, 그때 직원이 품목을 처음부터 다시 고르지
@@ -663,14 +674,17 @@ class MainWindow(QMainWindow):
         # "왜 대기열에서 안 사라지지?"를 나중에 묻지 않는다.
         if result.get("linkedReservation"):
             link_note = " · 대기 손님과 연결됨"
-        elif self.plate_edit.text().strip():
-            # 차량번호는 보냈는데 못 이었다. 예약 없이 온 손님일 수도 있고, 번호가 다를 수도 있다.
-            link_note = " · 연결된 예약 없음"
+        elif sent_plate:
+            # 차량번호는 보냈는데 못 이었다. 접수 없이 온 손님일 수도 있고, 번호가 다를 수도 있다.
+            link_note = " · 연결된 접수 없음"
         else:
             link_note = ""
+        # 서버가 어느 매장으로 받았는지(storeName) 함께 보여준다 -- 매장코드가 틀려 남의 매장으로 간 주문을 바로 알아챌 수 있다.
+        store_name = result.get("storeName")
+        store_note = f" · {store_name}" if store_name else ""
         waiting_for = "프론트 결제 대기 중" if self._current_pay_target == "front" else "POS 대기 중"
         self._set_status(
-            f"전송됨 · {waiting_for}...{link_note} ({reference_id})", STATUS_COLOR_PENDING
+            f"전송됨{store_note} · {waiting_for}...{link_note} ({reference_id})", STATUS_COLOR_PENDING
         )
         self._start_poll(reference_id)
 
@@ -734,6 +748,9 @@ class MainWindow(QMainWindow):
             self._offer_restore()
         elif status == "cancelled":
             self._set_status(f"취소되었습니다 ({reference_id})", STATUS_COLOR_NEUTRAL)
+        elif status in FINAL_STATUS_TEXT:
+            # 서버 상태 값(dismissed·expired 등)을 영문 그대로 보여주지 않는다.
+            self._set_status(f"{FINAL_STATUS_TEXT[status]} ({reference_id})", STATUS_COLOR_NEUTRAL)
         else:
             self._set_status(f"상태: {status} ({reference_id})", STATUS_COLOR_NEUTRAL)
 
@@ -777,7 +794,7 @@ class MainWindow(QMainWindow):
         if self._current_pay_target == "front":
             message = f"⏱ 5분 동안 프론트에서 결제가 끝나지 않았습니다 ({reference_id})"
         else:
-            message = f"⏱ 응답 없음 · 60초 동안 POS가 가져가지 않았습니다 ({reference_id})"
+            message = f"⏱ 60초 동안 POS에서 주문을 가져가지 않았어요. 매장 POS 탭앱이 켜져 있는지 확인해주세요 ({reference_id})"
         self._set_status(message, STATUS_COLOR_PENDING)
         # 타임아웃은 "아직 pending"일 뿐 실패가 아니다 — POS가 나중에 담아갈 수도 있다.
         # 그래서 복원은 제공하되, 되살려 다시 보내면 중복이 될 수 있다는 걸 버튼을 눌렀을 때

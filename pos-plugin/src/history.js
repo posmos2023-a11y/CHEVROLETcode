@@ -27,7 +27,7 @@ const promoEl = () => document.getElementById('history-promo')
 let shownCarNumber = ''
 
 // 홍보 확인(refreshPromo) 응답의 순번. 차를 바꿔 조회했는데 이전 차의 확인 응답이 늦게 도착하면, 지금 차 화면에
-// 이전 차의 [홍보 메시지 보내기] 버튼이 뜬다 -- 직원이 그대로 누르면 엉뚱한 손님에게 광고가 나간다(되돌릴 수 없다).
+// 이전 차의 [홍보 문자 보내기] 버튼이 뜬다 -- 직원이 그대로 누르면 엉뚱한 손님에게 광고가 나간다(되돌릴 수 없다).
 // 새 조회·목록 전환·새 확인이 시작될 때마다 올려서 그 전에 날아간 응답을 모두 무효로 만든다.
 let promoSeq = 0
 
@@ -77,7 +77,7 @@ export function openHistoryFor(carNumber) {
     search(carNumber)
     return
   }
-  bodyEl().innerHTML = '<div class="empty"><div class="empty-copy">차량번호나 전화번호를 입력하면 지난 정비 내역을 보여드립니다.</div></div>'
+  bodyEl().innerHTML = '<div class="empty"><div class="empty-copy">차량번호(뒷번호 4자리도 돼요)나 전화번호를 입력하면 지난 정비 내역을 보여드려요.</div></div>'
   promoSeq += 1
   const promo = promoEl()
   if (promo) promo.hidden = true
@@ -94,8 +94,9 @@ function formatDate(value) {
   return `${d.getFullYear()}.${String(d.getMonth() + 1).padStart(2, '0')}.${String(d.getDate()).padStart(2, '0')}`
 }
 
+// 정비 대기 카드(queueCard.js STATUS_LABEL)와 같은 이름을 쓴다. 따로 바꾸면 대기 화면과 이력 화면의 표기가 어긋난다.
 const STATUS_LABEL = {
-  waiting: '대기중', called: '호출완료', notify_failed: '알림실패',
+  waiting: '대기 중', called: '호출됨', notify_failed: '알림 실패',
   completed: '정비완료', cancelled: '취소됨',
 }
 
@@ -124,7 +125,7 @@ function renderVisits(carNumber, visits, info = {}) {
     <div class="history-owner">
       <strong class="history-owner-car">${deps.escapeHtml(carNumber)}</strong>
       ${owner ? `<span class="history-owner-contact">${owner}</span>` : '<span class="history-owner-contact">연락처 기록 없음</span>'}
-      ${info.phoneSearch ? `<span class="history-owner-note">${deps.escapeHtml(info.phoneSearch)}(으)로 찾음</span>` : ''}
+      ${info.phoneSearch ? `<span class="history-owner-note">${deps.escapeHtml(info.phoneSearch)} 번호로 찾음</span>` : ''}
     </div>
   `
 
@@ -154,8 +155,8 @@ function renderVisits(carNumber, visits, info = {}) {
       <article class="history-visit">
         <div class="history-visit-top">
           <strong class="history-date">${deps.escapeHtml(v.date || formatDate(v.at))}</strong>
-          ${v.status ? `<span class="history-badge">${deps.escapeHtml(STATUS_LABEL[v.status] || v.status)}</span>` : ''}
-          ${paid ? '<span class="history-badge paid">결제완료</span>' : ''}
+          ${v.status ? `<span class="history-badge">${deps.escapeHtml(STATUS_LABEL[v.status] || '기타')}</span>` : ''}
+          ${paid ? '<span class="history-badge paid">결제 완료</span>' : ''}
         </div>
         ${v.serviceType ? `<div class="history-service">${deps.escapeHtml(v.serviceType)}</div>` : ''}
         ${visitOwner ? `<div class="history-service">${visitOwner}</div>` : ''}
@@ -169,9 +170,9 @@ function renderVisits(carNumber, visits, info = {}) {
   }).join('')
 }
 
-// ── 방문 카드 도구: 삭제(리허설·테스트 기록 정리), 완료 문자 다시 보내기 ─────────────────────────
+// ── 방문 카드 도구: 삭제(리허설·테스트 기록 정리), 완료 알림 다시 보내기 ─────────────────────────
 // 둘 다 두 번 눌러야 실행된다. [삭제]는 그 방문과 거기 이어진 결제 기록을 함께 지운다(최근 결제·오늘 현황에서도
-// 빠진다. 서버는 행을 지우지 않고 삭제 표시만 남긴다). 완료 문자는 손님에게 간다.
+// 빠진다. 서버는 행을 지우지 않고 삭제 표시만 남긴다). 완료 알림은 손님에게 간다(알림톡 템플릿이 없으면 문자로 나간다).
 const toolConfirm = new Map() // key -> timeoutId
 const toolBusy = new Set()
 
@@ -184,7 +185,7 @@ function toolButton(key, label, confirmLabel, data) {
 function visitTools(v) {
   const parts = []
   if (v.reservationId && v.status === 'completed') {
-    parts.push(toolButton(`done:${v.reservationId}`, '완료 문자 보내기', '손님께 보낼까요?', { tool: 'done', id: v.reservationId }))
+    parts.push(toolButton(`done:${v.reservationId}`, '완료 알림 다시 보내기', '손님께 다시 보낼까요?', { tool: 'done', id: v.reservationId }))
   }
   const hasPayment = (v.orders || []).some((o) => o.paid)
   const confirmLabel = hasPayment ? '결제 기록도 함께 삭제할까요?' : '정말 삭제할까요?'
@@ -237,7 +238,7 @@ async function runVisitTool(key, tool, id) {
       }
       return deps.notify('error', res.body.error || '처리하지 못했습니다.')
     }
-    if (tool === 'done') return deps.notify('success', '손님께 정비 완료 문자를 보냈습니다.')
+    if (tool === 'done') return deps.notify('success', '손님께 정비완료 알림을 다시 보냈어요.')
     deps.notify('success', '정비 이력에서 삭제했습니다.')
     if (shownCarNumber) await search(shownCarNumber)
   } catch {
@@ -318,7 +319,7 @@ function renderRecent(visits) {
           </span>
           <span class="history-recent-right">
             ${v.totalAmount ? `<span class="history-recent-won">${formatWon(v.totalAmount)}</span>` : ''}
-            ${v.paid ? '<span class="history-badge paid">결제완료</span>' : ''}
+            ${v.paid ? '<span class="history-badge paid">결제 완료</span>' : ''}
           </span>
         </button>
       `
@@ -356,6 +357,65 @@ function renderCarChoices(res) {
   `
 }
 
+// 뒷번호 4자리(예: 3456)만 넣었는지. 정비소에서는 "뒷번호 3456"으로 차를 찾는 일이 흔하다.
+function asCarTail(raw) {
+  const v = String(raw || '').replace(/\s/g, '')
+  return /^\d{4}$/.test(v) ? v : null
+}
+
+// 뒷번호로 찾기. 서버 이력 조회는 차량번호가 정확히 같아야만 찾으므로, 서버를 바꾸지 않고 탭앱이 이미 받을 수 있는 범위
+// (최근 이력 20건 + 오늘 대기열)에서 그 뒷번호로 끝나는 차를 고른다. 한 대면 바로 그 차의 이력을, 여러 대면 고르는 목록을
+// 보여 준다. 범위 밖의 차는 찾지 못하므로 그때는 차량번호 전체를 넣어 달라고 알린다.
+async function searchByTail(tail, isLatest) {
+  const body = bodyEl()
+  let recent = []
+  let recentFailed = false
+  try {
+    const { ok, status, body: res } = await deps.apiGet('/api/pos/history/recent')
+    if (!ok && status === 401) {
+      deps.onUnauthorized(res.error)
+      return
+    }
+    if (ok) recent = res.visits || []
+    else recentFailed = true
+  } catch {
+    recentFailed = true
+  }
+  if (!isLatest()) return
+  let queueCars = []
+  try {
+    queueCars = typeof deps.queueCarNumbers === 'function' ? deps.queueCarNumbers() || [] : []
+  } catch {
+    queueCars = []
+  }
+  const cars = [...new Set([...queueCars, ...recent.map((v) => v.carNumber)]
+    .filter((c) => typeof c === 'string' && c.trim().endsWith(tail))
+    .map((c) => c.trim()))]
+  if (cars.length === 1) {
+    const input = inputEl()
+    if (input) input.value = cars[0]
+    search(cars[0])
+    return
+  }
+  if (!cars.length) {
+    body.innerHTML = `
+      <div class="empty">
+        <div class="empty-title">뒷번호 ${deps.escapeHtml(tail)}인 차를 찾지 못했어요</div>
+        <div class="empty-copy">${recentFailed ? '최근 이력을 불러오지 못해 오늘 대기열에서만 찾았어요. ' : '최근 이력 20건과 오늘 대기열에서 찾았어요. '}차량번호 전체(예: 12가${deps.escapeHtml(tail)})나 전화번호로 찾아주세요.</div>
+      </div>
+    `
+    return
+  }
+  body.innerHTML = `
+    <div class="history-recent-head">뒷번호 ${deps.escapeHtml(tail)}인 차량 ${cars.length}대 · 차량을 누르면 그 차의 이력을 봐요</div>
+    ${cars.map((car) => `
+      <button class="history-recent-row" type="button" data-car="${deps.escapeHtml(car)}">
+        <span class="history-recent-car">${deps.escapeHtml(car)}</span>
+      </button>
+    `).join('')}
+  `
+}
+
 async function search(rawCarNumber) {
   const isLatest = claimRender()
   promoSeq += 1
@@ -371,6 +431,12 @@ async function search(rawCarNumber) {
   body.innerHTML = '<div class="empty"><div class="empty-copy">불러오는 중...</div></div>'
   const promo = promoEl()
   if (promo) promo.hidden = true
+  const tail = phone ? null : asCarTail(carNumber)
+  if (tail) {
+    shownCarNumber = ''
+    await searchByTail(tail, isLatest)
+    return
+  }
   try {
     const query = phone ? `phone=${encodeURIComponent(phone)}` : `carNumber=${encodeURIComponent(carNumber)}`
     const { ok, status, body: res } = await deps.apiGet(`/api/pos/history?${query}`)
@@ -399,7 +465,7 @@ async function search(rawCarNumber) {
   }
 }
 
-// ── 홍보 메시지 수동 발송 ────────────────────────────────────────────────────
+// ── 홍보 문자 수동 발송 ──────────────────────────────────────────────────────
 // 광고성 정보 전송은 정보통신망법 제50조의 규제를 받는다. 보낼 수 있는지는 **서버가** 판단하고
 // (동의 여부 / 야간 / 30일 내 재발송), 여기서는 그 결과를 보여주고 버튼을 켜고 끄는 것만 한다.
 // 화면에서 막는 건 안내일 뿐 방어가 아니다 — 발송 라우트가 같은 조건을 다시 확인한다.
@@ -423,7 +489,7 @@ async function refreshPromo(carNumber) {
     }
     if (body.canSend) {
       promo.innerHTML = `
-        <button class="history-promo-button" type="button" id="history-promo-send">홍보 메시지 보내기</button>
+        <button class="history-promo-button" type="button" id="history-promo-send">홍보 문자 보내기</button>
         <div class="history-promo-note">광고 수신에 동의한 손님입니다. 한 번 보내면 30일간 다시 보낼 수 없습니다.</div>
       `
       const btn = document.getElementById('history-promo-send')
@@ -453,7 +519,7 @@ async function sendPromo(carNumber, btn) {
     setTimeout(() => {
       if (btn.dataset.confirming !== 'true') return
       btn.dataset.confirming = 'false'
-      btn.textContent = '홍보 메시지 보내기'
+      btn.textContent = '홍보 문자 보내기'
       btn.classList.remove('confirming')
     }, 3000)
     return
@@ -470,7 +536,7 @@ async function sendPromo(carNumber, btn) {
       refreshPromo(carNumber)
       return
     }
-    deps.notify('success', `${carNumber} 손님에게 홍보 메시지를 보냈습니다.`)
+    deps.notify('success', `${carNumber} 손님에게 홍보 문자를 보냈어요.`)
     refreshPromo(carNumber)
   } catch {
     deps.notify('error', '네트워크 연결을 확인한 뒤 다시 시도해주세요.')

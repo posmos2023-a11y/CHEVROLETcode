@@ -111,11 +111,36 @@ function kstDateRangeUtc(dateStr) {
 }
 
 // 정비가 끝났거나(completed) 취소된(cancelled) 예약은 "지금 대기열에 남아있는 손님" 계산에서
-// 항상 제외한다. peopleAhead 계산과 POS 대기열 조회가 이 규칙을 공유한다.
+// 항상 제외한다. POS 대기열 조회와 전산 주문 연결이 이 규칙을 공유한다.
 const CLOSED_RESERVATION_STATUSES = ['completed', 'cancelled']
 
-// 전산 주문을 예약과 이을 때 "오늘 접수분" 말고 함께 보는 이월 예약의 범위. 호출까지 끝났지만 다음 날로 넘어온 건
-// (POS 대기열이 이월 건으로 보여주는 상태와 같다)만 대상이고, 어제 waiting은 노쇼로 보고 제외한다.
+// 아직 끝나지 않은 접수(대기·호출됨·호출 알림 실패). 같은 차·같은 번호가 오늘 이 상태로 대기열에 있으면 새 번호를 주지 않는다(createReservation).
+const ACTIVE_QUEUE_STATUSES = ['waiting', 'called', 'notify_failed']
+
+// 휴대폰 번호 비교용 정규화(숫자만). 빈 값이면 null -- 번호가 없는 행끼리 같은 번호로 보지 않는다.
+function normalizePhoneDigits(raw) {
+  const digits = String(raw ?? '').replace(/\D/g, '')
+  return digits || null
+}
+
+// "앞에 기다리는 차" 수(손님 화면·접수 문자의 peopleAhead). 대기(waiting) 중인 접수만 센다 -- 이미 호출된 차(called/notify_failed)는
+// 카운터로 불려 가 정비가 시작된 손님이라, 세면 실제보다 오래 기다려야 하는 것처럼 안내된다(2026-10-23 회의 결정). 호출된 접수
+// 자신은 기다리는 순서가 끝났으므로 0이다. db: prisma 또는 트랜잭션(tx).
+function countWaitingAhead(db, reservation) {
+  if (reservation.status !== 'waiting') return Promise.resolve(0)
+  return db.reservation.count({
+    where: {
+      storeId: reservation.storeId,
+      serviceDate: reservation.serviceDate,
+      status: 'waiting',
+      createdAt: { lt: reservation.createdAt },
+    },
+  })
+}
+
+// 전산 주문을 예약과 이을 때 "오늘 접수분" 말고 함께 보는 이월 예약의 범위. 호출까지 끝났지만 다음 날로 넘어온 건만 대상이고,
+// 어제 waiting은 노쇼일 수 있어 잇지 않는다(POS 대기열은 새 탭앱이 요청하면 전날 waiting도 이월로 보여주지만 -- listActiveQueueForStore -- 자동 연결은
+// 결제 뒤 정비완료·영수증까지 이어지므로 더 좁게 둔다).
 const CARRYOVER_RESERVATION_STATUSES = ['called', 'notify_failed']
 const CARRYOVER_LOOKBACK_DAYS = 2
 
@@ -406,6 +431,17 @@ async function setPosToken(storeId, posToken) {
 // 서로 다른 queueNumber를 받는다. 반면 peopleAhead(대기인원 안내)는 이런 정확한 직렬화가 필요 없는
 // "손님에게 보여주는 대략적인 안내"일 뿐이라 count()를 그대로 둬도 문제없다 — 최악의 경우 대기인원
 // 안내가 한두 명 오차 나는 정도이고, 실제 대기 순서(queueNumber)는 항상 정확하다.
+//
+// 같은 차(정규화한 차량번호)·같은 휴대폰 번호(정규화)의 접수가 오늘 이미 대기열에 있으면(ACTIVE_QUEUE_STATUSES) 새 번호를 주지 않고
+// 그 접수를 duplicate로 돌려준다. 손님이 짧은 결과 화면을 놓쳐 "안 됐나?" 하고 다시 접수하면 번호가 두 개 생기고 알림도 두 번 나갔다.
+// 그러면 그 차의 전산 주문은 접수와 정확히 1건으로 이어지지 않아(findOpenReservationByCarNumber) 결제 뒤 정비완료·영수증도 빠졌다.
+// 번호가 다르면 예전처럼 새 접수를 만든다 -- 번호를 잘못 눌러 접수 문자를 못 받은 손님이 바른 번호로 다시 접수하면 새 번호로
+// 알림이 가야 한다. 같은 차로 보고 옛 접수를 돌려주면 호출·완료 문자가 계속 틀린 번호(모르는 사람)로 갔다. 기존 접수의 번호를
+// 새 값으로 덮어쓰지도 않는다(merchantId는 공개값이라, 차량번호만 알면 남의 알림을 가로챌 수 있다).
+// 중복일 때는 이번 요청의 광고 수신 선택을 기존 접수에 반영한다(동의 → 동의 시각을 지금으로, 거절 → 지운다). 홍보 발송은 "가장 최근
+// 기록 = 지금의 의사"로 판단하므로(findMarketingContactByCarNumber), 반영하지 않으면 방금 거절한 손님에게도 광고가 나간다.
+// 두 요청이 동시에 와도 하나만 새로 만들도록, 그 매장·차량번호 단위의 트랜잭션 잠금(pg_advisory_xact_lock -- 커밋하면 풀린다)을
+// 먼저 잡고 확인한다. 다른 차의 접수는 서로 기다리지 않는다.
 async function createReservation({ storeId, carNumber, phone, serviceType, idempotencyKey, privacyConsentAt, marketingConsentAt }) {
   const today = kstDateString()
   try {
@@ -414,20 +450,29 @@ async function createReservation({ storeId, carNumber, phone, serviceType, idemp
         const existing = await tx.reservation.findUnique({ where: { idempotencyKey } })
         if (existing) {
           if (existing.storeId !== storeId) {
-            const conflict = new Error('Idempotency-Key가 다른 매장에서 이미 사용되었습니다.')
+            // 이 문구는 손님 화면에 그대로 뜬다(server.js가 e.message를 409로 돌려준다) -- 개발 용어를 쓰지 않는다.
+            const conflict = new Error('접수 중 문제가 생겼어요. 처음부터 다시 시도해주세요.')
             conflict.code = 'IDEMPOTENCY_KEY_CONFLICT'
             throw conflict
           }
-          const peopleAhead = await tx.reservation.count({
-            where: {
-              storeId,
-              serviceDate: existing.serviceDate,
-              status: { notIn: CLOSED_RESERVATION_STATUSES },
-              createdAt: { lt: existing.createdAt },
-            },
-          })
-          return { reservation: existing, peopleAhead, duplicate: true }
+          return { reservation: existing, peopleAhead: await countWaitingAhead(tx, existing), duplicate: true }
         }
+      }
+
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`reservation-car:${storeId}:${carNumber}`}))`
+      // 같은 차의 오늘 접수는 많아야 몇 건이라, 번호는 정규화해서 JS에서 비교한다(옛 행에 하이픈이 섞여 있어도 같은 번호로 본다).
+      const samePhone = normalizePhoneDigits(phone)
+      const sameCarRows = await tx.reservation.findMany({
+        where: { storeId, serviceDate: today, carNumber, status: { in: ACTIVE_QUEUE_STATUSES } },
+        orderBy: { createdAt: 'desc' },
+      })
+      const sameCar = samePhone ? sameCarRows.find((row) => normalizePhoneDigits(row.phone) === samePhone) : null
+      if (sameCar) {
+        const consented = await tx.reservation.update({
+          where: { id: sameCar.id },
+          data: { marketingConsentAt: marketingConsentAt || null },
+        })
+        return { reservation: consented, peopleAhead: await countWaitingAhead(tx, consented), duplicate: true, sameCar: true }
       }
 
       const counterRows = await tx.$queryRaw`
@@ -439,9 +484,9 @@ async function createReservation({ storeId, carNumber, phone, serviceType, idemp
       `
       const queueNumber = Number(counterRows[0].counter)
 
-      // 오늘(serviceDate) + 아직 끝나지 않은(완료/취소 제외) 예약 수 = 이 손님 앞에 몇 명이 있는지.
+      // 오늘(serviceDate) 아직 호출되지 않은(waiting) 접수 수 = 이 손님 앞에 기다리는 차(countWaitingAhead 주석).
       const peopleAhead = await tx.reservation.count({
-        where: { storeId, serviceDate: today, status: { notIn: CLOSED_RESERVATION_STATUSES } },
+        where: { storeId, serviceDate: today, status: 'waiting' },
       })
 
       const reservation = await tx.reservation.create({
@@ -467,15 +512,7 @@ async function createReservation({ storeId, carNumber, phone, serviceType, idemp
     if (error?.code === 'P2002' && idempotencyKey) {
       const existing = await prisma.reservation.findUnique({ where: { idempotencyKey } })
       if (existing?.storeId === storeId) {
-        const peopleAhead = await prisma.reservation.count({
-          where: {
-            storeId,
-            serviceDate: existing.serviceDate,
-            status: { notIn: CLOSED_RESERVATION_STATUSES },
-            createdAt: { lt: existing.createdAt },
-          },
-        })
-        return { reservation: existing, peopleAhead, duplicate: true }
+        return { reservation: existing, peopleAhead: await countWaitingAhead(prisma, existing), duplicate: true }
       }
     }
     throw error
@@ -537,21 +574,25 @@ async function listPaymentsPage({ storeId, dateStart, dateEnd, statuses, q, limi
 // POS 탭앱 대기열 조회 전용(계약 v3 §4.1). 오늘(KST) serviceDate 접수분 전부 + 날짜와 무관하게
 // 아직 끝나지 않은(called/notify_failed) 이월 건을 함께 돌려준다. 대기열을 "오늘 것만"으로
 // 완전히 막으면 밤새 맡긴 차(어제 called 상태)를 다음날 POS에서 완료 처리할 수 없어지므로,
-// 이미 호출까지 끝난(더 이상 "새로 호출"할 대상이 아닌) 이월 건만 예외로 섞는다 — 어제 waiting
-// (노쇼로 추정되는 건)은 여전히 여기 뜨지 않는다. serviceDate 오름차순을 앞세워 이월 건이
-// 위쪽에 보이게 하고, 그 안에서는 queueNumber 오름차순을 유지한다.
+// 이미 호출까지 끝난(더 이상 "새로 호출"할 대상이 아닌) 이월 건을 예외로 섞는다.
+// includePreviousDayWaiting이면 바로 전날(serviceDate 하루 전)의 waiting도 함께 준다 -- 저녁에 접수해 호출하지 않은 채 하룻밤 맡긴
+// 차가 다음 날 대기열에서 사라지면 정비완료(완료 문자)도 취소도 할 수 없었다(관리자 웹에서 날짜를 바꿔야만 보였다). 서버 응답이 이
+// 건에 carriedOver를 붙이고, 호출(call)은 여전히 오늘 접수분만 받는다. 그보다 오래된 waiting은 노쇼로 보고 뜨지 않는다.
+// 이 건은 carriedOver를 아는 새 탭앱이 요청할 때만 싣는다(GET /api/pos/queue?carriedOver=1). 옛 탭앱은 이 건을 오늘 대기로 세고
+// '다음 호출'에 띄우며 [호출]을 켜 두는데, 호출은 404이고 [완료]는 waiting에서 눌리지 않아 [취소]밖에 할 수 없었다.
+// serviceDate 오름차순을 앞세워 이월 건이 위쪽에 보이게 하고, 그 안에서는 queueNumber 오름차순을 유지한다.
 //
 // 원래는 이 조건을 `(serviceDate=오늘 OR status IN(called,notify_failed))` 하나의 OR로 걸어
 // 한 번의 findMany로 받았다. 문제: OR로 묶이면 `@@index([storeId, serviceDate, status])`를
 // 안정적으로 타지 못한다 — 3년치(21,920행)를 시드해 통계(ANALYZE)가 없는 상태로 EXPLAIN
 // ANALYZE를 떠보면 "Rows Removed by Filter: 21898"까지 나온다(20건 받으려고 그 매장 예약을
 // 거의 다 훑음). 예약은 절대 삭제되지 않으므로(purgeExpiredReservations는 익명화만 함) 매장이
-// 오래될수록 이 스캔량은 계속 커진다. OR을 없애 두 번의 findMany로 나누면 각각 인덱스의
-// (storeId, serviceDate) / (storeId, status) 접두어를 그대로 태울 수 있다. 결과는 20~40건
-// 수준이라 JS에서 합쳐 정렬하는 비용은 무시할 만하다(구체적 EXPLAIN ANALYZE 전/후 수치는
-// 작업 보고 참고).
-async function listActiveQueueForStore(storeId, serviceDate) {
-  const [todayItems, carriedOverItems] = await Promise.all([
+// 오래될수록 이 스캔량은 계속 커진다. OR을 없애 findMany를 나누면 각각 인덱스의
+// (storeId, serviceDate, status) / (storeId, status) 접두어를 그대로 태울 수 있다. (storeId, status) 인덱스는
+// 2026-10-23에야 생겼다(schema.prisma Reservation) -- 그 전에는 이 주석과 달리 이월 조회가 (storeId) 인덱스로 그 매장 예약을
+// 전부 읽고 status로 걸렀다. 결과는 20~40건 수준이라 JS에서 합쳐 정렬하는 비용은 무시할 만하다.
+async function listActiveQueueForStore(storeId, serviceDate, { includePreviousDayWaiting = false } = {}) {
+  const [todayItems, carriedOverItems, previousDayWaiting] = await Promise.all([
     // 오늘(serviceDate) 접수분 중 아직 끝나지 않은 것 전부.
     prisma.reservation.findMany({
       where: { storeId, serviceDate, status: { notIn: CLOSED_RESERVATION_STATUSES } },
@@ -560,12 +601,18 @@ async function listActiveQueueForStore(storeId, serviceDate) {
     // 이월 건은 원래 접수일과 무관하게 걸러야 하는 게 계약이라(위 주석 참고), 오늘 것과
     // 겹치지 않게 serviceDate != 오늘만 뺀다(중복 방지, 위 todayItems 쪽에서 이미 잡힘).
     prisma.reservation.findMany({
-      where: { storeId, status: { in: ['called', 'notify_failed'] }, serviceDate: { not: serviceDate } },
+      where: { storeId, status: { in: CARRYOVER_RESERVATION_STATUSES }, serviceDate: { not: serviceDate } },
     }),
+    // 바로 전날 접수해 호출하지 않은 채 넘어온 waiting(위 주석). 그 전날 하루만 보고, 새 탭앱이 요청할 때만 싣는다.
+    includePreviousDayWaiting
+      ? prisma.reservation.findMany({
+        where: { storeId, serviceDate: kstDateBefore(serviceDate, 1), status: 'waiting' },
+      })
+      : [],
   ])
 
   // 원래 쿼리의 정렬(serviceDate asc, 그 안에서 queueNumber asc)을 그대로 유지한다.
-  return [...todayItems, ...carriedOverItems].sort((a, b) => {
+  return [...todayItems, ...carriedOverItems, ...previousDayWaiting].sort((a, b) => {
     if (a.serviceDate !== b.serviceDate) return a.serviceDate < b.serviceDate ? -1 : 1
     return a.queueNumber - b.queueNumber
   })
@@ -626,11 +673,14 @@ async function markReservationCalledFromNotifyFailed(id) {
 }
 
 // 정비가 끝나 정비 베이(자리)가 비었다는 뜻. 관리자가 직접 처리해야 한다 — 알림톡 발송 성공/실패와는
-// 별개로, 이걸 눌러야 다음 예약의 앞사람 계산에서 빠져 대기인원이 줄어든다.
-async function markReservationCompleted(id) {
+// 별개로 끝난 접수를 대기열에서 뺀다.
+// allowWaiting: 호출하지 않은 대기(waiting) 접수도 바로 완료한다(POS [완료]). 손님이 이미 카운터 앞에 있거나 바빠서 호출을 건너뛰면
+// 예전에는 [호출]("고객님의 순서입니다" 알림 발송)을 먼저 눌러야만 완료할 수 있어, 손님이 몇 초 사이에 알림 두 개를 받았다.
+// 관리자 웹 [정비완료]는 지금처럼 호출한 접수만 받는다.
+async function markReservationCompleted(id, { allowWaiting = false } = {}) {
   try {
     const result = await prisma.reservation.updateMany({
-      where: { id, status: { in: ['called', 'notify_failed'] } },
+      where: { id, status: { in: allowWaiting ? ACTIVE_QUEUE_STATUSES : ['called', 'notify_failed'] } },
       data: { status: 'completed', completedAt: new Date() },
     })
     if (!result.count) return null
@@ -674,14 +724,14 @@ async function clearReservationIntakeStatus(id) {
 }
 
 // 재발송 메시지의 "앞으로 N명"을 최신값으로 다시 계산한다. createReservation의 peopleAhead와
-// 동일 규칙(오늘 접수분 중 완료/취소가 아닌 예약 수, beforeCreatedAt 이전 접수분만) — 접수 시점과
+// 동일 규칙(그날 접수분 중 아직 호출되지 않은 waiting, beforeCreatedAt 이전 접수분만 -- countWaitingAhead 주석) — 접수 시점과
 // 재발송 시점 사이에 다른 손님이 왔다 갔다 했을 수 있어 그 시점 값을 그대로 재사용하면 안 된다.
 function countPeopleAhead(storeId, serviceDate, beforeCreatedAt) {
   return prisma.reservation.count({
     where: {
       storeId,
       serviceDate,
-      status: { notIn: CLOSED_RESERVATION_STATUSES },
+      status: 'waiting',
       createdAt: { lt: beforeCreatedAt },
     },
   })
@@ -980,7 +1030,7 @@ async function setStoreErpCode(storeId, erpStoreCode) {
     return await prisma.store.update({ where: { id: storeId }, data: { erpStoreCode: value } })
   } catch (e) {
     if (e?.code === 'P2002') {
-      const conflict = new Error('다른 매장이 이미 사용 중인 코드입니다.')
+      const conflict = new Error('다른 매장이 이미 쓰고 있는 전산 코드예요.')
       conflict.code = 'ERP_CODE_TAKEN'
       throw conflict
     }
@@ -1125,6 +1175,19 @@ async function sendErpCartToFront(id, storeId) {
     data: { payTarget: 'front', errorMessage: null, frontSentAt: new Date() },
   })
   return result.count > 0
+}
+
+// POS 탭앱 [프론트에 다시 띄우기]. 손님이 결제창을 놓치면(시간 초과·닫음) 프론트는 그 주문을 2분 동안 쉬게 해서(snooze) 그 사이
+// 결제할 방법이 없었다. 프론트의 쉬기 열쇠에는 frontSentAt이 섞여 있으므로(schema.prisma frontSentAt) 이 값을 지금으로 바꾸면 프론트가
+// 쉬는 중이어도 바로 다시 띄운다. 프론트 결제 대기(pending)인 건만 -- 결제 중(paying)·끝난 주문은 바꾸지 않는다.
+// 반환: 바꾼 frontSentAt(Date) 또는 null
+async function bumpErpCartFrontSentAt(id, storeId) {
+  const now = new Date()
+  const result = await prisma.erpCart.updateMany({
+    where: { id, storeId, payTarget: 'front', status: 'pending' },
+    data: { frontSentAt: now },
+  })
+  return result.count > 0 ? now : null
 }
 
 // 프론트로 넘긴 건을 다시 POS로 가져온다(손님이 프론트 앞을 떠났거나 잘못 넘겼을 때).
@@ -1645,7 +1708,7 @@ async function restoreErpCartPaidAfterPosCancel(id, storeId, { expectedPaymentId
 async function requestErpCartRefund(id, storeId) {
   const result = await prisma.erpCart.updateMany({
     where: { id, storeId, payTarget: 'front', status: 'paid' },
-    data: { status: 'refund_requested', refundRequestedAt: new Date(), errorMessage: null, refundMode: null },
+    data: { status: 'refund_requested', refundRequestedAt: new Date(), errorMessage: null },
   })
   return result.count > 0
 }
@@ -1654,7 +1717,7 @@ async function requestErpCartRefund(id, storeId) {
 async function withdrawErpCartRefund(id, storeId) {
   const result = await prisma.erpCart.updateMany({
     where: { id, storeId, status: 'refund_requested' },
-    data: { status: 'paid', refundRequestedAt: null, refundMode: null },
+    data: { status: 'paid', refundRequestedAt: null },
   })
   return result.count > 0
 }
@@ -2624,8 +2687,10 @@ async function purgeExpiredErpCarts(cutoff) {
 // 전산 주문(ErpOrder)은 그동안 파기 대상에 아예 없었다 — memo에 ErpCart와 같은 방식으로
 // 차량번호·고객명이 들어가고, items[].name도 전산이 형식 제약 없이 보내는 자유 텍스트라
 // (server.js validateDraftOrderBody — 1~100자 문자열이면 통과) 개인정보가 섞여 들어올 수 있다.
-// 레코드와 집계값(totalAmount, status)은 남기고 memo·itemsJson만 지운다 — itemsJson은
+// 레코드와 집계값(totalAmount, status)은 남기고 memo·itemsJson을 지운다 — itemsJson은
 // NOT NULL 컬럼이라 null 대신 빈 배열 JSON으로 대체한다(형식은 유지하되 내용만 비움).
+// tossRawJson(토스 응답 원본)과 errorMessage(토스 오류 문구)도 지운다 -- 토스가 돌려준 주문 원본에는 우리가 보낸 memo·품목명이
+// 그대로 들어 있어, memo만 지우면 같은 개인정보가 이 칸에 남는다.
 async function purgeExpiredErpOrders(cutoff) {
   let total = 0
   for (let i = 0; i < PURGE_MAX_ITERATIONS; i += 1) {
@@ -2637,7 +2702,7 @@ async function purgeExpiredErpOrders(cutoff) {
     if (!targets.length) break
     const result = await prisma.erpOrder.updateMany({
       where: { id: { in: targets.map((t) => t.id) } },
-      data: { memo: null, itemsJson: '[]', anonymizedAt: new Date() },
+      data: { memo: null, itemsJson: '[]', tossRawJson: null, errorMessage: null, anonymizedAt: new Date() },
     })
     total += result.count
     if (targets.length < PURGE_BATCH_SIZE) break
@@ -2718,25 +2783,41 @@ async function expireStaleErpCarts(now) {
 // 10회(=최대 1만 건) 반복한다 — 대상이 그보다 많으면 다음 스케줄 실행에서 나머지를 처리한다
 // (배치 잡 하나가 너무 오래 걸려 Cloud Scheduler의 타임아웃에 걸리는 걸 막기 위함).
 // 예외적으로 WebhookEvent는 익명화할 개인정보 필드가 없어 행 자체를 지운다(무한 증가 방지).
+//
+// 단계마다 따로 실패한다. 예전에는 순서대로 await해서, 앞 단계 하나가 statement_timeout(10초)에 걸리면 뒤의 파기(법적 의무)와
+// 전산 주문 만료가 함께 멈췄다 -- 만료가 멈추면 어제 주문이 오늘 POS에 뜬다. 실패한 단계는 결과에 null로, 사유는
+// errors[단계]에 담는다(errors는 실패가 있을 때만 붙는다). 단계마다 다시 돌려도 결과가 같으므로(이미 지운 행은 다시 걸리지 않는다)
+// 호출부(/internal/jobs/purge-expired)는 실패가 있으면 500을 돌려 스케줄러가 재시도하게 한다.
 async function purgeExpiredPersonalData(retentionDays) {
   const days = Number.isFinite(retentionDays) && retentionDays > 0
     ? retentionDays
     : (Number(process.env.DATA_RETENTION_DAYS) || DEFAULT_DATA_RETENTION_DAYS)
   const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000)
-  const reservations = await purgeExpiredReservations(cutoff)
-  const payments = await purgeExpiredPayments(cutoff)
-  const erpCarts = await purgeExpiredErpCarts(cutoff)
+  const result = {}
+  const errors = {}
+  const step = async (name, fn) => {
+    try {
+      result[name] = await fn()
+    } catch (e) {
+      result[name] = null
+      errors[name] = String(e?.message || e).slice(0, 300)
+    }
+  }
+  // 만료 처리를 맨 앞에 둔다 -- 보관기간(3년)과 무관하게 매일 돌아야 하는 짧은 주기의 정리라, 뒤의 큰 파기 단계가 느려도 먼저 끝나야 한다.
+  await step('expiredErpCarts', () => expireStaleErpCarts())
+  await step('reservations', () => purgeExpiredReservations(cutoff))
+  await step('payments', () => purgeExpiredPayments(cutoff))
+  await step('erpCarts', () => purgeExpiredErpCarts(cutoff))
   // 전산 주문(ErpOrder)도 ErpCart와 같은 이유(memo/items[].name에 차량번호·고객명)로 파기 대상이다.
-  const erpOrders = await purgeExpiredErpOrders(cutoff)
+  await step('erpOrders', () => purgeExpiredErpOrders(cutoff))
   // 홍보 발송 기록에도 전화번호·차량번호가 남는다. 같은 기준으로 지운다.
-  const promoSends = await purgeExpiredPromoSends(cutoff)
+  await step('promoSends', () => purgeExpiredPromoSends(cutoff))
   // 웹훅 이벤트는 개인정보가 아니라 무한 증가가 문제라 별도로 지운다(보관기간은 같은 값을 재사용).
-  const webhookEvents = await purgeExpiredWebhookEvents(cutoff)
+  await step('webhookEvents', () => purgeExpiredWebhookEvents(cutoff))
   // 토스 결제 매핑 기록도 웹훅마다(매장의 모든 결제) 쌓이므로 같은 기준으로 지운다. 개인정보는 없다.
-  const { count: tossPayments } = await prisma.tossPayment.deleteMany({ where: { createdAt: { lt: cutoff } } })
-  // 만료 처리는 보관기간(3년)과 무관하게 매일 돌아야 하는 짧은 주기의 정리라 같은 잡에 얹는다.
-  const expiredErpCarts = await expireStaleErpCarts()
-  return { reservations, payments, erpCarts, erpOrders, promoSends, webhookEvents, tossPayments, expiredErpCarts }
+  await step('tossPayments', async () => (await prisma.tossPayment.deleteMany({ where: { createdAt: { lt: cutoff } } })).count)
+  if (Object.keys(errors).length) result.errors = errors
+  return result
 }
 
 // 일별 요약(계약 v3 §5.1). 예약은 serviceDate 기준(접수일), 결제는 createdAt의 KST 하루 범위
@@ -2906,6 +2987,7 @@ module.exports = {
   listClosedFrontOrphanCartsForPos,
   hasUnackedFrontOrphan,
   sendErpCartToFront,
+  bumpErpCartFrontSentAt,
   returnErpCartToPos,
   listFrontErpCartsForPos,
   recordTossPayment,

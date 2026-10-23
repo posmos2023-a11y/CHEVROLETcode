@@ -1,6 +1,7 @@
 require('dotenv').config()
 const express = require('express')
 const cors = require('cors')
+const compression = require('compression')
 const rateLimit = require('express-rate-limit')
 const path = require('node:path')
 const crypto = require('node:crypto')
@@ -85,6 +86,7 @@ const {
   listClosedFrontOrphanCartsForPos,
   hasUnackedFrontOrphan,
   sendErpCartToFront,
+  bumpErpCartFrontSentAt,
   returnErpCartToPos,
   listFrontErpCartsForPos,
   recordTossPayment,
@@ -200,6 +202,11 @@ app.set('etag', false)
 // 다를 수 있어 하드코딩하지 않고 TRUST_PROXY_HOPS로 뺀다 (기본 1홉: 대부분의 PaaS 로드밸런서).
 app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS ?? 1))
 app.use(securityHeaders)
+
+// 응답 gzip 압축. 정적 파일과 모든 라우트보다 앞에 둔다. POS 폴링(GET /api/pos/queue)은 한 번에 수십 KB(실측 43KB → gzip 3.4KB)라
+// 400개 매장 x 5초면 송신량과 매장 LTE 회선 부담이 크다. 1KB 미만 응답은 압축 이득보다 CPU가 아까워 그대로 보낸다.
+// 요청 본문(웹훅 raw body 서명 검증)과는 무관하다 -- 응답 쪽만 바꾼다. 브라우저·웹뷰는 Accept-Encoding을 보내야만 압축본을 받는다.
+app.use(compression({ threshold: 1024 }))
 
 // --- CORS 설정 (계약 §8) ---
 // 손님/POS 단말기는 토스 결제 단말기 내장 브라우저 등 매번 다른 로컬 오리진에서 접근하므로
@@ -379,7 +386,7 @@ function resolveScopedStoreId(req) {
 // 매장의 예약을 건드리지 못하도록 막는다. hq_admin은 항상 통과.
 function assertOwnsReservation(req, res, reservation) {
   if (req.admin.role === 'store_admin' && reservation.storeId !== req.admin.storeId) {
-    res.status(403).json({ ok: false, error: '다른 매장의 예약입니다.' })
+    res.status(403).json({ ok: false, error: '다른 매장의 접수예요.' })
     return false
   }
   return true
@@ -400,15 +407,16 @@ function assertOwnsPayment(req, res, payment) {
 // 손님 개인을 인증할 방법이 없어 merchantId가 유일한 신뢰 경계다.
 const requireStore = asyncHandler(async (req, res, next) => {
   const merchantId = req.body?.merchantId ?? req.query?.merchantId
+  // 아래 문구는 손님 화면(프론트 접수·웹 접수)에 그대로 뜬다 -- 영문 필드명을 쓰지 않고 할 일을 알려준다.
   if (merchantId === undefined || merchantId === null || merchantId === '') {
-    return res.status(400).json({ ok: false, error: '가맹점 정보(merchantId)가 없습니다.' })
+    return res.status(400).json({ ok: false, error: '매장 정보를 확인할 수 없어요. 직원에게 문의해주세요.' })
   }
   const store = await findStoreByMerchantId(merchantId)
   if (!store) {
-    return res.status(404).json({ ok: false, error: '등록되지 않은 가맹점입니다.' })
+    return res.status(404).json({ ok: false, error: '아직 등록되지 않은 매장이에요. 직원에게 문의해주세요.' })
   }
   if (store.status !== 'active') {
-    return res.status(403).json({ ok: false, error: '비활성화된 가맹점입니다.' })
+    return res.status(403).json({ ok: false, error: '지금은 이용할 수 없는 매장이에요. 직원에게 문의해주세요.' })
   }
   req.store = store
   next()
@@ -435,7 +443,7 @@ const requireStoreToken = asyncHandler(async (req, res, next) => {
     })
   }
   if (store.status !== 'active') {
-    return res.status(403).json({ ok: false, error: '비활성화된 가맹점입니다.' })
+    return res.status(403).json({ ok: false, error: '이용이 중지된 매장이에요. 본사에 문의해주세요.' })
   }
   req.store = store
   next()
@@ -550,14 +558,14 @@ app.post('/api/admin/store-admins', requireAuth, requireRole('hq_admin'), asyncH
   const merchantId = String(req.body?.merchantId ?? '').trim()
 
   if (!email || !password || !merchantId) {
-    return res.status(400).json({ ok: false, error: 'email/password/merchantId가 모두 필요합니다.' })
+    return res.status(400).json({ ok: false, error: '토스 가맹점 ID, 이메일, 비밀번호를 모두 입력해주세요.' })
   }
   if (password.length < 8) {
     return res.status(400).json({ ok: false, error: '비밀번호는 8자 이상이어야 합니다.' })
   }
   const store = await findStoreByMerchantId(merchantId)
   if (!store) {
-    return res.status(404).json({ ok: false, error: '등록되지 않은 가맹점입니다.' })
+    return res.status(404).json({ ok: false, error: '등록되지 않은 토스 가맹점 ID예요.' })
   }
   if (await findAdminUserByEmail(email)) {
     return res.status(409).json({ ok: false, error: '이미 등록된 이메일입니다.' })
@@ -568,13 +576,75 @@ app.post('/api/admin/store-admins', requireAuth, requireRole('hq_admin'), asyncH
   return res.json({ ok: true, admin: { id: admin.id, email: admin.email, role: admin.role, storeId: admin.storeId } })
 }))
 
-const reservationLimiter = rateLimit({
-  windowMs: 10 * 60 * 1000,
-  limit: 5,
-  store: new PostgresRateLimitStore(prisma, { prefix: 'reservation', windowMs: 10 * 60 * 1000 }),
+// --- 손님 접수(POST /api/reservations) 한도 ---
+//
+// 예전에는 IP당 10분 5건이었다. 한 매장의 프론트는 공인 IP 하나로 나가므로 붐비는 아침 6번째 손님부터 '요청이 너무 많습니다'가
+// 떴고, 본사망·통신사 NAT를 함께 쓰는 매장끼리도 그 5건을 나눠 썼다(2026-10-23 회의). 그래서 매장+IP(requireStore 뒤 req.store.id와
+// 요청 IP) 단위로 넉넉히 세고, 같은 번호로 접수 문자를 계속 보내는 스팸은 전화번호(해시) 단위로 따로 막는다(paymentPhoneLimiter와 같은
+// 이유로 번호 원문은 저장하지 않는다). IP 한도는 DB를 건드리기 전의 폭주 차단용으로만 메모리에 넉넉히 둔다.
+// 매장 한도를 매장 하나로만 세면, merchantId는 공개값이라(웹 접수 링크 쿼리에 그대로 들어간다) IP 하나로 그 매장 몫 60건을 다 써서
+// 10분씩 그 매장의 프론트·웹 접수를 전부 429로 막을 수 있었다. 그래서 IP를 키에 넣어 남의 IP 몫은 쓰지 못하게 하고, 본문 검증
+// (validateReservationBody)을 통과한 요청만 센다 -- 빈 본문 같은 400 요청은 한도를 쓰지 않는다.
+// 429 본문은 { ok:false, code:'RATE_LIMITED', retryAfterSec, error } -- 프론트가 입력을 지우지 않고 그 시간 뒤 다시 시도하게 한다.
+// 한도값은 운영 로그를 보고 배포 없이 바꿀 수 있게 환경변수로도 받는다(양수만, 아니면 기본값).
+function positiveEnvNumber(name, fallback) {
+  const n = Number(process.env[name])
+  return Number.isFinite(n) && n > 0 ? n : fallback
+}
+const RESERVATION_WINDOW_MS = 10 * 60 * 1000
+// 매장+IP당 10분 60건 -- 실제 접수량(붐빌 때 매장 프론트 하나에서 10분 10~15대)의 몇 배
+const RESERVATION_STORE_LIMIT = positiveEnvNumber('RESERVATION_STORE_LIMIT_PER_10MIN', 60)
+// 같은 번호 10분 5건 -- 네트워크 오류 뒤 다시 시도(같은 Idempotency-Key)까지 센다
+const RESERVATION_PHONE_LIMIT = positiveEnvNumber('RESERVATION_PHONE_LIMIT_PER_10MIN', 5)
+const RESERVATION_IP_LIMIT_PER_MIN = positiveEnvNumber('RESERVATION_IP_LIMIT_PER_MIN', 120)
+
+function rateLimitedHandler(error) {
+  return (req, res, next, options) => {
+    const resetTime = req.rateLimit?.resetTime
+    const retryAfterSec = resetTime
+      ? Math.max(1, Math.ceil((new Date(resetTime).getTime() - Date.now()) / 1000))
+      : Math.ceil(options.windowMs / 1000)
+    res.status(options.statusCode).json({ ok: false, code: 'RATE_LIMITED', retryAfterSec, error })
+  }
+}
+
+function reservationPhoneRateKey(req) {
+  const phone = String(req.body?.phone ?? '').replace(/-/g, '').trim()
+  if (phone) return `phone:${crypto.createHash('sha256').update(phone).digest('hex').slice(0, 32)}`
+  return `ip:${rateLimit.ipKeyGenerator(req.ip)}`
+}
+
+const reservationIpFloodLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: RESERVATION_IP_LIMIT_PER_MIN,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { ok: false, error: '요청이 너무 많습니다. 잠시 후 다시 시도해주세요.' },
+  handler: rateLimitedHandler('접수가 잠시 몰렸어요. 잠시 후 다시 시도해주세요.'),
+})
+
+// 키는 매장+IP다(위 주석). prefix는 예전 그대로라 예전 매장 단위 키(store:<id>)는 창이 지나면 정리된다.
+function reservationStoreRateKey(req) {
+  return `store:${req.store.id}:ip:${rateLimit.ipKeyGenerator(req.ip)}`
+}
+
+const reservationStoreLimiter = rateLimit({
+  windowMs: RESERVATION_WINDOW_MS,
+  limit: RESERVATION_STORE_LIMIT,
+  keyGenerator: reservationStoreRateKey,
+  store: new PostgresRateLimitStore(prisma, { prefix: 'reservation-store', windowMs: RESERVATION_WINDOW_MS }),
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: rateLimitedHandler('접수가 잠시 몰렸어요. 잠시 후 다시 시도해주세요.'),
+})
+
+const reservationPhoneLimiter = rateLimit({
+  windowMs: RESERVATION_WINDOW_MS,
+  limit: RESERVATION_PHONE_LIMIT,
+  keyGenerator: reservationPhoneRateKey,
+  store: new PostgresRateLimitStore(prisma, { prefix: 'reservation-phone', windowMs: RESERVATION_WINDOW_MS }),
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: rateLimitedHandler('같은 번호로 접수가 여러 번 들어왔어요. 잠시 후 다시 시도해주세요.'),
 })
 
 const paymentLimiter = rateLimit({
@@ -589,7 +659,7 @@ const paymentLimiter = rateLimit({
 // 위 paymentLimiter는 IP 기준 10회/10분이다 — 공격자가 IP를 바꿔가며(또는 IP가 여러 개인
 // 환경에서) 같은 피해자 전화번호로 반복 호출하면 이 한도로는 못 막고, 그 번호로 영수증
 // 알림톡만 계속 나간다(표적 스팸/괴롭힘). 그래서 전화번호 기준 한도를 따로 둔다.
-// posStoreRateKey(위 869줄)가 토큰을 해시해서 키로 쓰는 것과 같은 이유로, 전화번호 원문을
+// posStoreRateKey(POS 폴링 한도 키)가 토큰을 해시해서 키로 쓰는 것과 같은 이유로, 전화번호 원문을
 // 그대로 레이트리밋 스토어에 남기지 않는다 — 평문 전화번호가 별도 테이블에 쌓이는 것 자체가
 // 또 다른 개인정보 노출 지점이 된다.
 function paymentPhoneRateKey(req) {
@@ -659,24 +729,29 @@ async function notifyQueueTurn(reservation) {
 }
 
 // --- 예약(대기순번) ---
-// 차량번호 + 전화번호를 등록하고 대기번호를 발급한다.
-// "앞에 몇 명 있는지"는 오늘(serviceDate) 접수분 중 완료/취소가 아닌 예약 수로 센다.
-// 단순히 'waiting'만 세면, 이미 호출됐지만 아직 정비 중인 손님을 무시하고 대기인원을 잘못 계산한다
-// (정비 베이가 몇 개 비었는지는 모르니, 관리자가 /api/reservations/:id/complete로 "정비완료"를
-// 눌러줘야 그 손님이 앞에서 빠진다).
+// 차량번호 + 전화번호를 등록하고 대기번호를 발급한다(화면에 보이는 이름은 '접수'다 -- 경로·DB 이름은 옛 단말과 전산 연동 때문에 그대로 둔다).
+// "앞에 몇 명 있는지"(peopleAhead)는 오늘 접수분 중 아직 호출되지 않은 waiting만 센다(store.countWaitingAhead). 예전에는 이미
+// 호출된 손님까지 세어 손님에게 실제보다 긴 대기를 안내했다(2026-10-23 회의 결정으로 바꿈).
+// 같은 차·같은 번호가 오늘 이미 대기열에 있으면 새 번호 없이 그 접수를 duplicate:true로 돌려준다(store.createReservation 주석) -- 알림도
+// 다시 보내지 않는다. 번호가 다르면 새 접수를 만든다.
 // 예약 접수 시에는 앞에 사람이 없더라도 항상 waiting 상태로 두고 접수 알림톡만 보낸다.
 // 실제 호출은 직원이 POS/관리자 화면에서 명시적으로 눌렀을 때만 발생한다.
-app.post('/api/reservations', publicCors, reservationLimiter, requireStore, asyncHandler(async (req, res) => {
-  const storeId = req.store.id
-  const carNumber = String(req.body?.carNumber ?? '').trim()
+// 한도: IP 폭주 차단(메모리) → 매장 확인 → 본문 검증 → 매장+IP 한도 → 같은 번호 한도(위 reservation*Limiter 주석).
+
+// 접수 본문 검증. 한도보다 앞에 둬서, 검증에 실패한 요청(400)은 매장+IP·번호 한도를 쓰지 않는다. 통과하면 정규화한 값을
+// req.reservationInput에 담아 넘긴다(번호 한도 키는 req.body.phone으로 만든다 -- reservationPhoneRateKey).
+function validateReservationBody(req, res, next) {
+  // '12가 3456'·'12가-3456'처럼 띄어 쓰거나 하이픈을 넣어도 받는다(normalizeCarNumber -- 전산 주문과 같은 정규화). 형식 검사는 그다음이다.
+  const carNumber = normalizeCarNumber(req.body?.carNumber) || ''
   const phone = String(req.body?.phone ?? '').replace(/-/g, '').trim()
   const serviceTypeKey = String(req.body?.serviceType ?? '').trim()
 
+  // 아래 문구는 손님 화면(프론트 접수 결과·웹 접수)에 그대로 뜬다.
   if (!CAR_NUMBER_RE.test(carNumber)) {
-    return res.status(400).json({ ok: false, error: '차량번호 형식이 올바르지 않습니다. 예) 12가3456' })
+    return res.status(400).json({ ok: false, error: '차량번호를 다시 확인해주세요. 예) 12가3456' })
   }
   if (!PHONE_RE.test(phone)) {
-    return res.status(400).json({ ok: false, error: '전화번호 형식이 올바르지 않습니다.' })
+    return res.status(400).json({ ok: false, error: '휴대폰 번호를 다시 확인해주세요. 예) 01012345678' })
   }
   if (!SERVICE_TYPES[serviceTypeKey]) {
     return res.status(400).json({ ok: false, error: '정비 항목을 선택해주세요.' })
@@ -696,8 +771,16 @@ app.post('/api/reservations', publicCors, reservationLimiter, requireStore, asyn
 
   const idempotencyKey = String(req.get('idempotency-key') || '').trim() || null
   if (idempotencyKey && idempotencyKey.length > 200) {
-    return res.status(400).json({ ok: false, error: 'Idempotency-Key가 너무 깁니다.' })
+    return res.status(400).json({ ok: false, error: '요청 정보가 올바르지 않아요. 처음부터 다시 시도해주세요.' })
   }
+
+  req.reservationInput = { carNumber, phone, serviceType, privacyConsentAt, marketingConsentAt, idempotencyKey }
+  return next()
+}
+
+app.post('/api/reservations', publicCors, reservationIpFloodLimiter, requireStore, validateReservationBody, reservationStoreLimiter, reservationPhoneLimiter, asyncHandler(async (req, res) => {
+  const storeId = req.store.id
+  const { carNumber, phone, serviceType, privacyConsentAt, marketingConsentAt, idempotencyKey } = req.reservationInput
 
   let reservation, peopleAhead, duplicate
   try {
@@ -716,19 +799,19 @@ app.post('/api/reservations', publicCors, reservationLimiter, requireStore, asyn
       return res.status(409).json({ ok: false, error: e.message })
     }
     // 계약 §5: 클라이언트에는 내부 에러 메시지(e.message)를 노출하지 않는다.
-    return res.status(500).json({ ok: false, error: '요청 처리 중 오류가 발생했습니다.' })
+    return res.status(500).json({ ok: false, error: '접수 중 오류가 발생했어요. 잠시 후 다시 시도하거나 직원에게 문의해주세요.' })
   }
 
+  // 같은 Idempotency-Key의 재시도이거나 같은 차·같은 번호가 오늘 이미 대기열에 있다 -- 기존 접수를 돌려준다(알림 없음).
+  // 본문은 손님 화면이 쓰는 값(대기번호·앞 대기 수·상태)만 싣는다. 이 경로는 공개라(merchantId는 공개값) id·정비 항목·날짜 같은
+  // 기존 접수의 세부값은 내보내지 않는다.
   if (duplicate) {
     return res.json({
       ok: true,
-      id: reservation.id,
+      duplicate: true,
       queueNumber: reservation.queueNumber,
       peopleAhead,
-      serviceType: reservation.serviceType,
       status: reservation.status,
-      serviceDate: reservation.serviceDate,
-      duplicate: true,
     })
   }
 
@@ -776,16 +859,17 @@ app.post('/api/reservations', publicCors, reservationLimiter, requireStore, asyn
 app.post('/api/queue/call-next', requireAuth, asyncHandler(async (req, res) => {
   const storeId = resolveScopedStoreId(req)
   if (!storeId) {
-    return res.status(400).json({ ok: false, error: 'storeId가 필요합니다.' })
+    return res.status(400).json({ ok: false, error: '상단에서 매장을 먼저 선택해주세요.' })
   }
   const reservation = await getNextWaitingReservation(storeId)
   if (!reservation) {
-    return res.status(404).json({ ok: false, error: '대기중인 예약이 없습니다.' })
+    return res.status(404).json({ ok: false, error: '대기 중인 손님이 없어요.' })
   }
 
   const outcome = await notifyQueueTurn(reservation)
 
-  return res.json({ ok: true, id: reservation.id, queueNumber: reservation.queueNumber, status: reservation.status, alreadyProcessed: !outcome.changed })
+  // carNumber: 관리자 웹이 "몇 번 어느 차를 호출했는지" 결과를 보여주는 데 쓴다(관리자 전용 라우트라 마스킹하지 않는다).
+  return res.json({ ok: true, id: reservation.id, queueNumber: reservation.queueNumber, carNumber: reservation.carNumber, status: reservation.status, alreadyProcessed: !outcome.changed })
 }))
 
 // 특정 예약을 대기열 순서와 무관하게 바로 호출한다 (관리자 전용).
@@ -793,14 +877,14 @@ app.post('/api/queue/call-next', requireAuth, asyncHandler(async (req, res) => {
 app.post('/api/reservations/:id/call', requireAuth, asyncHandler(async (req, res) => {
   const reservation = await getReservation(req.params.id)
   if (!reservation) {
-    return res.status(404).json({ ok: false, error: '예약을 찾을 수 없습니다.' })
+    return res.status(404).json({ ok: false, error: '접수 내역을 찾을 수 없어요.' })
   }
   if (!assertOwnsReservation(req, res, reservation)) return
   if (reservation.status !== 'waiting') {
     if (['called', 'notify_failed'].includes(reservation.status)) {
       return res.json({ ok: true, id: reservation.id, queueNumber: reservation.queueNumber, status: reservation.status, alreadyProcessed: true })
     }
-    return res.status(400).json({ ok: false, error: '대기중인 예약만 호출할 수 있습니다.' })
+    return res.status(400).json({ ok: false, error: '대기 중인 손님만 호출할 수 있어요.' })
   }
 
   const outcome = await notifyQueueTurn(reservation)
@@ -812,18 +896,18 @@ app.post('/api/reservations/:id/call', requireAuth, asyncHandler(async (req, res
 app.post('/api/reservations/:id/cancel', requireAuth, asyncHandler(async (req, res) => {
   const existing = await getReservation(req.params.id)
   if (!existing) {
-    return res.status(404).json({ ok: false, error: '예약을 찾을 수 없습니다.' })
+    return res.status(404).json({ ok: false, error: '접수 내역을 찾을 수 없어요.' })
   }
   if (!assertOwnsReservation(req, res, existing)) return
   if (existing.status === 'cancelled') {
     return res.json({ ok: true, id: existing.id, status: 'cancelled', alreadyCancelled: true })
   }
   if (existing.status === 'completed') {
-    return res.status(409).json({ ok: false, error: '이미 정비완료된 예약입니다.' })
+    return res.status(409).json({ ok: false, error: '이미 정비가 끝난 접수라 취소할 수 없어요.' })
   }
   const reservation = await markReservationCancelled(req.params.id)
   if (!reservation) {
-    return res.status(409).json({ ok: false, error: '취소할 수 없는 상태의 예약입니다.' })
+    return res.status(409).json({ ok: false, error: '지금은 취소할 수 없는 접수예요.' })
   }
   return res.json({ ok: true, id: reservation.id, status: reservation.status })
 }))
@@ -834,15 +918,15 @@ app.post('/api/reservations/:id/cancel', requireAuth, asyncHandler(async (req, r
 app.post('/api/reservations/:id/retry-notify', requireAuth, asyncHandler(async (req, res) => {
   const existing = await getReservation(req.params.id)
   if (!existing) {
-    return res.status(404).json({ ok: false, error: '예약을 찾을 수 없습니다.' })
+    return res.status(404).json({ ok: false, error: '접수 내역을 찾을 수 없어요.' })
   }
   if (!assertOwnsReservation(req, res, existing)) return
   if (existing.status !== 'notify_failed') {
-    return res.status(409).json({ ok: false, error: '알림실패 상태의 예약만 재발송할 수 있습니다.' })
+    return res.status(409).json({ ok: false, error: '호출 알림 발송에 실패한 접수만 다시 보낼 수 있어요.' })
   }
   const reservation = await markReservationCalledFromNotifyFailed(existing.id)
   if (!reservation) {
-    return res.status(409).json({ ok: false, error: '알림실패 상태의 예약만 재발송할 수 있습니다.' })
+    return res.status(409).json({ ok: false, error: '호출 알림 발송에 실패한 접수만 다시 보낼 수 있어요.' })
   }
   const outcome = await sendQueueTurnAndSync(reservation)
   return res.json({ ok: true, id: reservation.id, status: outcome.status, sent: outcome.sent })
@@ -855,11 +939,11 @@ app.post('/api/reservations/:id/retry-notify', requireAuth, asyncHandler(async (
 app.post('/api/reservations/:id/retry-intake', requireAuth, asyncHandler(async (req, res) => {
   const existing = await getReservation(req.params.id)
   if (!existing) {
-    return res.status(404).json({ ok: false, error: '예약을 찾을 수 없습니다.' })
+    return res.status(404).json({ ok: false, error: '접수 내역을 찾을 수 없어요.' })
   }
   if (!assertOwnsReservation(req, res, existing)) return
   if (existing.intakeNotifyStatus !== 'failed' || ['completed', 'cancelled'].includes(existing.status)) {
-    return res.status(409).json({ ok: false, error: '접수 알림 발송 실패 상태의 예약만 재발송할 수 있습니다.' })
+    return res.status(409).json({ ok: false, error: '접수 알림 발송에 실패한 건만 다시 보낼 수 있어요.' })
   }
 
   const peopleAhead = await countPeopleAhead(existing.storeId, existing.serviceDate, existing.createdAt)
@@ -892,7 +976,7 @@ app.post('/api/reservations/:id/retry-intake', requireAuth, asyncHandler(async (
 app.delete('/api/reservations/:id', requireAuth, asyncHandler(async (req, res) => {
   const reservation = await getReservation(req.params.id)
   if (!reservation) {
-    return res.status(404).json({ ok: false, error: '예약을 찾을 수 없습니다.' })
+    return res.status(404).json({ ok: false, error: '접수 내역을 찾을 수 없어요.' })
   }
   if (!assertOwnsReservation(req, res, reservation)) return
   await deleteReservation(req.params.id)
@@ -904,7 +988,7 @@ app.delete('/api/reservations/:id', requireAuth, asyncHandler(async (req, res) =
 app.post('/api/reservations/:id/complete', requireAuth, asyncHandler(async (req, res) => {
   const existing = await getReservation(req.params.id)
   if (!existing) {
-    return res.status(404).json({ ok: false, error: '예약을 찾을 수 없습니다.' })
+    return res.status(404).json({ ok: false, error: '접수 내역을 찾을 수 없어요.' })
   }
   if (!assertOwnsReservation(req, res, existing)) return
   const reservation = await markReservationCompleted(req.params.id)
@@ -912,7 +996,7 @@ app.post('/api/reservations/:id/complete', requireAuth, asyncHandler(async (req,
     if (existing.status === 'completed') {
       return res.json({ ok: true, id: existing.id, status: existing.status, alreadyCompleted: true })
     }
-    return res.status(409).json({ ok: false, error: '호출완료 또는 알림실패 상태의 예약만 완료할 수 있습니다.' })
+    return res.status(409).json({ ok: false, error: '호출한 손님만 정비완료로 처리할 수 있어요.' })
   }
   const notified = await notifyRepairDone(reservation)
   return res.json({ ok: true, id: reservation.id, status: reservation.status, notified })
@@ -982,7 +1066,7 @@ app.get('/api/reservations/failed', requireAuth, asyncHandler(async (req, res) =
 // 매장 토큰으로 키를 잡으면 한 매장이 단말기를 몇 대 두든 그 매장 몫 안에서만 소비된다.
 // 토큰은 인증 전 값이지만 이 한도의 목적은 "한 클라이언트가 과하게 두드리는 것"을 막는 것이라
 // 문제되지 않는다 — 토큰을 바꿔가며 우회하려는 쪽은 아래 posIpFloodLimiter와 인증 실패
-// 카운터(recordPosAuthFailure)가 잡는다.
+// 카운터(rejectPosAuthFailure)가 잡는다. 조회 한도는 인증보다 앞에 둔다: 토큰을 가진 단말이 폭주해도 DB 조회(매장 찾기) 전에 끊긴다.
 const POS_READ_LIMIT_PER_MIN = 300
 
 function posStoreRateKey(req) {
@@ -1012,20 +1096,33 @@ const posIpFloodLimiter = rateLimit({
   message: { ok: false, error: '요청이 너무 많습니다. 잠시 후 다시 시도해주세요.' },
 })
 
-// 호출/완료/취소처럼 상태를 바꾸는 POS 라우트는 폴링만큼 빈도가 높지 않고, 매장 전체(여러 탭앱
+// 호출/완료/취소처럼 상태를 바꾸는 POS·프론트 라우트는 폴링만큼 빈도가 높지 않고, 매장 전체(여러 탭앱
 // 인스턴스가 있을 수 있음) 기준의 정확한 한도가 더 의미 있어서 기존처럼 DB 기반 스토어를 유지한다.
+// 인증(requireStoreToken) **뒤에** 두고 매장 단위로 센다(2026-10-23). 예전에는 인증 앞에서 IP로 셌다:
+//   - 공인 IP를 함께 쓰는 매장들이 결제 보고(/result·/paid)까지 한도 하나를 나눠 썼다.
+//   - 토큰이 틀린 요청 1건이 이 카운터와 인증 실패 카운터에 DB를 두 번 썼다(이제 실패 카운터만 쓴다).
+// 인증 전에는 req.store가 없으므로 이 키의 ip: 분기는 순서를 잘못 붙였을 때의 안전장치일 뿐이다.
+const POS_WRITE_LIMIT_PER_MIN = positiveEnvNumber('POS_WRITE_LIMIT_PER_MIN', 120)
+
 const posLimiter = rateLimit({
   windowMs: 60 * 1000,
-  limit: 60,
+  limit: POS_WRITE_LIMIT_PER_MIN,
+  keyGenerator: (req) => (req.store ? `store:${req.store.id}` : `ip:${rateLimit.ipKeyGenerator(req.ip)}`),
   store: new PostgresRateLimitStore(prisma, { prefix: 'pos', windowMs: 60 * 1000 }),
   standardHeaders: true,
   legacyHeaders: false,
   message: { ok: false, error: '요청이 너무 많습니다. 잠시 후 다시 시도해주세요.' },
 })
 
-// X-Store-Token 무차별 대입 방어 (validatePosToken 위 주석 참고).
-// 관리자가 짧은 토큰(최소 4자)을 지정할 수 있게 하면서도 안전하려면 토큰 추측 시도 자체를
-// 막아야 한다. IP당 15분에 10회 실패면 차단한다.
+// X-Store-Token 인증 실패 카운터 (validatePosToken 위 주석 참고).
+// IP당 15분에 10회를 넘게 틀리면 그 IP의 **틀린** 시도에 401 대신 429를 준다.
+//
+// ⚠️ 이 카운터는 추측을 막지 못한다(2026-10-23 확인). requireStoreToken은 토큰을 먼저 조회하고 실패했을 때만 여기로 오므로,
+// 차단된 IP에서도 맞는 토큰은 그대로 200을 받는다 -- 바뀌는 것은 틀린 시도의 응답 코드뿐이다. 실제 상한은 IP당 분당
+// posIpFloodLimiter(600회)이고, 한 번의 추측이 400개 매장 토큰 전부와 비교된다. 그래서 직접 지정 토큰을 12자 이상·영문+숫자로
+// 올렸고(POS_TOKEN_MIN_LENGTH), 전체 실패 수가 급증하면 pos_auth_bruteforce 로그를 남긴다(아래 POS_AUTH_GLOBAL_*).
+// "차단된 IP는 맞는 토큰도 거절"로 바꾸면 안 된다: POS와 프론트가 같은 공인 IP를 쓰므로 한 단말의 오타가 매장 전체를 멈춘다.
+// 근본 대책은 1회용 연결 코드 + 긴 토큰(개선 제안 B1)이다.
 //
 // ⚠️ 예전에는 이걸 express-rate-limit의 skipSuccessfulRequests로 구현했다. 그 옵션은
 // "일단 세고(increment), 성공하면 되돌리는(decrement)" 방식이라 **정상 요청 1건당 DB 쓰기가
@@ -1044,19 +1141,44 @@ const posAuthFailureStore = new PostgresRateLimitStore(prisma, {
   prefix: 'pos-auth',
   windowMs: POS_AUTH_FAILURE_WINDOW_MS,
 })
+// 전체(모든 IP) 인증 실패 수. IP를 바꿔 가며 토큰을 맞혀 보는 시도는 IP 카운터에 안 걸리므로 전체 수로 본다. 막지는 않고 로그만
+// 남긴다(Cloud Logging에서 jsonPayload.event="pos_auth_bruteforce"로 알림을 건다).
+// 주의: 토큰을 재발급한 뒤 다시 연결하지 않은 단말도 폴링마다 틀린다 -- 401에도 3초마다 계속 묻는 옛 프론트 1대가 15분에 약 300회다.
+// 그래서 이 알림은 "추측 공격" 또는 "옛 토큰으로 계속 두드리는 단말"을 뜻한다. 로그의 ipFailures(그 IP의 실패 수)가 크면 후자다.
+const POS_AUTH_GLOBAL_ALERT_THRESHOLD = 300
+const POS_AUTH_GLOBAL_KEY = 'all'
+const posAuthGlobalStore = new PostgresRateLimitStore(prisma, {
+  prefix: 'pos-auth-global',
+  windowMs: POS_AUTH_FAILURE_WINDOW_MS,
+})
 
 // 인증 실패를 1회 기록하고, 한도를 넘었으면 429를 보낸 뒤 true를 돌려준다.
 // (호출부는 true면 이미 응답이 나갔으므로 그대로 return 하면 된다.)
 async function rejectPosAuthFailure(req, res, unauthorizedBody) {
   const key = `ip:${rateLimit.ipKeyGenerator(req.ip)}`
   let totalHits = 1
-  try {
-    const result = await posAuthFailureStore.increment(key)
-    totalHits = result.totalHits
-  } catch (e) {
+  const [ipResult, globalResult] = await Promise.allSettled([
+    posAuthFailureStore.increment(key),
+    posAuthGlobalStore.increment(POS_AUTH_GLOBAL_KEY),
+  ])
+  if (ipResult.status === 'fulfilled') {
+    totalHits = ipResult.value.totalHits
+  } else {
     // 카운터를 못 쓰더라도 인증 자체는 이미 실패한 상태다. 여기서 500을 내면 공격자에게
     // DB를 흔드는 수단을 주는 셈이라, 로그만 남기고 평소대로 401로 돌려보낸다.
-    logger.error('[pos] 인증 실패 카운터 기록 실패', { error: e.message })
+    logger.error('[pos] 인증 실패 카운터 기록 실패', { error: ipResult.reason?.message })
+  }
+  if (globalResult.status === 'fulfilled') {
+    const globalHits = globalResult.value.totalHits
+    // 넘는 순간 한 번, 그 뒤로는 100회마다 남긴다(실패마다 남기면 로그가 공격 규모만큼 불어난다).
+    if (globalHits > POS_AUTH_GLOBAL_ALERT_THRESHOLD && (globalHits === POS_AUTH_GLOBAL_ALERT_THRESHOLD + 1 || globalHits % 100 === 0)) {
+      logger.error('[pos] 매장 토큰 인증 실패가 전체적으로 급증했습니다(토큰 추측 또는 옛 토큰 단말 의심)', {
+        event: 'pos_auth_bruteforce',
+        failures: globalHits,
+        ipFailures: totalHits,
+        windowMinutes: POS_AUTH_FAILURE_WINDOW_MS / 60000,
+      })
+    }
   }
   if (totalHits > POS_AUTH_FAILURE_LIMIT) {
     res.status(429).json({
@@ -1069,10 +1191,13 @@ async function rejectPosAuthFailure(req, res, unauthorizedBody) {
   return true
 }
 
-// 오늘(KST) serviceDate 접수분 + 아직 끝나지 않은 이월 건(called/notify_failed)을 함께 보여준다
-// (계약 v3 §4.1~4.2). 응답 최상위 serviceDate(오늘 날짜)는 그대로 유지하고, 각 item에도
-// serviceDate를 실어보내 POS 화면이 "오늘 최상위 serviceDate와 다르면 이월 건"으로 배지를 붙일 수
-// 있게 한다.
+// 오늘(KST) serviceDate 접수분 + 아직 끝나지 않은 이월 건(called/notify_failed)을 함께 보여준다(계약 v3 §4.1~4.2,
+// store.listActiveQueueForStore). ?carriedOver=1이면 바로 전날 호출하지 않은 waiting도 싣는다 -- carriedOver를 아는 새 탭앱만 이
+// 값을 보낸다. 옛 탭앱은 이 건을 오늘 대기로 세고 [호출]을 켜 두는데 호출은 404이고 [완료]는 waiting에서 눌리지 않는다.
+// 응답 최상위 serviceDate(오늘 날짜)는 그대로 유지하고, 각 item에도 serviceDate를 실어보내 POS 화면이 "오늘 최상위 serviceDate와
+// 다르면 이월 건"으로 배지를 붙일 수 있게 한다.
+// item.carriedOver: 전날의 waiting(호출하지 않은 채 넘어온 건)일 때만 true -- 탭앱이 [호출] 대신 [완료]·[취소]만 보여준다(호출은 오늘
+// 접수분만 받는다). item.createdAt·calledAt: 탭앱이 접수 시각과 경과 시간을 그린다.
 // 정비 대기열 "최근 결제" 목록이 오늘 말고 며칠 전까지 보여줄지. 6이면 오늘 포함 7일.
 const SETTLED_LOOKBACK_DAYS_BEFORE_TODAY = 6
 
@@ -1096,11 +1221,13 @@ function noteDeviceSeen(storeId, kind) {
 app.get('/api/pos/queue', posIpFloodLimiter, posQueueReadLimiter, requireStoreToken, asyncHandler(async (req, res) => {
   noteDeviceSeen(req.store.id, 'pos')
   const serviceDate = kstDateString()
+  // 전날 waiting은 새 탭앱이 요청할 때만 싣는다(위 주석). '1' 말고는 모두 예전 응답이다.
+  const includePreviousDayWaiting = req.query.carriedOver === '1'
   // 대기열과 전산 장바구니를 한 응답에 함께 담는다. 예전에는 탭앱이 두 경로를 각각 폴링해서
   // 매장당 요청이 두 배였다 -- 400개 매장 기준 초당 160건 중 절반이 이 때문이었다.
   // 두 조회는 서로 무관하므로 병렬로 던진다.
   const [reservations, erpCarts, frontCartRows, settledRows, orphanRows] = await Promise.all([
-    listActiveQueueForStore(req.store.id, serviceDate),
+    listActiveQueueForStore(req.store.id, serviceDate, { includePreviousDayWaiting }),
     loadPendingErpCartsForResponse(req.store.id),
     listFrontErpCartsForPos(req.store.id, 20),
     // 최근 7일(오늘 포함, KST 자정 기준). 정비 후 며칠 지나 환불을 요청하는 손님도 있다.
@@ -1211,7 +1338,9 @@ app.get('/api/pos/queue', posIpFloodLimiter, posQueueReadLimiter, requireStoreTo
       status: r.status,
       phoneMasked: maskPhone(r.phone),
       createdAt: r.createdAt,
+      calledAt: r.calledAt || null,
       serviceDate: r.serviceDate,
+      carriedOver: r.status === 'waiting' && r.serviceDate !== serviceDate,
     })),
   })
 }))
@@ -1275,9 +1404,9 @@ function frontOrphanOf(row) {
 // 탭앱 경고 목록(/api/pos/queue frontOrphans)이 보여주는 기간. 그보다 오래된 흔적은 관리자 웹 대사로 넘긴다.
 const FRONT_ORPHAN_ALERT_DAYS = 7
 
-// ⚠️ 이 라우트는 **구버전 탭앱 호환용**으로 남겨둔다. 새 탭앱은 /api/pos/queue 응답의
-// erpCarts를 쓰므로 이 경로를 부르지 않는다 -- 폴링 요청이 매장당 절반으로 줄어든다.
-// 400개 매장이 한꺼번에 업데이트되지는 않으므로 당분간 둘 다 살아 있어야 한다.
+// ⚠️ 지우지 말 것. 지금 탭앱도 부른다(pos-plugin erpCarts.js refreshErpCarts가 deps.apiGet('/api/pos/erp-carts')): 전산 주문 화면의
+// [새로고침] 버튼, 지우기·[POS로 되돌리기] 직후의 목록 갱신, /api/pos/queue 응답에 erpCarts가 없을 때의 폴백. 정기 폴링만
+// /api/pos/queue 응답의 erpCarts를 쓴다. 예전 주석은 "구버전 탭앱 호환용"이라고 했는데 사실이 아니었다 -- 믿고 지우면 그 버튼들이 404가 된다.
 app.get('/api/pos/erp-carts', posIpFloodLimiter, posQueueReadLimiter, requireStoreToken, asyncHandler(async (req, res) => {
   return res.json({ ok: true, carts: await loadPendingErpCartsForResponse(req.store.id) })
 }))
@@ -1306,16 +1435,16 @@ const UNLOAD_FORCE_AFTER_MS = 30 * 60 * 1000
 // POS 플러그인이 addLineItem() 결과를 되돌려준다. posLimiter를 쓴다 -- 폴링(조회)이 아니라
 // "이 매장 전체 기준으로 한도를 두는 게 의미 있는" 상태 변경 액션이라 posQueueReadLimiter가 아닌
 // 기존 posLimiter(DB 기반)와 맞춘다.
-app.post('/api/pos/erp-carts/:id/consume', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+app.post('/api/pos/erp-carts/:id/consume', posIpFloodLimiter, requireStoreToken, posLimiter, asyncHandler(async (req, res) => {
   // dismissed = 매장 직원이 화면에서 이 주문을 치웠다(잘못 온 건). 전산이 취소한 cancelled와
   // 구분해서 남긴다 -- 전산 입장에서 "우리가 취소"와 "매장이 거부"는 후속 조치가 다르다.
   const result = req.body?.result
   if (result !== 'loaded' && result !== 'failed' && result !== 'dismissed') {
-    return res.status(400).json({ ok: false, error: "result는 'loaded', 'failed', 'dismissed' 중 하나여야 합니다." })
+    return res.status(400).json({ ok: false, error: '요청 정보가 올바르지 않아요. 화면을 새로 고친 뒤 다시 시도해주세요.' })
   }
   const attemptId = parseAttemptId(req.body?.attemptId)
   if (attemptId === false) {
-    return res.status(400).json({ ok: false, error: 'attemptId는 8~64자의 영문/숫자/하이픈/밑줄이어야 합니다.' })
+    return res.status(400).json({ ok: false, error: '요청 정보가 올바르지 않아요. 화면을 새로 고친 뒤 다시 시도해주세요.' })
   }
   // 이미 처리된 건을 돌려줄 때, 그 처리가 이 요청(같은 attemptId)의 첫 시도가 성공한 것인지 알려준다. 재시도한 탭앱이
   // 자기 첫 성공을 "다른 단말기가 먼저 담았다"로 오해해 이미 POS에 담은 주문을 또 담지 않게 한다.
@@ -1332,7 +1461,7 @@ app.post('/api/pos/erp-carts/:id/consume', posIpFloodLimiter, posLimiter, requir
   // POS 토큰으로도 남의 장바구니 상태를 바꿀 수 있게 되어버린다.
   const cart = await prisma.erpCart.findUnique({ where: { id: req.params.id } })
   if (!cart || cart.storeId !== req.store.id) {
-    return res.status(404).json({ ok: false, error: '장바구니를 찾을 수 없습니다.' })
+    return res.status(404).json({ ok: false, error: '주문을 찾을 수 없습니다.' })
   }
 
   if (cart.payTarget === 'front') {
@@ -1401,10 +1530,10 @@ app.post('/api/pos/erp-carts/:id/consume', posIpFloodLimiter, posLimiter, requir
 // 싣고 /unload는 빈 바디로 보내던 버전)이다 -- 그 탭앱은 force를 보낼 수 없어, 확인하면 자기가 담은 주문도 영영 되돌리지 못한다.
 // 그래서 예전처럼 되돌리고 경고 로그만 남긴다. 새 탭앱은 기억하는 attemptId가 없어도 checkDevice:true를 싣는다.
 // 담긴 채 24시간이 넘은 주문은 되돌려도 전산 주문 목록에 다시 뜨지 않으므로 pending 대신 dismissed로 닫는다.
-app.post('/api/pos/erp-carts/:id/unload', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+app.post('/api/pos/erp-carts/:id/unload', posIpFloodLimiter, requireStoreToken, posLimiter, asyncHandler(async (req, res) => {
   const attemptId = parseAttemptId(req.body?.attemptId)
   if (attemptId === false) {
-    return res.status(400).json({ ok: false, error: 'attemptId는 8~64자의 영문/숫자/하이픈/밑줄이어야 합니다.' })
+    return res.status(400).json({ ok: false, error: '요청 정보가 올바르지 않아요. 화면을 새로 고친 뒤 다시 시도해주세요.' })
   }
   const force = req.body?.force === true
   const checkDevice = req.body?.checkDevice === true || attemptId !== null
@@ -1472,17 +1601,21 @@ app.post('/api/pos/erp-carts/:id/unload', posIpFloodLimiter, posLimiter, require
 // 반드시 명시적인 확인 동작(예: 2단계 확인 버튼) 뒤에만 이 엔드포인트를 호출해야 한다 —
 // 서버는 그 UX를 강제할 수 없으므로 프론트(탭앱) 쪽 책임이다.
 // 해당 매장 + 오늘 serviceDate의 예약만 대상으로 한다(계약 §3.14) — 아니면 404.
-app.post('/api/pos/queue/:id/call', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+app.post('/api/pos/queue/:id/call', posIpFloodLimiter, requireStoreToken, posLimiter, asyncHandler(async (req, res) => {
   const serviceDate = kstDateString()
   const reservation = await getReservation(req.params.id)
-  if (!reservation || reservation.storeId !== req.store.id || reservation.serviceDate !== serviceDate) {
-    return res.status(404).json({ ok: false, error: '예약을 찾을 수 없습니다.' })
+  if (!reservation || reservation.storeId !== req.store.id) {
+    return res.status(404).json({ ok: false, error: '접수 내역을 찾을 수 없어요.' })
+  }
+  if (reservation.serviceDate !== serviceDate) {
+    // 전날 넘어온 접수(대기열에 carriedOver로 보인다). [호출] 버튼을 그대로 보여주는 옛 탭앱에서 눌러도 무엇을 하면 되는지 알려준다.
+    return res.status(404).json({ ok: false, error: '전날 접수한 건이라 호출할 수 없어요. [완료]나 [취소]로 정리해주세요.' })
   }
   if (reservation.status !== 'waiting') {
     if (['called', 'notify_failed'].includes(reservation.status)) {
       return res.json({ ok: true, id: reservation.id, status: reservation.status, alreadyProcessed: true })
     }
-    return res.status(400).json({ ok: false, error: '대기중인 예약만 호출할 수 있습니다.' })
+    return res.status(400).json({ ok: false, error: '대기 중인 손님만 호출할 수 있어요.' })
   }
   const outcome = await notifyQueueTurn(reservation)
   return res.json({ ok: true, id: reservation.id, status: reservation.status, alreadyProcessed: !outcome.changed })
@@ -1492,38 +1625,114 @@ app.post('/api/pos/queue/:id/call', posIpFloodLimiter, posLimiter, requireStoreT
 // 차(어제 called 상태)를 다음날 POS에서 완료 처리할 수 있어야 하기 때문이다. 호출(call)은 여전히
 // 오늘 것만 허용하므로(아래 call 라우트), 여기서 day-scope를 빼도 "어제 waiting을 오늘 실수로 새로
 // 호출"하는 사고로는 이어지지 않는다.
-app.post('/api/pos/queue/:id/complete', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+// 대기(waiting)도 받는다(2026-10-23) -- 호출을 건너뛴 손님을 [호출]("고객님의 순서입니다" 발송) 없이 바로 정비완료로 끝낸다
+// (store.markReservationCompleted allowWaiting). 전날 넘어온 waiting(carriedOver)도 여기서 정리한다.
+// 본문 { notify: false }면 완료 문자("차량을 찾으러 와주세요") 없이 완료만 하고 notified:false를 준다 -- 어제 정비를 마치고 손님이 이미
+// 차를 찾아간 접수를 다음 날 정리할 때 하루 늦은 문자가 가지 않게 한다. 그 밖(본문 없음 포함)은 예전처럼 보낸다.
+// 이미 완료된 접수는 200 { ok, alreadyCompleted:true, status:'completed' }다(문자는 다시 보내지 않는다). 처음 읽은 뒤 다른 POS나
+// 결제 뒤 자동 완료(completeReservationAfterPayment)가 먼저 완료해 바꾸기가 0건이 된 경우도 다시 읽어 같은 응답을 준다 -- 예전에는
+// 처음 읽은 상태(called 등)만 보고 '취소된 접수라…' 409를 줘서, 정비가 끝난 손님을 직원이 취소된 줄 알았다.
+app.post('/api/pos/queue/:id/complete', posIpFloodLimiter, requireStoreToken, posLimiter, asyncHandler(async (req, res) => {
   const existing = await getReservation(req.params.id)
   if (!existing || existing.storeId !== req.store.id) {
-    return res.status(404).json({ ok: false, error: '예약을 찾을 수 없습니다.' })
+    return res.status(404).json({ ok: false, error: '접수 내역을 찾을 수 없어요.' })
   }
-  const reservation = await markReservationCompleted(req.params.id)
+  const skipNotify = req.body?.notify === false
+  const reservation = await markReservationCompleted(req.params.id, { allowWaiting: true })
   if (!reservation) {
-    if (existing.status === 'completed') {
-      return res.json({ ok: true, id: existing.id, status: existing.status, alreadyCompleted: true })
+    const latest = existing.status === 'completed' ? existing : await getReservation(req.params.id)
+    if (!latest) {
+      return res.status(404).json({ ok: false, error: '접수 내역을 찾을 수 없어요.' })
     }
-    return res.status(409).json({ ok: false, error: '호출완료 또는 알림실패 상태의 예약만 완료할 수 있습니다.' })
+    if (latest.status === 'completed') {
+      return res.json({ ok: true, id: latest.id, status: 'completed', alreadyCompleted: true })
+    }
+    if (latest.status === 'cancelled') {
+      return res.status(409).json({ ok: false, error: '취소된 접수라 정비완료로 바꿀 수 없어요.', status: 'cancelled' })
+    }
+    return res.status(409).json({ ok: false, error: '지금은 정비완료로 바꿀 수 없는 상태예요. 목록을 새로 불러와주세요.', status: latest.status })
+  }
+  if (skipNotify) {
+    logger.info('[pos] 완료 문자 없이 정비완료로 정리', { storeId: req.store.id, reservationId: reservation.id, serviceDate: reservation.serviceDate })
+    return res.json({ ok: true, id: reservation.id, status: reservation.status, notified: false })
   }
   const notified = await notifyRepairDone(reservation)
   return res.json({ ok: true, id: reservation.id, status: reservation.status, notified })
 }))
 
-// 노쇼 손님을 대기열에서 빼는 용도 (계약 §3.16 신규). complete와 동일하게(계약 v3 §4.3) 해당
-// 매장만 확인하고 day-scope는 두지 않는다 — 이월(called/notify_failed) 건도 취소할 수 있어야 한다.
-app.post('/api/pos/queue/:id/cancel', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+// POS [알림 다시 보내기]. 호출 알림(고객님의 순서입니다)이 실패한(notify_failed) 접수만 다시 보낸다. 예전에는 관리자 웹에만 있어
+// 매장 직원이 PC에서 로그인해야 했다.
+// 두 POS가 동시에 눌러도 한 번만 나간다: notify_failed → called 원자적 전이(markReservationCalledFromNotifyFailed)가 잠금이다 --
+// 이긴 요청 하나만 보내고, 진 요청은 409다. 보내기에 실패하면 notify_failed로 되돌린다(sendQueueTurnAndSync).
+// 응답: { ok, status, notify: 'sent' | 'failed' | 'unknown', error? }
+//   failed  확실히 안 나갔다(번호·발송사 탓) -- 다시 보내도 대개 같으니 직접 연락을 권한다.
+//   unknown 결과를 모른다(시간 초과 등) -- 이미 갔을 수 있어 다시 보내기 전에 손님께 먼저 연락해보라고 안내한다. 상태는 notify_failed로
+//           되돌려 둔다(502 { ok:false, notify:'unknown', status:'notify_failed' }) -- 탭앱이 다음 다시 보내기 전에 경고한다.
+// 보내는 동안에는 상태가 called라 다른 POS의 다시 보내기는 409다(위 잠금). 되돌리기는 called일 때만 하므로(markReservationNotifyFailed),
+// 그사이 다른 쪽이 정비완료·취소했으면 그 상태를 다시 읽어 준다.
+// 오늘 접수분과 이월 건 모두 받는다(호출 알림을 다시 보내는 것이지 새로 호출하는 것이 아니다).
+app.post('/api/pos/queue/:id/retry-notify', posIpFloodLimiter, requireStoreToken, posLimiter, asyncHandler(async (req, res) => {
   const existing = await getReservation(req.params.id)
   if (!existing || existing.storeId !== req.store.id) {
-    return res.status(404).json({ ok: false, error: '예약을 찾을 수 없습니다.' })
+    return res.status(404).json({ ok: false, error: '접수 내역을 찾을 수 없어요.' })
+  }
+  const notRetryable = (row) => res.status(409).json({
+    ok: false,
+    status: row?.status ?? null,
+    error: row?.status === 'called'
+      ? '호출 알림을 이미 보냈어요(다른 단말기에서 먼저 보냈을 수 있어요).'
+      : '호출 알림 발송에 실패한 접수만 다시 보낼 수 있어요.',
+  })
+  if (existing.status !== 'notify_failed') return notRetryable(existing)
+  const claimed = await markReservationCalledFromNotifyFailed(existing.id)
+  if (!claimed) return notRetryable(await getReservation(existing.id))
+
+  try {
+    await solapi.sendQueueTurnAlimtalk({
+      phone: claimed.phone,
+      carNumber: claimed.carNumber,
+      queueNumber: claimed.queueNumber,
+      serviceType: claimed.serviceType,
+      storeName: claimed.store?.name,
+      storeId: claimed.storeId,
+      reservationId: claimed.id,
+    })
+    logger.info('[pos] 호출 알림 다시 보내기 성공', { storeId: req.store.id, reservationId: claimed.id })
+    return res.json({ ok: true, status: 'called', notify: 'sent' })
+  } catch (notifyError) {
+    const notify = solapi.classifySendFailure(notifyError) === 'unknown' ? 'unknown' : 'failed'
+    logger.error('[pos] 호출 알림 다시 보내기 실패', {
+      storeId: req.store.id, reservationId: claimed.id, notify, ...solapi.sendFailureLog(notifyError),
+    })
+    const failed = await markReservationNotifyFailed(claimed.id)
+    const current = failed || await getReservation(claimed.id)
+    return res.status(502).json({
+      ok: false,
+      status: current?.status || 'notify_failed',
+      notify,
+      error: notify === 'unknown'
+        ? '알림이 나갔는지 확인하지 못했어요. 다시 보내기 전에 손님께 먼저 연락해 주세요.'
+        : '호출 알림을 다시 보내지 못했어요. 손님께 직접 연락해 주세요.',
+    })
+  }
+}))
+
+// 노쇼 손님을 대기열에서 빼는 용도 (계약 §3.16 신규). complete와 동일하게(계약 v3 §4.3) 해당
+// 매장만 확인하고 day-scope는 두지 않는다 — 이월(called/notify_failed) 건도 취소할 수 있어야 한다.
+app.post('/api/pos/queue/:id/cancel', posIpFloodLimiter, requireStoreToken, posLimiter, asyncHandler(async (req, res) => {
+  const existing = await getReservation(req.params.id)
+  if (!existing || existing.storeId !== req.store.id) {
+    return res.status(404).json({ ok: false, error: '접수 내역을 찾을 수 없어요.' })
   }
   if (existing.status === 'cancelled') {
     return res.json({ ok: true, id: existing.id, status: 'cancelled', alreadyProcessed: true })
   }
   if (existing.status === 'completed') {
-    return res.status(409).json({ ok: false, error: '이미 정비완료된 예약입니다.' })
+    return res.status(409).json({ ok: false, error: '이미 정비가 끝난 접수라 취소할 수 없어요.' })
   }
   const reservation = await markReservationCancelled(req.params.id)
   if (!reservation) {
-    return res.status(409).json({ ok: false, error: '취소할 수 없는 상태의 예약입니다.' })
+    return res.status(409).json({ ok: false, error: '지금은 취소할 수 없는 접수예요.' })
   }
   return res.json({ ok: true, id: reservation.id, status: reservation.status })
 }))
@@ -1542,16 +1751,16 @@ app.post('/api/payments', publicCors, paymentLimiter, paymentPhoneLimiter, requi
   // 정상 흐름(front-plugin/payment.html)은 항상 이 값을 함께 보내므로 필수로 막아도 정상
   // 결제는 깨지지 않는다 — 없이 들어오는 요청은 "전화번호+동의만 알면 되는" 조회성 악용이다.
   if (!paymentKey) {
-    return res.status(400).json({ ok: false, error: 'paymentKey가 필요합니다.' })
+    return res.status(400).json({ ok: false, error: '결제 정보를 확인할 수 없어요. 직원에게 문의해주세요.' })
   }
   if (paymentKey.length > 200) {
-    return res.status(400).json({ ok: false, error: 'paymentKey가 너무 깁니다.' })
+    return res.status(400).json({ ok: false, error: '결제 정보를 확인할 수 없어요. 직원에게 문의해주세요.' })
   }
   if (!PHONE_RE.test(phone)) {
-    return res.status(400).json({ ok: false, error: '전화번호 형식이 올바르지 않습니다.' })
+    return res.status(400).json({ ok: false, error: '휴대폰 번호를 다시 확인해주세요. 예) 01012345678' })
   }
   if (carNumberRaw && !CAR_NUMBER_RE.test(carNumberRaw)) {
-    return res.status(400).json({ ok: false, error: '차량번호 형식이 올바르지 않습니다. 예) 12가3456' })
+    return res.status(400).json({ ok: false, error: '차량번호를 다시 확인해주세요. 예) 12가3456' })
   }
   let amount = null
   if (amountRaw !== undefined && amountRaw !== null && amountRaw !== '') {
@@ -1579,7 +1788,7 @@ app.post('/api/payments', publicCors, paymentLimiter, paymentPhoneLimiter, requi
       // 오는 건 재시도가 아니라, 그 결제 건을 근거로 남의 번호로 조회/수신을 시도하는
       // 경우이므로 막는다(계약과 무관하게 이번에 새로 추가하는 방어).
       if (existing.phone !== phone) {
-        return res.status(409).json({ ok: false, error: '이미 다른 전화번호로 등록된 결제입니다.' })
+        return res.status(409).json({ ok: false, error: '이 결제는 이미 다른 번호로 영수증이 신청되어 있어요. 직원에게 문의해주세요.' })
       }
       return res.json({ ok: true, id: existing.id })
     }
@@ -1699,7 +1908,13 @@ app.get('/api/admin/stores', requireAuth, requireRole('hq_admin'), asyncHandler(
   const limit = parseLimit(req.query.limit)
   const offset = parseOffset(req.query.offset)
   const { total, items } = await listStoresPage({ q, limit, offset })
-  const stores = items.map(({ posToken, ...rest }) => ({ ...rest, hasPosToken: Boolean(posToken) }))
+  // weakPosToken: 지금 기준(12자 미만)으로는 직접 지정할 수 없는 짧은 토큰이 이미 들어가 있는 매장. 관리자 웹이 '약한 토큰' 배지를 붙여
+  // 재발급을 권한다(값·길이 자체는 내보내지 않는다). 이미 발급된 토큰은 그대로 동작한다.
+  const stores = items.map(({ posToken, ...rest }) => ({
+    ...rest,
+    hasPosToken: Boolean(posToken),
+    weakPosToken: Boolean(posToken) && String(posToken).length < POS_TOKEN_MIN_LENGTH,
+  }))
   return res.json({ ok: true, count: stores.length, total, hasMore: offset + stores.length < total, stores })
 }))
 
@@ -1708,13 +1923,13 @@ app.post('/api/admin/stores', requireAuth, requireRole('hq_admin'), asyncHandler
   const name = String(req.body?.name ?? '').trim()
 
   if (!merchantId) {
-    return res.status(400).json({ ok: false, error: 'merchantId가 필요합니다.' })
+    return res.status(400).json({ ok: false, error: '토스 가맹점 ID를 입력해주세요.' })
   }
   if (!name) {
     return res.status(400).json({ ok: false, error: '매장명이 필요합니다.' })
   }
   if (await findStoreByMerchantId(merchantId)) {
-    return res.status(409).json({ ok: false, error: '이미 등록된 merchantId입니다.' })
+    return res.status(409).json({ ok: false, error: '이미 등록된 토스 가맹점 ID예요.' })
   }
 
   // 단건 등록은 사람이 직접 입력하는 경로라 수정 라우트(.../business-number)와 똑같이 즉시
@@ -1752,35 +1967,35 @@ app.post('/api/admin/stores/bulk', requireAuth, requireRole('hq_admin'), asyncHa
 // 직접 지정을 허용하는 이유: 무작위 64자는 안전하지만 매장 단말기에서 손으로 입력하기가 사실상
 // 불가능하다. 실제 운영에서는 관리자가 매장에 불러주거나 적어서 전달해야 해서, 입력 가능한
 // 길이의 값을 정할 수 있어야 한다.
-// 다만 이 토큰이 /api/pos/* 의 유일한 인증 수단이므로 아래 제약을 서버가 강제한다 —
+// 다만 이 토큰이 /api/pos/*·/api/front/* 의 유일한 인증 수단이므로 아래 제약을 서버가 강제한다 —
 // 이걸 클라이언트 검증에만 맡기면 API를 직접 호출해 "1234" 같은 값을 넣을 수 있고, 그 순간
 // 이번에 막은 무인증 취약점으로 그대로 되돌아간다.
-// 최소 길이를 4자로 둔 이유와, 그래서 반드시 함께 있어야 하는 방어 장치:
 //
-// 4자(영문/숫자/-/_ 기준 64^4 ≈ 1,670만 가지)는 그 자체로는 절대 안전하지 않다. 게다가 실제로는
-// 무작위가 아니라 "1234", "1001", 매장 약칭 같은 값을 쓰게 되므로, 흔한 후보 수백 개만 돌려봐도
-// 뚫린다. 그런데도 짧은 값을 허용하는 건 POS 단말기에서 긴 문자열을 손으로 입력하는 게 현실적으로
-// 불가능해서다(운영이 불편하면 결국 토큰을 아무 데나 적어두게 되어 더 위험해진다).
-//
-// 그래서 "짧은 비밀번호 + 시도 횟수 제한"이라는 ATM PIN과 같은 모델을 쓴다. 아래 posAuthLimiter가
-// 토큰이 틀린 요청(401)만 세어서 IP당 15분에 10회로 막기 때문에, 4자라도 전수/사전 공격이
-// 현실적으로 불가능해진다. 둘 중 하나라도 빠지면 이번에 막은 무인증 취약점으로 되돌아간다 —
-// 길이 제한을 더 낮추거나 posAuthLimiter를 제거할 때는 반드시 같이 판단해야 한다.
-const POS_TOKEN_MIN_LENGTH = 4
+// 최소 12자, 영문과 숫자를 섞어야 한다(2026-10-23, 예전 최소 4자). 예전 주석은 "인증 실패를 IP당 15분 10회로 막으니
+// 4자라도 전수·사전 공격이 불가능하다"고 했는데 사실이 아니었다: 그 카운터는 틀린 시도의 응답 코드만 401에서 429로 바꿀 뿐
+// 맞는 토큰은 차단된 IP에서도 통과하고(rejectPosAuthFailure 위 주석), 한 번의 추측이 400개 매장 토큰 전부와 비교된다.
+// 짧고 뻔한 값("1234", 매장 약칭)은 흔한 후보 수백 개만 돌려도 맞는다. 12자 영문+숫자(예: gangnam01pos)는 손으로 입력할 수
+// 있으면서 후보 사전에 잘 걸리지 않는 선이다. 이미 발급된 토큰(예전 기준으로 지정한 짧은 값 포함)은 그대로 동작한다 --
+// 관리자 웹이 '약한 토큰' 배지로 재발급을 권한다(GET /api/admin/stores weakPosToken). 근본 대책은 개선 제안 B1(1회용 연결 코드).
+const POS_TOKEN_MIN_LENGTH = 12
 const POS_TOKEN_MAX_LENGTH = 128
 const POS_TOKEN_RE = /^[A-Za-z0-9_-]+$/
 
 function validatePosToken(raw) {
   const token = String(raw).trim()
   if (token.length < POS_TOKEN_MIN_LENGTH || token.length > POS_TOKEN_MAX_LENGTH) {
-    return { error: `POS 토큰은 ${POS_TOKEN_MIN_LENGTH}자 이상 ${POS_TOKEN_MAX_LENGTH}자 이하여야 합니다.` }
+    return { error: `POS 토큰은 ${POS_TOKEN_MIN_LENGTH}자 이상 ${POS_TOKEN_MAX_LENGTH}자 이하로 정해주세요.` }
   }
   if (!POS_TOKEN_RE.test(token)) {
-    return { error: 'POS 토큰은 영문/숫자/하이픈(-)/밑줄(_)만 사용할 수 있습니다.' }
+    return { error: 'POS 토큰은 영문/숫자/하이픈(-)/밑줄(_)만 쓸 수 있어요.' }
   }
-  // "1111", "0000"처럼 한 글자만 반복하는 값은 후보군이 64개뿐이라 시도 제한이 있어도 위험하다.
+  // 숫자만("123456789012")이거나 영문만인 값은 사전·연번 후보에 잘 걸린다.
+  if (!/[A-Za-z]/.test(token) || !/[0-9]/.test(token)) {
+    return { error: 'POS 토큰에는 영문과 숫자를 함께 넣어주세요.' }
+  }
+  // "1111", "0000"처럼 한 글자만 반복하는 값은 후보군이 64개뿐이라 시도 제한이 있어도 위험하다(영문+숫자 규칙 뒤에도 남겨 둔다).
   if (new Set(token).size < 2) {
-    return { error: 'POS 토큰이 너무 단순합니다. 같은 문자만 반복할 수 없습니다.' }
+    return { error: 'POS 토큰이 너무 단순해요. 같은 문자만 반복할 수 없어요.' }
   }
   return { token }
 }
@@ -1906,7 +2121,7 @@ app.post('/api/admin/stores/:id/erp-code', requireAuth, requireRole('hq_admin'),
   if (!wantsClear) {
     const code = String(raw).trim()
     if (code.length < 1 || code.length > 64 || !ERP_STORE_CODE_RE.test(code)) {
-      return res.status(400).json({ ok: false, error: '매장 코드는 1~64자의 영문/숫자/하이픈(-)/밑줄(_)만 사용할 수 있습니다.' })
+      return res.status(400).json({ ok: false, error: '전산 코드는 1~64자의 영문·숫자·하이픈(-)·밑줄(_)만 쓸 수 있어요.' })
     }
   }
 
@@ -2088,7 +2303,8 @@ app.post('/api/webhooks/toss/payment', asyncHandler(async (req, res) => {
     const validSignature =
       sigBuf.length === expectedBuf.length && crypto.timingSafeEqual(sigBuf, expectedBuf)
     if (!validSignature) {
-      logger.error('[webhook] 서명 검증 실패', { webhookId })
+      // 고정 이벤트 코드로 알림을 건다(문구를 다듬어도 알림이 멈추지 않게) -- jsonPayload.event="webhook_signature_failed"
+      logger.error('[webhook] 서명 검증 실패', { event: 'webhook_signature_failed', webhookId })
       return res.status(401).json({ ok: false, error: 'invalid signature' })
     }
   } else {
@@ -2129,6 +2345,8 @@ app.post('/api/webhooks/toss/payment', asyncHandler(async (req, res) => {
 // 공유 토큰(X-ERP-Token) 인증. requirePromotionJobAuth와 동일하게 timingSafeEqual로 비교해
 // 타이밍 공격으로 토큰 일부를 추측하는 걸 막는다. 미설정이면 503 -- 전산 연동 자체를 켜지
 // 않은 환경(로컬 개발 등)에서 이 라우트가 500 대신 명확한 신호를 주기 위함이다.
+// 매장 단위 한도(erpLimiter)는 이 인증 **뒤에** 둔다(2026-10-23). storeCode(CHV-001 형식)는 비밀값이 아니어서, 앞에 두면 토큰이 없는
+// 사람이 {storeCode:'CHV-001'}로 분당 한도만큼 보내기만 해도 그 매장의 진짜 전산 주문이 429를 받았다. IP 폭주 차단(erpIpFloodLimiter)만 앞에 둔다.
 function requireErpToken(req, res, next) {
   const expected = process.env.ERP_API_TOKEN
   const supplied = req.get('x-erp-token') || ''
@@ -2138,7 +2356,8 @@ function requireErpToken(req, res, next) {
   const expectedBuf = Buffer.from(expected)
   const suppliedBuf = Buffer.from(supplied)
   if (expectedBuf.length !== suppliedBuf.length || !crypto.timingSafeEqual(expectedBuf, suppliedBuf)) {
-    return res.status(401).json({ ok: false, error: 'unauthorized' })
+    // 전산 시뮬레이터·전산 화면 상태줄에 그대로 보인다(영문 'unauthorized' 대신).
+    return res.status(401).json({ ok: false, error: 'ERP 토큰이 올바르지 않아요.' })
   }
   return next()
 }
@@ -2149,8 +2368,9 @@ function requireErpToken(req, res, next) {
 // 그 한도를 400개 매장이 통째로 나눠 쓰는 꼴이 되어, 한 매장이 같은 주문을 실수로 재시도만
 // 해도 나머지 399개 매장은 [담기]를 눌러도 POS에 주문이 뜨지 않는다. posStoreRateKey와 같은
 // 방식으로 매장 단위로 쪼갠다 -- 다만 여기는 인증 전 토큰이 아니라 요청 바디의 storeCode를
-// 키로 쓴다(express.json이 이 라우트들보다 앞서(196줄) 등록돼 있어 keyGenerator에서도
-// req.body를 읽을 수 있다). storeCode가 없는 라우트(재조회 GET, 취소 POST)는 IP로 폴백한다.
+// 키로 쓴다(express.json 미들웨어가 이 라우트들보다 앞서 app.use로 등록돼 있어 keyGenerator에서도
+// req.body를 읽을 수 있다). storeCode가 없는 라우트(재조회 GET, 취소 POST)는 referenceId로 쪼갠다(아래).
+// 인증(requireErpToken) 뒤에 돌므로, 토큰이 맞는 요청만 이 카운터를 쓴다.
 const DEFAULT_ERP_STORE_LIMIT_PER_MIN = 120
 const configuredErpStoreLimit = Number(process.env.ERP_STORE_LIMIT_PER_MIN)
 const ERP_STORE_LIMIT_PER_MIN = Number.isFinite(configuredErpStoreLimit) && configuredErpStoreLimit > 0
@@ -2280,7 +2500,7 @@ function deriveTossOrderKey(referenceId) {
   return `erp-${referenceId}`
 }
 
-app.post('/api/erp/draft-orders', erpIpFloodLimiter, erpLimiter, requireErpToken, asyncHandler(async (req, res) => {
+app.post('/api/erp/draft-orders', erpIpFloodLimiter, requireErpToken, erpLimiter, asyncHandler(async (req, res) => {
   const parsed = validateDraftOrderBody(req.body)
   if (parsed.error) {
     return res.status(400).json({ ok: false, error: parsed.error })
@@ -2289,10 +2509,10 @@ app.post('/api/erp/draft-orders', erpIpFloodLimiter, erpLimiter, requireErpToken
 
   const store = await findStoreByErpCode(storeCode)
   if (!store) {
-    return res.status(404).json({ ok: false, error: '등록되지 않은 매장 코드입니다.' })
+    return res.status(404).json({ ok: false, error: '등록되지 않은 전산 코드예요.' })
   }
   if (store.status !== 'active') {
-    return res.status(403).json({ ok: false, error: '비활성화된 가맹점입니다.' })
+    return res.status(403).json({ ok: false, error: '이용이 중지된 매장이에요. 본사에 문의해주세요.' })
   }
 
   // 멱등: 이미 처리된(failed가 아닌) 건이면 토스를 다시 호출하지 않고 그대로 돌려준다.
@@ -2349,7 +2569,7 @@ app.post('/api/erp/draft-orders', erpIpFloodLimiter, erpLimiter, requireErpToken
 }))
 
 // 전산이 결과를 재조회할 수 있게 한다(§4.3).
-app.get('/api/erp/draft-orders/:referenceId', erpIpFloodLimiter, erpLimiter, requireErpToken, asyncHandler(async (req, res) => {
+app.get('/api/erp/draft-orders/:referenceId', erpIpFloodLimiter, requireErpToken, erpLimiter, asyncHandler(async (req, res) => {
   const order = await findErpOrderByReference(req.params.referenceId)
   if (!order) {
     return res.status(404).json({ ok: false, error: '요청하신 주문을 찾을 수 없습니다.' })
@@ -2406,8 +2626,8 @@ const PROMO_BLOCK_MESSAGES = {
 // unknown은 나갔을 수 있어 30일 제한에 넣는다. 자동 홍보의 "같은 번호 실패 횟수"는 failed만 센다(store.countRecentAutoPromoFailures).
 const PROMO_SEND_FAILURE_STATUS = { recipient: 'failed', provider: 'failed_provider', unknown: 'unknown' }
 // 발송사 계정·설정 탓 실패의 안내. 매장에서 다시 보내도 똑같이 실패하므로 본사 확인을 요청한다(기간 발송은 멈춘다).
-const PROMO_PROVIDER_STOP_MESSAGE = '문자 발송 계정(잔액·발신번호·템플릿) 문제로 멈췄습니다. 본사 확인이 필요합니다'
-const PROMO_PROVIDER_FAILED_MESSAGE = '문자 발송 계정(잔액·발신번호·템플릿) 문제로 보내지 못했습니다. 본사 확인이 필요합니다'
+const PROMO_PROVIDER_STOP_MESSAGE = '문자 발송 계정(잔액·발신번호·템플릿) 문제로 멈췄습니다. 본사 확인이 필요합니다.'
+const PROMO_PROVIDER_FAILED_MESSAGE = '문자 발송 계정(잔액·발신번호·템플릿) 문제로 보내지 못했습니다. 본사 확인이 필요합니다.'
 
 function recentlySentMessage(lastSentAt) {
   const days = (Date.now() - new Date(lastSentAt).getTime()) / (24 * 60 * 60 * 1000)
@@ -2472,7 +2692,7 @@ app.get('/api/pos/promo/eligibility', posIpFloodLimiter, posQueueReadLimiter, re
 }))
 
 // 직원이 [홍보 보내기]를 눌렀을 때. 위 조건을 **여기서 다시** 확인한다.
-app.post('/api/pos/promo/send', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+app.post('/api/pos/promo/send', posIpFloodLimiter, requireStoreToken, posLimiter, asyncHandler(async (req, res) => {
   const carNumber = String(req.body?.carNumber || '').trim()
   if (!carNumber) {
     return res.status(400).json({ ok: false, error: '차량번호를 입력해주세요.' })
@@ -2533,7 +2753,7 @@ function parseOptOutPhone(raw) {
   return PHONE_RE.test(phone) ? phone : null
 }
 
-app.post('/api/pos/promo/opt-out', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+app.post('/api/pos/promo/opt-out', posIpFloodLimiter, requireStoreToken, posLimiter, asyncHandler(async (req, res) => {
   const phone = parseOptOutPhone(req.body?.phone)
   if (!phone) return res.status(400).json({ ok: false, error: '전화번호를 01012345678 형식으로 입력해주세요.' })
   const row = await registerMarketingOptOut({ storeId: req.store.id, phone, recordedBy: null, via: 'pos' })
@@ -2543,7 +2763,7 @@ app.post('/api/pos/promo/opt-out', posIpFloodLimiter, posLimiter, requireStoreTo
 
 // 홍보 문자 목록에서 번호 삭제(탭앱). 리허설·테스트 번호를 치우거나 홍보를 보내지 않기로 한 번호용이다.
 // 지운 번호는 목록에서 사라지고 차량별·자동 발송에서도 막힌다. 손님의 수신거부와는 따로 기록한다.
-app.post('/api/pos/promo/exclude', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+app.post('/api/pos/promo/exclude', posIpFloodLimiter, requireStoreToken, posLimiter, asyncHandler(async (req, res) => {
   const phone = parseOptOutPhone(req.body?.phone)
   if (!phone) return res.status(400).json({ ok: false, error: '전화번호가 올바르지 않습니다.' })
   await registerPromoExclusion(req.store.id, phone)
@@ -2584,8 +2804,8 @@ app.get('/api/pos/promo/demo-mode', posIpFloodLimiter, posQueueReadLimiter, requ
   return res.json(promoDemoBody(store))
 }))
 
-app.post('/api/pos/promo/demo-mode', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
-  if (typeof req.body?.enabled !== 'boolean') return res.status(400).json({ ok: false, error: 'enabled(true/false)가 필요합니다.' })
+app.post('/api/pos/promo/demo-mode', posIpFloodLimiter, requireStoreToken, posLimiter, asyncHandler(async (req, res) => {
+  if (typeof req.body?.enabled !== 'boolean') return res.status(400).json({ ok: false, error: '요청 정보가 올바르지 않아요. 화면을 새로 고친 뒤 다시 시도해주세요.' })
   // 실매장 운영: 30일 재발송 제한을 푸는 건 본사만 한다(관리자 웹). 매장 단말기에서는 끄기만 된다.
   if (req.body.enabled) return res.status(403).json({ ok: false, error: '시연 모드는 본사 관리자 웹에서만 켤 수 있습니다.' })
   const store = await togglePromoDemo(req.store.id, req.body.enabled, { via: 'pos' })
@@ -2595,7 +2815,7 @@ app.post('/api/pos/promo/demo-mode', posIpFloodLimiter, posLimiter, requireStore
 app.post('/api/admin/promo-demo-mode', requireAuth, asyncHandler(async (req, res) => {
   const storeId = req.admin.role === 'store_admin' ? req.admin.storeId : String(req.body?.storeId || '').trim()
   if (!storeId) return res.status(400).json({ ok: false, error: '매장을 선택해주세요.' })
-  if (typeof req.body?.enabled !== 'boolean') return res.status(400).json({ ok: false, error: 'enabled(true/false)가 필요합니다.' })
+  if (typeof req.body?.enabled !== 'boolean') return res.status(400).json({ ok: false, error: '요청 정보가 올바르지 않아요. 화면을 새로 고친 뒤 다시 시도해주세요.' })
   if (req.body.enabled && req.admin.role === 'store_admin') {
     return res.status(403).json({ ok: false, error: '시연 모드는 본사 관리자만 켤 수 있습니다.' })
   }
@@ -2648,7 +2868,7 @@ function resolvePromoCampaignPeriod(source) {
     return { error: { status: 400, body: { ok: false, error: '기간을 YYYY-MM-DD 형식으로 입력해주세요.' } } }
   }
   if (from > to) return { error: { status: 400, body: { ok: false, error: '시작일이 종료일보다 늦습니다.' } } }
-  if (to > kstDateString()) return { error: { status: 400, body: { ok: false, error: '종료일은 오늘 이전이어야 합니다.' } } }
+  if (to > kstDateString()) return { error: { status: 400, body: { ok: false, error: '종료일은 오늘까지만 고를 수 있어요.' } } }
   const start = kstDateRangeUtc(from).start
   const end = kstDateRangeUtc(to).end
   if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
@@ -2780,7 +3000,7 @@ async function runPromoCampaignSend(target, confirmCountRaw, sentBy, via, limits
   }
   const confirmCount = Number(confirmCountRaw)
   if (!Number.isSafeInteger(confirmCount) || confirmCount < 0) {
-    return { status: 400, body: { ok: false, error: '발송 대상 수(confirmCount)가 필요합니다. 미리보기를 먼저 해주세요.' } }
+    return { status: 400, body: { ok: false, error: '보낼 대상을 먼저 확인해주세요.' } }
   }
   if (promoCampaignBusy.has(target.store.id)) {
     return { status: 409, body: { ok: false, reason: 'busy', error: '이 매장에 다른 발송이 진행 중입니다. 잠시 후 다시 시도해주세요.' } }
@@ -2796,7 +3016,7 @@ async function runPromoCampaignSend(target, confirmCountRaw, sentBy, via, limits
           ok: false,
           reason: 'count_changed',
           eligible: recipients.length,
-          error: `미리보기 이후 대상이 ${recipients.length}명으로 늘었습니다. 다시 확인한 뒤 보내주세요.`,
+          error: `대상을 확인한 뒤 ${recipients.length}명으로 늘었어요. 대상을 다시 확인한 뒤 보내주세요.`,
         },
       }
     }
@@ -2887,7 +3107,7 @@ app.get('/api/pos/promo-campaign/preview', posIpFloodLimiter, posQueueReadLimite
   return res.json(await buildPromoCampaignPreview({ store: req.store, ...period }, { filter: req.query.filter, offset: req.query.offset, limit: req.query.limit }))
 }))
 
-app.post('/api/pos/promo-campaign/send', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+app.post('/api/pos/promo-campaign/send', posIpFloodLimiter, requireStoreToken, posLimiter, asyncHandler(async (req, res) => {
   const period = resolvePromoCampaignPeriod(req.body)
   if (period.error) return res.status(period.error.status).json(period.error.body)
   const { status, body } = await runPromoCampaignSend({ store: req.store, ...period }, req.body?.confirmCount, null, 'pos', POS_PROMO_CAMPAIGN_LIMITS)
@@ -3105,10 +3325,10 @@ async function shortPosPaymentAmount(cart, reportedPaymentId, meta) {
   return null
 }
 
-app.post('/api/pos/erp-carts/:id/paid', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+app.post('/api/pos/erp-carts/:id/paid', posIpFloodLimiter, requireStoreToken, posLimiter, asyncHandler(async (req, res) => {
   const cart = await prisma.erpCart.findUnique({ where: { id: req.params.id } })
   if (!cart || cart.storeId !== req.store.id) {
-    return res.status(404).json({ ok: false, error: '장바구니를 찾을 수 없습니다.' })
+    return res.status(404).json({ ok: false, error: '주문을 찾을 수 없습니다.' })
   }
   const reportedPaymentId = req.body?.paymentId ? String(req.body.paymentId).slice(0, 200) : null
   const reportedOrderId = req.body?.orderId ? String(req.body.orderId).slice(0, 200) : null
@@ -3134,12 +3354,12 @@ app.post('/api/pos/erp-carts/:id/paid', posIpFloodLimiter, posLimiter, requireSt
     if (isSamePosPayment(row, reportedPaymentId)) {
       return res.json({ ok: true, alreadyProcessed: true, status: row.status })
     }
-    logger.error('[pos] 이미 결제된 주문에 다른 결제 통보가 왔습니다. 대사가 필요합니다', reportMeta(row))
+    logger.error('[pos] 이미 결제된 주문에 다른 결제 통보가 왔습니다. 대사가 필요합니다', { event: 'recon_needed', ...reportMeta(row) })
     return res.status(409).json({
       ok: false,
       code: 'ALREADY_PAID_OTHER',
       status: row.status,
-      error: '이 주문은 이미 다른 결제로 결제 완료됐습니다. 같은 주문을 두 번 결제했는지 [주문] 탭에서 확인해주세요.',
+      error: '이 주문은 이미 다른 결제로 결제 완료됐어요. 이중 결제인지 POS [주문] 탭에서 확인해주세요.',
     })
   }
 
@@ -3200,7 +3420,7 @@ app.post('/api/pos/erp-carts/:id/paid', posIpFloodLimiter, posLimiter, requireSt
       status: cart.status,
       paymentAmount: short.paymentAmount,
       cartAmount: short.cartAmount,
-      error: `고른 결제 금액(${short.paymentAmount.toLocaleString('ko-KR')}원)이 이 주문 금액(${short.cartAmount.toLocaleString('ko-KR')}원)보다 적습니다. 이 주문을 결제한 결제가 맞는지 [주문] 탭에서 확인해주세요.`,
+      error: `고른 결제 금액(${short.paymentAmount.toLocaleString('ko-KR')}원)이 이 주문 금액(${short.cartAmount.toLocaleString('ko-KR')}원)보다 적어요. 이 주문의 결제가 맞는지 POS [주문] 탭에서 확인해주세요.`,
     })
   }
 
@@ -3236,7 +3456,7 @@ app.post('/api/pos/erp-carts/:id/paid', posIpFloodLimiter, posLimiter, requireSt
     if (CLOSED_CART_STATUSES.includes(cart.status)) {
       // 이미 끝난 주문인데 POS에서는 돈이 나갔다는 통보가 왔다. 조용히 409만 돌려주면 결제된 사실이 우리 기록 어디에도
       // 남지 않으므로 크게 남긴다 -- 매장·토스 결제 ID로 대사해서 주문을 되살리거나 환불해야 한다.
-      logger.error('[pos] 결제 통보가 끝난 주문에 왔습니다. 대사가 필요합니다', { ...reportMeta(cart), paymentId: reportedPaymentId })
+      logger.error('[pos] 결제 통보가 끝난 주문에 왔습니다. 대사가 필요합니다', { event: 'recon_needed', ...reportMeta(cart), paymentId: reportedPaymentId })
       return res.status(409).json({
         ok: false, code: 'ALREADY_CLOSED', error: CLOSED_CART_PAID_ERROR, status: cart.status,
       })
@@ -3247,10 +3467,10 @@ app.post('/api/pos/erp-carts/:id/paid', posIpFloodLimiter, posLimiter, requireSt
     }
     if (cart.payTarget !== 'pos') {
       // 프론트 결제 건(대기·결제 중·담김)인데 POS에서 돈이 나갔다는 통보다. 프론트에서도 결제되면 두 번 받는다.
-      logger.error('[pos] 프론트 결제 주문에 POS 결제 통보가 왔습니다. 대사가 필요합니다', reportMeta(cart))
+      logger.error('[pos] 프론트 결제 주문에 POS 결제 통보가 왔습니다. 대사가 필요합니다', { event: 'recon_needed', ...reportMeta(cart) })
     }
     // 담기 전(pending)·담김(loaded)이 아니거나 프론트 결제 건은 POS 결제로 기록할 수 없다.
-    return res.status(409).json({ ok: false, error: '담기 전이거나 담긴 POS 결제 주문만 결제 완료로 기록할 수 있습니다.', status: cart.status })
+    return res.status(409).json({ ok: false, error: '아직 결제 전인 POS 결제 주문만 결제 완료로 기록할 수 있어요.', status: cart.status })
   }
 
   // 직원이 손으로 고른 결제도 금액을 본다(자동으로 맞춘 결제는 탭앱이 그 POS 주문에서 찾은 것이라 보지 않는다).
@@ -3268,14 +3488,14 @@ app.post('/api/pos/erp-carts/:id/paid', posIpFloodLimiter, posLimiter, requireSt
     const latest = await prisma.erpCart.findUnique({ where: { id: cart.id } })
     if (latest && PAID_LIKE_CART_STATUSES.includes(latest.status)) return respondPaidRow(latest)
     if (latest && [...CLOSED_CART_STATUSES, 'refunded'].includes(latest.status)) {
-      logger.error('[pos] 결제 통보가 끝난 주문에 왔습니다. 대사가 필요합니다', { ...reportMeta(latest), paymentId: reportedPaymentId })
+      logger.error('[pos] 결제 통보가 끝난 주문에 왔습니다. 대사가 필요합니다', { event: 'recon_needed', ...reportMeta(latest), paymentId: reportedPaymentId })
       return res.status(409).json({
         ok: false, code: 'ALREADY_CLOSED', error: CLOSED_CART_PAID_ERROR, status: latest.status,
       })
     }
     // 그 사이 프론트로 넘어갔다 등. POS에서 받은 돈을 이 주문에 기록하지 못했다.
-    logger.error('[pos] POS 결제 통보를 주문에 반영하지 못했습니다. 대사가 필요합니다', reportMeta(latest))
-    return res.status(409).json({ ok: false, error: '담기 전이거나 담긴 POS 결제 주문만 결제 완료로 기록할 수 있습니다.', status: latest?.status, payTarget: latest?.payTarget })
+    logger.error('[pos] POS 결제 통보를 주문에 반영하지 못했습니다. 대사가 필요합니다', { event: 'recon_needed', ...reportMeta(latest) })
+    return res.status(409).json({ ok: false, error: '아직 결제 전인 POS 결제 주문만 결제 완료로 기록할 수 있어요.', status: latest?.status, payTarget: latest?.payTarget })
   }
   if (cart.deletedAt) {
     logger.warn('[pos] 삭제했던 주문이 결제 완료로 확정되어 되살립니다', { storeId: req.store.id, cartId: cart.id, referenceId: cart.referenceId })
@@ -3298,8 +3518,8 @@ async function findOwnCart(req, res) {
 }
 
 // [최근 결제] 숨기기/다시 보이기. body: { hidden: true|false }
-app.post('/api/pos/erp-carts/:id/hide', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
-  if (typeof req.body?.hidden !== 'boolean') return res.status(400).json({ ok: false, error: 'hidden(true/false)이 필요합니다.' })
+app.post('/api/pos/erp-carts/:id/hide', posIpFloodLimiter, requireStoreToken, posLimiter, asyncHandler(async (req, res) => {
+  if (typeof req.body?.hidden !== 'boolean') return res.status(400).json({ ok: false, error: '요청 정보가 올바르지 않아요. 화면을 새로 고친 뒤 다시 시도해주세요.' })
   const cart = await findOwnCart(req, res)
   if (!cart) return
   const changed = await setErpCartHidden(req.store.id, cart.id, req.body.hidden)
@@ -3308,7 +3528,7 @@ app.post('/api/pos/erp-carts/:id/hide', posIpFloodLimiter, posLimiter, requireSt
 }))
 
 // [최근 결제] 삭제. 결제 완료·취소된 건만(취소 진행 중이면 409).
-app.post('/api/pos/erp-carts/:id/delete', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+app.post('/api/pos/erp-carts/:id/delete', posIpFloodLimiter, requireStoreToken, posLimiter, asyncHandler(async (req, res) => {
   const cart = await findOwnCart(req, res)
   if (!cart) return
   const changed = await softDeleteErpCart(req.store.id, cart.id)
@@ -3320,7 +3540,7 @@ app.post('/api/pos/erp-carts/:id/delete', posIpFloodLimiter, posLimiter, require
 }))
 
 // 프론트 결제 대기 주문 지우기. 손님이 아직 결제를 시작하지 않은(pending) 건만 -- 결제 중(paying)이면 409.
-app.post('/api/pos/erp-carts/:id/dismiss-front', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+app.post('/api/pos/erp-carts/:id/dismiss-front', posIpFloodLimiter, requireStoreToken, posLimiter, asyncHandler(async (req, res) => {
   const cart = await findOwnCart(req, res)
   if (!cart) return
   if (cart.payTarget !== 'front') return res.status(409).json({ ok: false, error: '프론트 결제 대기 주문이 아닙니다.' })
@@ -3335,7 +3555,7 @@ app.post('/api/pos/erp-carts/:id/dismiss-front', posIpFloodLimiter, posLimiter, 
 // 표시까지 사라졌고, 이중 결제였다면 본사가 화면에서 찾을 근거가 없어졌다. 확인한 경고는 관리자 웹에 '매장 확인함'으로 계속 보이고,
 // 탭앱은 접어서 보여준다. 확인한 뒤에는 전산 취소·만료가 그 주문을 닫을 수 있다. 확인한 사람·내용은 로그로도 남긴다.
 // (경로 이름은 옛 탭앱 호환으로 그대로 둔다.)
-app.post('/api/pos/erp-carts/:id/clear-front-orphan', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+app.post('/api/pos/erp-carts/:id/clear-front-orphan', posIpFloodLimiter, requireStoreToken, posLimiter, asyncHandler(async (req, res) => {
   const cart = await prisma.erpCart.findUnique({ where: { id: req.params.id } })
   if (!cart || cart.storeId !== req.store.id) {
     return res.status(404).json({ ok: false, error: '주문을 찾을 수 없습니다.' })
@@ -3362,7 +3582,7 @@ app.post('/api/pos/erp-carts/:id/clear-front-orphan', posIpFloodLimiter, posLimi
 // 주문이고, 흔적의 금액을 알면 주문 금액과 같아야 한다(다르면 409 AMOUNT_MISMATCH -- 다른 주문의 승인이거나 재전송으로 금액이 바뀌었다).
 // 결제 중(paying)·결제 완료 이후 상태는 409(다른 결제가 이미 붙어 있거나 붙는 중이다). 바꾼 뒤에는 프론트 결제 보고와 같은 처리를 한다
 // (토스 결제 기록과 잇기·웹훅 백업 기록 정리·예약 정비완료·영수증). 응답: { ok, status, wasStatus, reservationCompleted, receipt }
-app.post('/api/pos/erp-carts/:id/record-front-orphan', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+app.post('/api/pos/erp-carts/:id/record-front-orphan', posIpFloodLimiter, requireStoreToken, posLimiter, asyncHandler(async (req, res) => {
   const cart = await prisma.erpCart.findUnique({ where: { id: req.params.id } })
   if (!cart || cart.storeId !== req.store.id) {
     return res.status(404).json({ ok: false, error: '주문을 찾을 수 없습니다.' })
@@ -3376,7 +3596,7 @@ app.post('/api/pos/erp-carts/:id/record-front-orphan', posIpFloodLimiter, posLim
   if (!FRONT_ORPHAN_RECORDABLE_STATUSES.includes(cart.status)) {
     return res.status(409).json({
       ok: false, code: 'NOT_RECORDABLE', status: cart.status, frontOrphan: frontOrphanOf(cart),
-      error: '결제 중이거나 이미 결제·취소된 주문이라 이 승인으로 결제 완료를 기록할 수 없습니다. 토스 결제내역에서 확인해 한쪽을 환불해주세요.',
+      error: '결제 중이거나 이미 결제·취소된 주문이라 이 승인으로 결제 완료를 기록할 수 없어요. 토스 결제내역에서 확인해 한쪽 결제를 취소해주세요.',
     })
   }
   if (cart.frontOrphanAmount !== null && cart.frontOrphanAmount !== cart.totalAmount) {
@@ -3421,7 +3641,7 @@ app.post('/api/pos/erp-carts/:id/record-front-orphan', posIpFloodLimiter, posLim
 }))
 
 // 정비 이력에서 한 방문 숨기기. body: { reservationId } 또는 { cartId }
-app.post('/api/pos/history/hide', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+app.post('/api/pos/history/hide', posIpFloodLimiter, requireStoreToken, posLimiter, asyncHandler(async (req, res) => {
   const reservationId = req.body?.reservationId ? String(req.body.reservationId) : null
   const cartId = req.body?.cartId ? String(req.body.cartId) : null
   if (!reservationId && !cartId) return res.status(400).json({ ok: false, error: '숨길 방문이 없습니다.' })
@@ -3431,7 +3651,7 @@ app.post('/api/pos/history/hide', posIpFloodLimiter, posLimiter, requireStoreTok
 }))
 
 // 정비 이력에서 한 방문 삭제(이어진 결제 기록도 함께). body: { reservationId } 또는 { cartId }
-app.post('/api/pos/history/delete', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+app.post('/api/pos/history/delete', posIpFloodLimiter, requireStoreToken, posLimiter, asyncHandler(async (req, res) => {
   const reservationId = req.body?.reservationId ? String(req.body.reservationId) : null
   const cartId = req.body?.cartId ? String(req.body.cartId) : null
   if (!reservationId && !cartId) return res.status(400).json({ ok: false, error: '삭제할 방문이 없습니다.' })
@@ -3452,13 +3672,13 @@ async function resendErpCartReceipt(cart, storeName) {
   const messages = {
     sent: '영수증을 보냈습니다.',
     failed: '영수증 발송에 실패했습니다. 잠시 후 다시 시도해주세요.',
-    no_reservation: '예약과 이어지지 않아 손님 번호를 모릅니다(같은 차량번호로 오늘 예약이 1건이어야 합니다).',
-    no_phone: '예약에 연락처가 없습니다.',
+    no_reservation: '접수 내역과 연결되지 않아 손님 번호를 알 수 없어요. (오늘 같은 차량번호로 접수한 건이 1건일 때만 연결돼요.)',
+    no_phone: '접수 내역에 연락처가 없어요.',
   }
   return { status: receipt === 'sent' ? 200 : 409, body: { ok: receipt === 'sent', receipt, error: receipt === 'sent' ? undefined : messages[receipt], message: messages[receipt] } }
 }
 
-app.post('/api/pos/erp-carts/:id/resend-receipt', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+app.post('/api/pos/erp-carts/:id/resend-receipt', posIpFloodLimiter, requireStoreToken, posLimiter, asyncHandler(async (req, res) => {
   const cart = await findOwnCart(req, res)
   if (!cart) return
   const { status, body } = await resendErpCartReceipt(cart, req.store.name)
@@ -3474,13 +3694,13 @@ app.post('/api/admin/erp-carts/:id/resend-receipt', requireAuth, asyncHandler(as
   return res.status(status).json(body)
 }))
 
-// 정비 완료 안내 다시 보내기(탭앱 정비 이력). 정비완료된 예약만.
-app.post('/api/pos/queue/:id/resend-done', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+// 정비 완료 안내 다시 보내기(탭앱 정비 이력). 정비완료된 접수만.
+app.post('/api/pos/queue/:id/resend-done', posIpFloodLimiter, requireStoreToken, posLimiter, asyncHandler(async (req, res) => {
   const reservation = await prisma.reservation.findUnique({ where: { id: req.params.id }, include: { store: true } })
   if (!reservation || reservation.storeId !== req.store.id || reservation.anonymizedAt) {
-    return res.status(404).json({ ok: false, error: '예약을 찾을 수 없습니다.' })
+    return res.status(404).json({ ok: false, error: '접수 내역을 찾을 수 없어요.' })
   }
-  if (reservation.status !== 'completed') return res.status(409).json({ ok: false, error: '정비완료된 예약만 완료 문자를 보낼 수 있습니다.' })
+  if (reservation.status !== 'completed') return res.status(409).json({ ok: false, error: '정비가 끝난 접수만 완료 문자를 보낼 수 있어요.' })
   const notified = await notifyRepairDone(reservation)
   if (!notified) return res.status(502).json({ ok: false, notified, error: '완료 문자를 보내지 못했습니다. 잠시 후 다시 시도해주세요.' })
   return res.json({ ok: true, notified })
@@ -3596,7 +3816,7 @@ function frontRefundParams(cart) {
 // POS 탭앱 [프론트로 결제 요청]. 전산이 POS로 보낸 주문을, 담기 전에 프론트 결제로 돌린다.
 // 손님이 프론트 앞에 왔을 때 직원이 넘기는 흐름이다(전산이 처음부터 payTarget:'front'로 보내는
 // 경로와 결과는 같다).
-app.post('/api/pos/erp-carts/:id/send-to-front', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+app.post('/api/pos/erp-carts/:id/send-to-front', posIpFloodLimiter, requireStoreToken, posLimiter, asyncHandler(async (req, res) => {
   const cart = await prisma.erpCart.findUnique({ where: { id: req.params.id } })
   if (!cart || cart.storeId !== req.store.id) {
     return res.status(404).json({ ok: false, error: '주문을 찾을 수 없습니다.' })
@@ -3614,8 +3834,29 @@ app.post('/api/pos/erp-carts/:id/send-to-front', posIpFloodLimiter, posLimiter, 
   return res.json({ ok: true, alreadyProcessed: false, status: 'pending', payTarget: 'front' })
 }))
 
+// POS 탭앱 [프론트에 다시 띄우기]. 손님이 결제창을 놓쳐 프론트가 그 주문을 2분 동안 쉬고 있을 때, frontSentAt을 지금으로 바꿔
+// 프론트가 바로 다시 띄우게 한다(store.bumpErpCartFrontSentAt). 프론트 결제 대기(pending)인 건만 -- 그 밖은 409와 지금 상태.
+app.post('/api/pos/erp-carts/:id/resend-front', posIpFloodLimiter, requireStoreToken, posLimiter, asyncHandler(async (req, res) => {
+  const cart = await prisma.erpCart.findUnique({ where: { id: req.params.id } })
+  if (!cart || cart.storeId !== req.store.id || cart.deletedAt) {
+    return res.status(404).json({ ok: false, error: '주문을 찾을 수 없습니다.' })
+  }
+  const frontSentAt = await bumpErpCartFrontSentAt(cart.id, req.store.id)
+  if (!frontSentAt) {
+    const latest = await prisma.erpCart.findUnique({ where: { id: cart.id } })
+    const error = latest?.payTarget !== 'front'
+      ? '프론트 결제 대기 주문이 아니에요.'
+      : latest?.status === 'paying'
+        ? '손님이 프론트에서 결제 중이에요.'
+        : '이미 결제가 진행됐거나 끝난 주문이에요.'
+    return res.status(409).json({ ok: false, error, status: latest?.status ?? null, payTarget: latest?.payTarget ?? null })
+  }
+  logger.info('[pos] 프론트 결제 대기 주문을 프론트에 다시 띄움', { storeId: req.store.id, cartId: cart.id })
+  return res.json({ ok: true, status: 'pending', payTarget: 'front', frontSentAt })
+}))
+
 // POS 탭앱 [POS로 되돌리기]. 프론트가 아직 결제를 시작하지 않은 건만 되돌린다.
-app.post('/api/pos/erp-carts/:id/return-to-pos', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+app.post('/api/pos/erp-carts/:id/return-to-pos', posIpFloodLimiter, requireStoreToken, posLimiter, asyncHandler(async (req, res) => {
   const cart = await prisma.erpCart.findUnique({ where: { id: req.params.id } })
   if (!cart || cart.storeId !== req.store.id) {
     return res.status(404).json({ ok: false, error: '주문을 찾을 수 없습니다.' })
@@ -3628,7 +3869,7 @@ app.post('/api/pos/erp-carts/:id/return-to-pos', posIpFloodLimiter, posLimiter, 
     const latest = await prisma.erpCart.findUnique({ where: { id: cart.id } })
     const error = latest?.status === 'paying'
       ? '손님이 프론트에서 결제 중입니다. 끝나거나 취소된 뒤에 다시 시도해주세요.'
-      : '되돌릴 수 없는 주문입니다.'
+      : '이미 결제가 진행됐거나 끝난 주문이라 POS로 되돌릴 수 없어요.'
     return res.status(409).json({ ok: false, error, status: latest?.status, payTarget: latest?.payTarget })
   }
   return res.json({ ok: true, alreadyProcessed: false, status: 'pending', payTarget: 'pos' })
@@ -3643,7 +3884,7 @@ app.post('/api/pos/erp-carts/:id/return-to-pos', posIpFloodLimiter, posLimiter, 
 //   - 현금영수증 없는 현금: 토스 쪽에 취소할 대상이 없다. 현금을 돌려주고 /refunded(method:'cash')로 기록만 한다.
 // 어느 경우든 토스 취소 웹훅이 오면 그쪽이 최종 근거로 refunded를 확정한다(markErpCartsRefundedByToss).
 
-app.post('/api/pos/erp-carts/:id/refund-request', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+app.post('/api/pos/erp-carts/:id/refund-request', posIpFloodLimiter, requireStoreToken, posLimiter, asyncHandler(async (req, res) => {
   const cart = await prisma.erpCart.findUnique({ where: { id: req.params.id } })
   if (!cart || cart.storeId !== req.store.id) {
     return res.status(404).json({ ok: false, error: '주문을 찾을 수 없습니다.' })
@@ -3665,7 +3906,7 @@ app.post('/api/pos/erp-carts/:id/refund-request', posIpFloodLimiter, posLimiter,
   return res.json({ ok: true, alreadyProcessed: false, status: 'refund_requested' })
 }))
 
-app.post('/api/pos/erp-carts/:id/refund-withdraw', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+app.post('/api/pos/erp-carts/:id/refund-withdraw', posIpFloodLimiter, requireStoreToken, posLimiter, asyncHandler(async (req, res) => {
   const cart = await prisma.erpCart.findUnique({ where: { id: req.params.id } })
   if (!cart || cart.storeId !== req.store.id) {
     return res.status(404).json({ ok: false, error: '주문을 찾을 수 없습니다.' })
@@ -3686,12 +3927,12 @@ app.post('/api/pos/erp-carts/:id/refund-withdraw', posIpFloodLimiter, posLimiter
 // body.paymentId(method 'pos', 선택): 탭앱이 취소한 결제(카드에 보이던 tossPaymentId). 그 사이 이 주문이 다른 결제로 바뀌었으면
 // (취소 후 재결제 복원 등) 409 PAYMENT_CHANGED로 거절한다 -- 옛 결제 P의 취소 기록이 새 결제 P2로 받은 주문을 환불로 바꾸면,
 // 받은 돈이 전산에 환불로 고정되고 되살릴 길이 없다. 안 보내는 옛 탭앱은 예전처럼 읽은 그 결제 ID로만 취소한다.
-const PAYMENT_CHANGED_ERROR = '그 사이 이 주문이 다른 결제로 바뀌었습니다. 화면을 새로 고친 뒤 [주문] 탭에서 어느 결제를 취소했는지 확인해주세요.'
+const PAYMENT_CHANGED_ERROR = '그 사이 이 주문이 다른 결제로 바뀌었어요. 화면을 새로 고친 뒤 POS [주문] 탭에서 어느 결제를 취소했는지 확인해주세요.'
 
-app.post('/api/pos/erp-carts/:id/refunded', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+app.post('/api/pos/erp-carts/:id/refunded', posIpFloodLimiter, requireStoreToken, posLimiter, asyncHandler(async (req, res) => {
   const method = req.body?.method
   if (method !== 'pos' && method !== 'cash') {
-    return res.status(400).json({ ok: false, error: "method는 'pos' 또는 'cash'여야 합니다." })
+    return res.status(400).json({ ok: false, error: '요청 정보가 올바르지 않아요. 화면을 새로 고친 뒤 다시 시도해주세요.' })
   }
   const cart = await prisma.erpCart.findUnique({ where: { id: req.params.id } })
   if (!cart || cart.storeId !== req.store.id) {
@@ -3749,7 +3990,7 @@ app.post('/api/pos/erp-carts/:id/refunded', posIpFloodLimiter, posLimiter, requi
 //     늦은 'paid' 보고는 아직 아무도 주문을 다시 잡지 않았으면(프론트 대기 pending) 결제 완료로 받고, 그 밖(POS로 되돌림·다시
 //     결제됨·지움 등)이면 logger.error(대사 필요)와 409 PAID_AFTER_RELEASE로 남긴다(/result 참고).
 //   - 취소 중: paid로 풀고 그 시도를 묘비 목록(refundReleasedAttemptId)에 더한다. 카드 취소가 실제로 끝났다면 토스 취소 웹훅이 refunded로 맞춘다.
-app.post('/api/pos/erp-carts/:id/force-release', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+app.post('/api/pos/erp-carts/:id/force-release', posIpFloodLimiter, requireStoreToken, posLimiter, asyncHandler(async (req, res) => {
   const cart = await prisma.erpCart.findUnique({ where: { id: req.params.id } })
   if (!cart || cart.storeId !== req.store.id) {
     return res.status(404).json({ ok: false, error: '주문을 찾을 수 없습니다.' })
@@ -3770,8 +4011,8 @@ app.post('/api/pos/erp-carts/:id/force-release', posIpFloodLimiter, posLimiter, 
   }
 
   const released = cart.status === 'paying'
-    ? await forceReleaseErpCartFrontPaying(cart.id, req.store.id, cart.frontPaymentKey, '프론트 결제 상태를 직원이 풀었음')
-    : await forceReleaseErpCartRefunding(cart.id, req.store.id, cart.refundAttemptId, '프론트 취소 상태를 직원이 풀었음')
+    ? await forceReleaseErpCartFrontPaying(cart.id, req.store.id, cart.frontPaymentKey, '프론트 결제 중 상태를 직원이 풀었어요')
+    : await forceReleaseErpCartRefunding(cart.id, req.store.id, cart.refundAttemptId, '프론트 결제 취소 중 상태를 직원이 풀었어요')
   if (!released) {
     // 읽은 뒤 프론트가 결과를 보고했거나 다른 시도로 바뀌었다 -- 푸는 대신 최신 상태를 알려준다.
     const latest = await prisma.erpCart.findUnique({ where: { id: cart.id } })
@@ -3786,6 +4027,10 @@ app.post('/api/pos/erp-carts/:id/force-release', posIpFloodLimiter, posLimiter, 
 }))
 
 // 프론트 대기화면이 몇 초마다 부른다. POS 폴링과 같은 한도(매장 토큰 기준)를 쓴다.
+// pollMs: 프론트가 다음 조회까지 기다릴 간격(ms). 400대에 ZIP을 다시 배포하지 않고 서버 배포만으로 간격을 바꿀 수 있게 미리 심어 둔다
+// (프론트는 2초~30초로 잘라 쓰고, 이 필드가 없으면 3초). 지금은 예전과 같은 3초라 동작이 바뀌지 않는다.
+const FRONT_POLL_MS = 3000
+
 app.get('/api/front/erp-carts', posIpFloodLimiter, posQueueReadLimiter, requireStoreToken, asyncHandler(async (req, res) => {
   noteDeviceSeen(req.store.id, 'front')
   const [carts, refundRows] = await Promise.all([
@@ -3806,15 +4051,15 @@ app.get('/api/front/erp-carts', posIpFloodLimiter, posQueueReadLimiter, requireS
     requestedAt: row.refundRequestedAt || null, // 다시 요청한 취소는 프론트가 쉬는 중이어도 바로 띄운다
     refund: frontRefundParams(row),
   }))
-  return res.json({ ok: true, storeName: req.store.name, carts, refunds })
+  return res.json({ ok: true, storeName: req.store.name, carts, refunds, pollMs: FRONT_POLL_MS })
 }))
 
 // 프론트가 결제 취소창을 띄우기 직전에 부른다(두 대가 같은 건을 동시에 취소하지 않게 잡는다).
 // body.attemptId(선택): 프론트가 취소창을 띄울 때마다 새로 만든 시도 구분자. refund-result에 같은 값을 돌려보낸다.
-app.post('/api/front/erp-carts/:id/refund-start', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+app.post('/api/front/erp-carts/:id/refund-start', posIpFloodLimiter, requireStoreToken, posLimiter, asyncHandler(async (req, res) => {
   const attemptId = parseAttemptId(req.body?.attemptId)
   if (attemptId === false) {
-    return res.status(400).json({ ok: false, error: 'attemptId는 8~64자의 영문/숫자/하이픈/밑줄이어야 합니다.' })
+    return res.status(400).json({ ok: false, error: '요청 정보가 올바르지 않아요. 화면을 새로 고친 뒤 다시 시도해주세요.' })
   }
   const cart = await prisma.erpCart.findUnique({ where: { id: req.params.id } })
   if (!cart || cart.storeId !== req.store.id || cart.payTarget !== 'front') {
@@ -3824,12 +4069,12 @@ app.post('/api/front/erp-carts/:id/refund-start', posIpFloodLimiter, posLimiter,
     // 프론트가 이 시도는 포기했다고 이미 알렸는데(시간 초과 뒤 refund-result) 이 start가 늦게 도착했다. 받아주면 프론트는
     // 취소창을 접었는데 서버만 refunding으로 잡혀 직원이 풀 때까지 갇힌다. (읽은 뒤 끼어든 포기 보고는 markErpCartRefunding이
     // 전이와 함께 다시 확인해 거절한다.)
-    return res.status(409).json({ ok: false, error: '이미 중단된 취소 시도입니다.', stale: true, status: cart.status })
+    return res.status(409).json({ ok: false, error: '중단된 결제 취소예요. 처음부터 다시 시도해주세요.', stale: true, status: cart.status })
   }
   if (cart.status === 'refunding') {
     if (attemptId && cart.refundAttemptId && cart.refundAttemptId !== attemptId) {
       // 다른 시도가 취소를 쥐고 있다. 그 정보를 나눠주면 두 곳에서 같은 결제를 취소하려 든다.
-      return res.status(409).json({ ok: false, error: '다른 프론트에서 취소가 진행 중입니다.', status: 'refunding' })
+      return res.status(409).json({ ok: false, error: '다른 단말기에서 결제 취소가 진행 중이에요.', status: 'refunding' })
     }
     // 같은 프론트가 재시도했다. 취소 정보를 다시 돌려준다.
     return res.json({ ok: true, alreadyProcessed: true, id: cart.id, refund: frontRefundParams(cart) })
@@ -3839,25 +4084,26 @@ app.post('/api/front/erp-carts/:id/refund-start', posIpFloodLimiter, posLimiter,
     const latest = await prisma.erpCart.findUnique({ where: { id: cart.id } })
     if (isReleasedToken(latest?.refundReleasedAttemptId, attemptId)) {
       // 읽은 직후 같은 시도의 포기 보고가 먼저 처리됐다.
-      return res.status(409).json({ ok: false, error: '이미 중단된 취소 시도입니다.', stale: true, status: latest.status })
+      return res.status(409).json({ ok: false, error: '중단된 결제 취소예요. 처음부터 다시 시도해주세요.', stale: true, status: latest.status })
     }
-    return res.status(409).json({ ok: false, error: '취소할 수 없는 주문입니다.', status: latest?.status })
+    return res.status(409).json({ ok: false, error: '이미 취소됐거나 결제 전인 주문이라 결제 취소를 할 수 없어요.', status: latest?.status })
   }
   return res.json({ ok: true, alreadyProcessed: false, id: cart.id, refund: frontRefundParams(cart) })
 }))
 
-// 풀린 취소 시도의 늦은 완료 보고를 환불로 받을 때 남기는 refundNote(관리자 웹·탭앱에 보인다)
-const FRONT_REFUND_AFTER_RELEASE_NOTE = '프론트에서 결제 취소(풀린 뒤 보고)'
+// 풀린 취소 시도의 늦은 완료 보고를 환불로 받을 때 남기는 refundNote(관리자 웹·탭앱에 보인다). 화면 표시용 문구일 뿐 조회 조건으로
+// 쓰지 않는다(2026-10-23 문구를 바꿨다 -- 그 전 행에는 '프론트에서 결제 취소(풀린 뒤 보고)'가 남아 있다).
+const FRONT_REFUND_AFTER_RELEASE_NOTE = '프론트에서 결제 취소(늦게 확인됨)'
 
 // 프론트 결제 취소 결과. result: 'refunded' | 'failed' | 'cancelled'(손님이 취소창을 닫음)
-app.post('/api/front/erp-carts/:id/refund-result', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+app.post('/api/front/erp-carts/:id/refund-result', posIpFloodLimiter, requireStoreToken, posLimiter, asyncHandler(async (req, res) => {
   const result = req.body?.result
   if (result !== 'refunded' && result !== 'failed' && result !== 'cancelled') {
-    return res.status(400).json({ ok: false, error: "result는 'refunded', 'failed', 'cancelled' 중 하나여야 합니다." })
+    return res.status(400).json({ ok: false, error: '요청 정보가 올바르지 않아요. 화면을 새로 고친 뒤 다시 시도해주세요.' })
   }
   const attemptId = parseAttemptId(req.body?.attemptId)
   if (attemptId === false) {
-    return res.status(400).json({ ok: false, error: 'attemptId는 8~64자의 영문/숫자/하이픈/밑줄이어야 합니다.' })
+    return res.status(400).json({ ok: false, error: '요청 정보가 올바르지 않아요. 화면을 새로 고친 뒤 다시 시도해주세요.' })
   }
   const cart = await prisma.erpCart.findUnique({ where: { id: req.params.id } })
   if (!cart || cart.storeId !== req.store.id || cart.payTarget !== 'front') {
@@ -3873,6 +4119,7 @@ app.post('/api/front/erp-carts/:id/refund-result', posIpFloodLimiter, posLimiter
     if (result === 'refunded') {
       // 다른 시도의 취소가 실제로 성공했을 수 있다(카드는 이미 취소). 상태는 토스 취소 웹훅이 맞추지만 사람이 볼 수 있게 남긴다.
       logger.error('[front] 다른 시도의 결제 취소 완료 보고가 와서 거절했습니다. 토스 취소 내역과 대사가 필요합니다.', {
+        event: 'recon_needed',
         cartId: cart.id, status: cart.status, attemptId, currentAttemptId: cart.refundAttemptId,
       })
     } else {
@@ -3880,7 +4127,7 @@ app.post('/api/front/erp-carts/:id/refund-result', posIpFloodLimiter, posLimiter
       // 늦은 refund-start가 그 취소를 가로채지 못하게 한다(지금 쥐고 있는 시도는 목록을 보지 않으므로 막지 않는다).
       await markErpCartRefundAttemptReleased(cart.id, attemptId)
     }
-    return res.status(409).json({ ok: false, error: '지금 진행 중인 취소 시도의 보고가 아닙니다.', stale: true, status: cart.status })
+    return res.status(409).json({ ok: false, error: '이미 다른 결제 취소 처리로 바뀌었어요. 직원에게 확인해주세요.', stale: true, status: cart.status })
   }
 
   if (result === 'refunded') {
@@ -3898,8 +4145,8 @@ app.post('/api/front/erp-carts/:id/refund-result', posIpFloodLimiter, posLimiter
     }
     if (!changed) {
       // 손님 돈은 돌려줬는데 상태가 맞지 않는다 -- 대사가 필요하므로 크게 남긴다.
-      logger.error('[front] 결제 취소 완료 보고를 반영하지 못했습니다. 확인이 필요합니다.', { cartId: cart.id, status: cart.status })
-      return res.status(409).json({ ok: false, error: '주문 상태가 맞지 않아 취소를 기록하지 못했습니다.', status: cart.status })
+      logger.error('[front] 결제 취소 완료 보고를 반영하지 못했습니다. 확인이 필요합니다.', { event: 'recon_needed', cartId: cart.id, status: cart.status })
+      return res.status(409).json({ ok: false, error: '주문 상태가 바뀌어 결제 취소를 기록하지 못했어요. 직원에게 알려주세요.', status: cart.status })
     }
     return res.json({ ok: true, alreadyProcessed: false, status: 'refunded' })
   }
@@ -3927,15 +4174,15 @@ app.post('/api/front/erp-carts/:id/refund-result', posIpFloodLimiter, posLimiter
   if (latest?.status === 'refund_requested' || latest?.status === 'paid') {
     return res.json({ ok: true, alreadyProcessed: true, status: latest.status })
   }
-  return res.status(409).json({ ok: false, error: '주문 상태가 맞지 않습니다.', status: latest?.status })
+  return res.status(409).json({ ok: false, error: '주문 상태가 바뀌었어요. 직원에게 확인해주세요.', status: latest?.status })
 }))
 
 // 결제창을 띄우기 직전에 부른다. 이 주문을 이 프론트가 잡았다는 표시(paying)와 paymentKey를 남기고,
 // 결제할 금액을 서버 기준으로 돌려준다.
-app.post('/api/front/erp-carts/:id/start', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+app.post('/api/front/erp-carts/:id/start', posIpFloodLimiter, requireStoreToken, posLimiter, asyncHandler(async (req, res) => {
   const paymentKey = String(req.body?.paymentKey ?? '').trim()
   if (!FRONT_PAYMENT_KEY_RE.test(paymentKey)) {
-    return res.status(400).json({ ok: false, error: 'paymentKey는 8~64자의 영문/숫자/하이픈/밑줄이어야 합니다.' })
+    return res.status(400).json({ ok: false, error: '결제 요청 정보가 올바르지 않아요. 직원에게 문의해주세요.' })
   }
 
   const cart = await prisma.erpCart.findUnique({ where: { id: req.params.id } })
@@ -3943,7 +4190,7 @@ app.post('/api/front/erp-carts/:id/start', posIpFloodLimiter, posLimiter, requir
     return res.status(404).json({ ok: false, error: '주문을 찾을 수 없습니다.' })
   }
   if (cart.status !== 'pending') {
-    return res.status(409).json({ ok: false, error: '결제할 수 없는 주문입니다(이미 결제 중이거나 끝났습니다).', status: cart.status })
+    return res.status(409).json({ ok: false, error: '이미 결제 중이거나 결제가 끝난 주문이에요.', status: cart.status })
   }
   // 이미 승인됐는데 반영하지 못한 결제가 있는 주문(확인 전)은 결제창을 띄우지 않는다(markErpCartFrontPaying 주석).
   const orphanBlock = (row) => (row?.frontOrphanAt && !row.frontOrphanAckAt
@@ -3957,7 +4204,7 @@ app.post('/api/front/erp-carts/:id/start', posIpFloodLimiter, posLimiter, requir
   } catch (e) {
     // paymentKey unique 충돌 -- 프론트가 같은 키를 다른 주문에 재사용했다.
     if (e?.code === 'P2002') {
-      return res.status(409).json({ ok: false, error: '이미 사용한 paymentKey입니다. 새 값으로 다시 시도해주세요.' })
+      return res.status(409).json({ ok: false, error: '이미 처리된 결제 요청이에요. 처음 화면으로 돌아가 다시 시도해주세요.' })
     }
     throw e
   }
@@ -3966,10 +4213,10 @@ app.post('/api/front/erp-carts/:id/start', posIpFloodLimiter, posLimiter, requir
     // 알려(묘비 목록 frontReleasedKey) 늦게 도착한 start가 거절된 경우다.
     const latest = await prisma.erpCart.findUnique({ where: { id: cart.id } })
     if (isReleasedToken(latest?.frontReleasedKey, paymentKey)) {
-      return res.status(409).json({ ok: false, error: '이미 중단된 결제 시도입니다. 새 paymentKey로 다시 시도해주세요.', stale: true, status: latest.status })
+      return res.status(409).json({ ok: false, error: '중단된 결제예요. 처음 화면으로 돌아가 다시 시도해주세요.', stale: true, status: latest.status })
     }
     if (orphanBlock(latest)) return
-    return res.status(409).json({ ok: false, error: '결제할 수 없는 주문입니다(이미 결제 중이거나 끝났습니다).', status: latest?.status })
+    return res.status(409).json({ ok: false, error: '이미 결제 중이거나 결제가 끝난 주문이에요.', status: latest?.status })
   }
 
   return res.json({
@@ -3988,7 +4235,10 @@ app.post('/api/front/erp-carts/:id/start', posIpFloodLimiter, posLimiter, requir
 // 반환: sent | failed | no_reservation | no_phone (ErpCart.receiptStatus에도 남겨 관리자 웹에 보인다)
 async function sendErpCartReceipt(cart, storeName) {
   const status = await sendErpCartReceiptInner(cart, storeName)
-  await prisma.erpCart.update({ where: { id: cart.id }, data: { receiptStatus: status } }).catch(() => {})
+  // 결과 기록이 실패해도 발송 결과(응답)는 그대로 돌려준다. 다만 조용히 버리면 관리자 웹에 영수증 상태가 비어 "안 보냈나?"를 되짚을 수 없다.
+  await prisma.erpCart.update({ where: { id: cart.id }, data: { receiptStatus: status } }).catch((e) => {
+    logger.warn('[erp-cart] 영수증 발송 결과를 주문에 기록하지 못함', { cartId: cart.id, receipt: status, error: e.message })
+  })
   return status
 }
 
@@ -4093,14 +4343,14 @@ async function settleFrontPaidCart(cart, { approvalNo, paymentMethod }, storeNam
 }
 
 // 결제 결과 보고. result: 'paid' | 'cancelled' | 'failed'.
-app.post('/api/front/erp-carts/:id/result', posIpFloodLimiter, posLimiter, requireStoreToken, asyncHandler(async (req, res) => {
+app.post('/api/front/erp-carts/:id/result', posIpFloodLimiter, requireStoreToken, posLimiter, asyncHandler(async (req, res) => {
   const result = req.body?.result
   if (result !== 'paid' && result !== 'cancelled' && result !== 'failed') {
-    return res.status(400).json({ ok: false, error: "result는 'paid', 'cancelled', 'failed' 중 하나여야 합니다." })
+    return res.status(400).json({ ok: false, error: '요청 정보가 올바르지 않아요. 화면을 새로 고친 뒤 다시 시도해주세요.' })
   }
   const paymentKey = String(req.body?.paymentKey ?? '').trim()
   if (!FRONT_PAYMENT_KEY_RE.test(paymentKey)) {
-    return res.status(400).json({ ok: false, error: 'paymentKey가 올바르지 않습니다.' })
+    return res.status(400).json({ ok: false, error: '결제 요청 정보가 올바르지 않아요. 직원에게 문의해주세요.' })
   }
 
   // 다른 매장 주문·없는 주문은 404. 프론트 결제 건이 아니게 된 주문(POS로 되돌림)도 예전에는 404였는데, 'paid' 보고라면
@@ -4140,6 +4390,7 @@ app.post('/api/front/erp-carts/:id/result', posIpFloodLimiter, posLimiter, requi
       // 대신 "직원 확인 필요"를 띄우고 같은 주문의 결제를 다시 시작하지 않게 한다.
       const orphanAmount = reportedFrontAmount(req.body) ?? cart.totalAmount
       logger.error('[front] 결제가 승인됐지만 주문에 반영하지 못함. 대사 필요', {
+        event: 'recon_needed',
         cartId: cart.id,
         status: latest?.status ?? null,
         payTarget: latest?.payTarget ?? null,
@@ -4160,7 +4411,7 @@ app.post('/api/front/erp-carts/:id/result', posIpFloodLimiter, posLimiter, requi
         ok: false,
         code: 'PAID_AFTER_RELEASE',
         status: latest?.status ?? null,
-        error: '결제는 승인됐지만 주문 상태가 맞지 않아 결제 완료로 기록하지 못했습니다. 직원 확인이 필요합니다.',
+        error: '결제는 승인됐지만 주문에 반영하지 못했어요. 직원에게 알려주세요.',
       })
     }
     if (afterRelease) {
@@ -4215,7 +4466,7 @@ app.post('/api/front/erp-carts/:id/result', posIpFloodLimiter, posLimiter, requi
   }
   const latest = await prisma.erpCart.findUnique({ where: { id: cart.id }, select: { status: true } })
   if (latest?.status === 'pending') return res.json({ ok: true, alreadyProcessed: true, status: 'pending' })
-  return res.status(409).json({ ok: false, error: '주문 상태가 맞지 않습니다.', status: latest?.status })
+  return res.status(409).json({ ok: false, error: '주문 상태가 바뀌었어요. 직원에게 확인해주세요.', status: latest?.status })
 }))
 
 // --- 쉐보레 전산(ERP) "물건 담기" -> POS 플러그인 장바구니 중계 (POS-CART-BRIDGE §1) ---
@@ -4249,12 +4500,23 @@ function businessNumberCandidates(raw) {
 }
 
 // 반환: { store } | { error: {status, body} }
+// 코드로 찾은 매장의 사업자번호와 전산이 함께 보낸 사업자번호가 다르면 erp_store_mismatch 경고만 남긴다(아직 거절하지 않는다) --
+// 전산 쪽 코드 매핑이 틀려 남의 매장으로 주문이 가고 있을 수 있다. 양쪽에 값이 다 있을 때만 비교한다.
 async function resolveErpStore(storeCode, rawBusinessNumber) {
   const byCode = await findStoreByErpCode(storeCode)
-  if (byCode) return { store: byCode }
+  if (byCode) {
+    const sent = businessNumberCandidates(rawBusinessNumber)
+    const stored = String(byCode.businessNumber || '').replace(/\D/g, '')
+    if (sent && stored && sent[0] !== stored) {
+      logger.warn('[erp] 전산 코드로 찾은 매장과 사업자번호가 다릅니다(주문은 그대로 받음)', {
+        event: 'erp_store_mismatch', storeCode, storeId: byCode.id,
+      })
+    }
+    return { store: byCode }
+  }
 
   if (rawBusinessNumber === undefined || rawBusinessNumber === null || String(rawBusinessNumber).trim() === '') {
-    return { error: { status: 404, body: { ok: false, error: '등록되지 않은 매장 코드입니다.' } } }
+    return { error: { status: 404, body: { ok: false, error: '등록되지 않은 전산 코드예요.' } } }
   }
 
   // 여기서부터는 storeCode를 **DB에 새로 저장**하는 경로다. 관리자 웹(POST .../erp-code)은 형식을
@@ -4272,20 +4534,20 @@ async function resolveErpStore(storeCode, rawBusinessNumber) {
 
   const matches = await findStoresByBusinessNumbers(candidates)
   if (matches.length === 0) {
-    return { error: { status: 404, body: { ok: false, error: '등록되지 않은 매장 코드입니다.' } } }
+    return { error: { status: 404, body: { ok: false, error: '등록되지 않은 전산 코드예요.' } } }
   }
   if (matches.length > 1) {
     // 같은 사업자번호를 여러 매장이 쓰고 있으면 어느 쪽인지 우리가 정할 수 없다.
     logger.error('[erp] 사업자번호가 여러 매장과 일치해 자동 연결을 중단합니다.', {
       storeCode, matched: matches.map((m) => m.id),
     })
-    return { error: { status: 409, body: { ok: false, error: '사업자번호가 여러 매장과 일치합니다. 본사에 매장 코드 등록을 요청해주세요.' } } }
+    return { error: { status: 409, body: { ok: false, error: '사업자번호가 여러 매장과 일치해요. 본사에 전산 코드 등록을 요청해주세요.' } } }
   }
 
   const store = matches[0]
   if (store.erpStoreCode) {
     // 이미 다른 코드가 붙어 있는 매장이다. 덮어쓰면 기존 매핑이 조용히 바뀌므로 거부한다.
-    return { error: { status: 409, body: { ok: false, error: '이 매장에는 이미 다른 매장 코드가 등록되어 있습니다.' } } }
+    return { error: { status: 409, body: { ok: false, error: '이 매장에는 이미 다른 전산 코드가 등록되어 있어요.' } } }
   }
 
   const bound = await bindErpCodeIfUnset(store.id, storeCode)
@@ -4293,20 +4555,33 @@ async function resolveErpStore(storeCode, rawBusinessNumber) {
     // 그 사이 다른 요청이 먼저 붙였거나 코드를 다른 매장이 선점했다. 다시 읽어 판단한다.
     const recheck = await findStoreByErpCode(storeCode)
     if (recheck && recheck.id === store.id) return { store: recheck }
-    return { error: { status: 409, body: { ok: false, error: '매장 코드를 등록하지 못했습니다. 본사에 문의해주세요.' } } }
+    return { error: { status: 409, body: { ok: false, error: '전산 코드를 등록하지 못했어요. 본사에 문의해주세요.' } } }
   }
 
   logger.info('[erp] 사업자번호로 매장 코드를 자동 연결했습니다.', { storeId: store.id, storeCode })
   return { store: { ...store, erpStoreCode: storeCode } }
 }
 
-app.post('/api/erp/carts', erpIpFloodLimiter, erpLimiter, requireErpToken, asyncHandler(async (req, res) => {
+// 인증 뒤의 거절(400/403/404/409)을 고정 이벤트 코드로 남긴다(jsonPayload.event="erp_rejected"). "전산에서 보냈는데 POS에 안 떠요"의
+// 가장 흔한 원인(등록되지 않은 전산 코드 404)이 예전에는 흔적을 남기지 않았다. 개인정보(차량번호·memo)는 넣지 않는다.
+function rejectErpCart(req, res, status, body) {
+  logger.warn('[erp] 전산 주문을 거절했습니다', {
+    event: 'erp_rejected',
+    status,
+    storeCode: String(req.body?.storeCode ?? '').trim().slice(0, 64) || null,
+    referenceId: String(req.body?.referenceId ?? req.params?.referenceId ?? '').trim().slice(0, 200) || null,
+    reason: body.code || body.error,
+  })
+  return res.status(status).json(body)
+}
+
+app.post('/api/erp/carts', erpIpFloodLimiter, requireErpToken, erpLimiter, asyncHandler(async (req, res) => {
   // validateDraftOrderBody를 그대로 재사용한다 -- storeCode/referenceId/items/totalAmount/memo
   // 검증 규칙이 draft-orders와 완전히 동일해야 하고(전산 쪽이 같은 바디 스키마로 두 경로를
   // 오갈 수 있어야 함), 이 검증 로직을 복제하면 나중에 한쪽만 고쳐서 규칙이 어긋날 위험이 있다.
   const parsed = validateDraftOrderBody(req.body)
   if (parsed.error) {
-    return res.status(400).json({ ok: false, error: parsed.error })
+    return rejectErpCart(req, res, 400, { ok: false, error: parsed.error })
   }
   const { storeCode, referenceId, items, totalAmount, memo } = parsed
   // autoPay는 draft-orders에는 없는 필드라 validateDraftOrderBody가 모르는 값이다 -- 여기서만
@@ -4324,17 +4599,17 @@ app.post('/api/erp/carts', erpIpFloodLimiter, erpLimiter, requireErpToken, async
   const payTargetRaw = req.body?.payTarget
   const payTarget = payTargetRaw === undefined || payTargetRaw === null || payTargetRaw === '' ? 'pos' : payTargetRaw
   if (payTarget !== 'pos' && payTarget !== 'front') {
-    return res.status(400).json({ ok: false, error: "payTarget은 'pos' 또는 'front'여야 합니다." })
+    return rejectErpCart(req, res, 400, { ok: false, error: "payTarget은 'pos' 또는 'front'여야 합니다." })
   }
 
   // 코드로 못 찾으면 사업자번호로 자동 연결을 시도한다(resolveErpStore 주석 참고).
   const resolved = await resolveErpStore(storeCode, req.body?.businessNumber)
   if (resolved.error) {
-    return res.status(resolved.error.status).json(resolved.error.body)
+    return rejectErpCart(req, res, resolved.error.status, resolved.error.body)
   }
   const store = resolved.store
   if (store.status !== 'active') {
-    return res.status(403).json({ ok: false, error: '비활성화된 가맹점입니다.' })
+    return rejectErpCart(req, res, 403, { ok: false, error: '이용이 중지된 매장이에요. 본사에 문의해주세요.' })
   }
 
   // referenceId는 매장별이 아니라 **전역** 유일이다(@unique). 그래서 다른 매장이 이미 쓴 번호가
@@ -4344,7 +4619,7 @@ app.post('/api/erp/carts', erpIpFloodLimiter, erpLimiter, requireErpToken, async
   // storeId를 다른 매장으로 바꿔치기해버린다.
   const existingAnyStore = await findErpCartByReference(referenceId)
   if (existingAnyStore && existingAnyStore.storeId !== store.id) {
-    return res.status(409).json({ ok: false, error: '이미 다른 매장에서 사용한 referenceId입니다.' })
+    return rejectErpCart(req, res, 409, { ok: false, error: '이미 다른 매장에서 사용한 referenceId입니다.' })
   }
 
   // 멱등: 같은 referenceId가 이미 있고 cancelled가 아니면(pending/loaded/failed 어느 쪽이든)
@@ -4352,7 +4627,7 @@ app.post('/api/erp/carts', erpIpFloodLimiter, erpLimiter, requireErpToken, async
   // cancelled였다면 전산이 다시 담는 것이므로 새로 생성한다(취소된 건 재사용하지 않는다).
   const existing = await findErpCartByReference(referenceId)
   if (existing && existing.status !== 'cancelled') {
-    return res.json({ ok: true, cartId: existing.id, referenceId, status: existing.status, payTarget: existing.payTarget, duplicate: true })
+    return res.json({ ok: true, cartId: existing.id, referenceId, status: existing.status, payTarget: existing.payTarget, storeName: store.name, duplicate: true })
   }
 
   // 차량번호가 오면 그날 대기 중인 손님과 잇는다. 이어지면 결제가 끝났을 때 정비완료까지
@@ -4384,16 +4659,18 @@ app.post('/api/erp/carts', erpIpFloodLimiter, erpLimiter, requireErpToken, async
     reservationId,
     payTarget,
   })
+  // storeName: 전산(시뮬레이터)이 "어느 매장으로 갔는지" 사람에게 보여줄 수 있게 함께 돌려준다 -- 코드 매핑이 틀려 남의 매장으로 간
+  // 주문을 보낸 쪽에서 바로 알아챌 수 있다.
   return res.status(201).json({
-    ok: true, cartId: cart.id, referenceId, status: cart.status, payTarget: cart.payTarget, linkedReservation: Boolean(reservationId),
+    ok: true, cartId: cart.id, referenceId, status: cart.status, payTarget: cart.payTarget, storeName: store.name, linkedReservation: Boolean(reservationId),
   })
 }))
 
 // 전산이 담아둔 장바구니의 처리 상태(pending/loaded/failed/cancelled)를 재조회할 수 있게 한다.
-app.get('/api/erp/carts/:referenceId', erpIpFloodLimiter, erpLimiter, requireErpToken, asyncHandler(async (req, res) => {
+app.get('/api/erp/carts/:referenceId', erpIpFloodLimiter, requireErpToken, erpLimiter, asyncHandler(async (req, res) => {
   const cart = await findErpCartByReference(req.params.referenceId)
   if (!cart) {
-    return res.status(404).json({ ok: false, error: '요청하신 장바구니를 찾을 수 없습니다.' })
+    return res.status(404).json({ ok: false, error: '주문을 찾을 수 없습니다.' })
   }
   return res.json({
     ok: true,
@@ -4421,20 +4698,22 @@ app.get('/api/erp/carts/:referenceId', erpIpFloodLimiter, erpLimiter, requireErp
 // 취소되면 POS 목록에서 빠지고 전산이 새 referenceId로 다시 보내면 같은 정비를 또 결제한다. 매장이 확인(탭앱 [확인했어요])하거나 그
 // 승인으로 결제 완료를 기록하면 풀린다. 응답에는 늘 frontOrphan을 싣는다.
 const ERP_CANCEL_FRONT_ORPHAN_ERROR = '프론트에서 이미 승인된 결제가 있는 주문이라 취소할 수 없습니다. 매장에서 결제 내역을 확인한 뒤 다시 시도해주세요.'
+// 대기(pending)가 아닌 주문의 전산 취소. 정확한 상태는 응답 status에 함께 실린다.
+const ERP_CANCEL_NOT_PENDING_ERROR = '아직 매장에서 처리하기 전인 주문만 취소할 수 있어요. 이미 POS에 담겼거나 처리된 주문이라 매장에 확인해주세요.'
 
-app.post('/api/erp/carts/:referenceId/cancel', erpIpFloodLimiter, erpLimiter, requireErpToken, asyncHandler(async (req, res) => {
+app.post('/api/erp/carts/:referenceId/cancel', erpIpFloodLimiter, requireErpToken, erpLimiter, asyncHandler(async (req, res) => {
   const cart = await findErpCartByReference(req.params.referenceId)
   if (!cart) {
-    return res.status(404).json({ ok: false, error: '요청하신 장바구니를 찾을 수 없습니다.' })
+    return rejectErpCart(req, res, 404, { ok: false, error: '주문을 찾을 수 없습니다.' })
   }
   const frontOrphanBlocked = (row) => {
     logger.warn('[erp] 확인하지 않은 프론트 미반영 승인이 있어 전산 취소를 거절', {
       storeId: row.storeId, cartId: row.id, referenceId: row.referenceId, approvalNo: row.frontOrphanApprovalNo, amount: row.frontOrphanAmount,
     })
-    return res.status(409).json({ ok: false, code: 'FRONT_ORPHAN', error: ERP_CANCEL_FRONT_ORPHAN_ERROR, status: row.status, frontOrphan: frontOrphanOf(row) })
+    return rejectErpCart(req, res, 409, { ok: false, code: 'FRONT_ORPHAN', error: ERP_CANCEL_FRONT_ORPHAN_ERROR, status: row.status, frontOrphan: frontOrphanOf(row) })
   }
   if (cart.status !== 'pending') {
-    return res.status(409).json({ ok: false, error: '대기중인 장바구니만 취소할 수 있습니다.', status: cart.status, frontOrphan: frontOrphanOf(cart) })
+    return rejectErpCart(req, res, 409, { ok: false, error: ERP_CANCEL_NOT_PENDING_ERROR, status: cart.status, frontOrphan: frontOrphanOf(cart) })
   }
   if (hasUnackedFrontOrphan(cart)) return frontOrphanBlocked(cart)
   const changed = await cancelErpCart(req.params.referenceId)
@@ -4443,7 +4722,7 @@ app.post('/api/erp/carts/:referenceId/cancel', erpIpFloodLimiter, erpLimiter, re
     // 다시 읽어 최신 상태를 알려준다.
     const latest = await findErpCartByReference(req.params.referenceId)
     if (latest?.status === 'pending' && hasUnackedFrontOrphan(latest)) return frontOrphanBlocked(latest)
-    return res.status(409).json({ ok: false, error: '대기중인 장바구니만 취소할 수 있습니다.', status: latest?.status, frontOrphan: frontOrphanOf(latest) })
+    return rejectErpCart(req, res, 409, { ok: false, error: ERP_CANCEL_NOT_PENDING_ERROR, status: latest?.status, frontOrphan: frontOrphanOf(latest) })
   }
   return res.json({ ok: true, status: 'cancelled', frontOrphan: frontOrphanOf(cart) })
 }))
@@ -4636,24 +4915,34 @@ async function sendDuePromotions() {
 
 // Cloud Scheduler가 매일 오전 10시(KST)에 호출한다. Cloud Run 인스턴스마다 cron을 띄우지
 // 않고, 공유 claim + promoSent 조건으로 동일 작업의 재전송을 막는다.
+// 잡이 돌았는지 알 수 있게 끝날 때마다 고정 이벤트로 남긴다(jsonPayload.event="job_finished" / "job_failed"). 예전에는 성공하면 아무
+// 기록이 없어 스케줄러 등록 여부조차 확인할 수 없었다.
 app.post('/internal/jobs/send-promotions', requirePromotionJobAuth, asyncHandler(async (req, res) => {
   try {
     const result = await sendDuePromotions()
+    logger.info('[promotion-job] 완료', { event: 'job_finished', job: 'send-promotions', ...result })
     return res.json({ ok: true, ...result })
   } catch (error) {
-    logger.error('[promotion-job] 처리 실패', { job: 'send-promotions', error: error.message })
+    logger.error('[promotion-job] 처리 실패', { event: 'job_failed', job: 'send-promotions', error: error.message })
     return res.status(500).json({ ok: false, error: '프로모션 작업 처리에 실패했습니다.' })
   }
 }))
 
 // 개인정보 보관기간 경과 건 파기(익명화) (계약 §3.25 신규). PROMOTION_JOB_TOKEN을 그대로
 // 재사용한다 — 둘 다 "Cloud Scheduler가 부르는 내부 배치 작업"이라는 같은 신뢰 경계이기 때문이다.
+// 단계별로 따로 돈다(store.purgeExpiredPersonalData 주석) -- 한 단계가 실패해도 나머지는 끝까지 하고, 실패한 단계가 있으면 500을 돌려
+// 스케줄러가 재시도하게 한다(다시 돌려도 결과가 같다). 응답에는 단계별 건수와 errors가 실린다.
 app.post('/internal/jobs/purge-expired', requirePromotionJobAuth, asyncHandler(async (req, res) => {
   try {
     const result = await purgeExpiredPersonalData()
+    if (result.errors) {
+      logger.error('[purge-job] 일부 단계 실패', { event: 'job_failed', job: 'purge-expired', ...result })
+      return res.status(500).json({ ok: false, error: '개인정보 파기 작업 일부가 실패했습니다.', ...result })
+    }
+    logger.info('[purge-job] 완료', { event: 'job_finished', job: 'purge-expired', ...result })
     return res.json({ ok: true, ...result })
   } catch (error) {
-    logger.error('[purge-job] 처리 실패', { job: 'purge-expired', error: error.message })
+    logger.error('[purge-job] 처리 실패', { event: 'job_failed', job: 'purge-expired', error: error.message })
     return res.status(500).json({ ok: false, error: '개인정보 파기 작업 처리에 실패했습니다.' })
   }
 }))

@@ -94,19 +94,21 @@ export function notifyNewErpCarts(carts) {
     return
   }
   if (!fresh.length || currentView === 'erp') return
-  deps.notify('success', `전산 주문이 ${fresh.length}건 들어왔습니다. [전산 주문]에서 확인하세요.`)
+  // [보기]를 누르면 바로 그 화면으로 간다(POS 토스트는 버튼 하나를 붙일 수 있다).
+  deps.notify('success', `전산 주문이 ${fresh.length}건 들어왔어요. [전산 주문]에서 확인해주세요.`, { text: '보기', onClick: () => switchTo('erp') })
 }
 
 let initialised = false
 
-// 새 정비 예약도 같은 방식으로 알린다. 직원이 [전산 주문]이나 [정비 이력]을 보고 있으면 손님이 키오스크에서
-// 예약해도 배지 숫자만 바뀌어 놓치기 쉽다.
+// 새 접수도 같은 방식으로 알린다. 직원이 [전산 주문]이나 [정비 이력]을 보고 있으면 손님이 프론트에서
+// 접수해도 배지 숫자만 바뀌어 놓치기 쉽다. 어제 넘어온 대기 접수(carriedOver)는 새로 들어온 게 아니라 세지 않는다 --
+// 서버가 그 목록을 처음 내려주는 날 "새 접수 N건"이 한꺼번에 뜨지 않게 한다.
 let lastReservationIds = null
 
 export function notifyNewReservations(reservations) {
-  const ids = new Set((reservations || []).filter((r) => r.status === 'waiting').map((r) => r.id))
+  const ids = new Set((reservations || []).filter((r) => r.status === 'waiting' && !r.carriedOver).map((r) => r.id))
   const fresh = lastReservationIds ? [...ids].filter((id) => !lastReservationIds.has(id)) : []
   lastReservationIds = ids
   if (!fresh.length || currentView === 'queue') return
-  deps.notify('success', `새 정비 예약이 ${fresh.length}건 들어왔습니다. [정비 대기]에서 확인하세요.`)
+  deps.notify('success', `새 접수가 ${fresh.length}건 들어왔어요. [정비 대기]에서 확인해주세요.`, { text: '보기', onClick: () => switchTo('queue') })
 }

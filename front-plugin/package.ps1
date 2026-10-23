@@ -7,10 +7,10 @@ $apiBaseUrl = if ($env:CHEVROLET_API_BASE_URL) { $env:CHEVROLET_API_BASE_URL.Tri
 if (-not $apiBaseUrl) {
   throw 'CHEVROLET_API_BASE_URL 환경변수를 설정한 뒤 패키징하세요. 예: $env:CHEVROLET_API_BASE_URL="https://chevrolet-xxxxx-uc.a.run.app"'
 }
+# payment.html(금액 직접 입력 결제)은 대기화면에서 가는 길이 없어 ZIP에서 뺐다(package.sh와 같다). 파일은 저장소에 남아 있다.
 $runtimeFiles = @(
   'index.html',
   'onboarding.html',
-  'payment.html',
   'reservation.html',
   'sdk.js',
   'settings.html',
@@ -44,7 +44,7 @@ try {
   }
   Compress-Archive -Path (Join-Path $stageDir '*') -DestinationPath $zipPath -CompressionLevel Optimal
   Write-Output "생성 완료: $zipPath"
-  Write-Output 'ZIP 내용: index.html, onboarding.html, payment.html, reservation.html, sdk.js, settings.html, api-config.js, erp-pay.html, erp-front-pay.js'
+  Write-Output 'ZIP 내용: index.html, onboarding.html, reservation.html, sdk.js, settings.html, api-config.js, erp-pay.html, erp-front-pay.js'
 }
 finally {
   if (Test-Path -LiteralPath $stageDir) {

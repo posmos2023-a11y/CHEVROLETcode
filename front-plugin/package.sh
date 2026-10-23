@@ -3,7 +3,8 @@
 # 한쪽을 고치면 반드시 다른 쪽도 같이 고칠 것.
 #
 # CHEVROLET_API_BASE_URL 환경변수를 필수로 받아 api-config.js의 __CHEVROLET_API_BASE_URL__
-# placeholder를 치환한 뒤, 배포에 필요한 7개 런타임 파일만 chevrolet-front-plugin.zip으로 묶는다.
+# placeholder를 치환한 뒤, 배포에 필요한 8개 런타임 파일만 chevrolet-front-plugin.zip으로 묶는다.
+# payment.html(금액 직접 입력 결제)은 대기화면에서 가는 길이 없어 ZIP에서 뺐다. 파일은 저장소에 남아 있다.
 set -euo pipefail
 
 plugin_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,7 +22,6 @@ fi
 runtime_files=(
   "index.html"
   "onboarding.html"
-  "payment.html"
   "reservation.html"
   "sdk.js"
   "settings.html"
@@ -69,4 +69,4 @@ else
 fi
 
 echo "생성 완료: $zip_path"
-echo 'ZIP 내용: index.html, onboarding.html, payment.html, reservation.html, sdk.js, settings.html, api-config.js, erp-pay.html, erp-front-pay.js'
+echo 'ZIP 내용: index.html, onboarding.html, reservation.html, sdk.js, settings.html, api-config.js, erp-pay.html, erp-front-pay.js'

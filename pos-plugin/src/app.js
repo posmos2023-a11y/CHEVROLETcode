@@ -16,6 +16,8 @@ import { initHistory, openHistoryFor, loadRecentHistory } from './history.js'
 // 좌측 메뉴와 화면 전환. 화면을 나누면 전산 주문이 메뉴 뒤로 숨는데, 그때 새 주문을
 // 놓치지 않게 배지와 토스트로 알리는 것도 이 모듈이 맡는다.
 import { initNav, switchTo, registerViewLoader, updateBadges, notifyNewErpCarts, notifyNewReservations } from './nav.js'
+// 대기 카드 한 장의 규칙(상태별 버튼, 접수 시각·경과 시간, 어제 넘어온 접수, 결과 안내 문구). DOM과 무관한 순수 함수라 따로 뒀다.
+import { queueCardHtml, isCarriedOver, completesSilently, actionResultMessage, actionErrorMessage } from './queueCard.js'
 
 // 실제 토스POS 단말기 밖(로컬 브라우저)에서 미리 볼 때는 posPluginSdk가 부모 프레임(POS 앱)과
 // 통신하지 못해 응답이 오지 않는다. 백엔드가 제공하는 미리보기에서는 같은 origin을 사용하고,
@@ -24,8 +26,6 @@ const configuredApiBaseUrl = __CHEVROLET_API_BASE_URL__
 const isPreview = /^(localhost|127\.0\.0\.1)$/.test(location.hostname) || location.pathname.startsWith('/pos-plugin/')
 
 const API_BASE = isPreview ? '' : String(configuredApiBaseUrl).replace(/\/$/, '')
-
-const STATUS_LABEL = { waiting: '대기중', called: '호출완료', notify_failed: '알림실패', cancelled: '취소됨' }
 
 // ─────────────────────────────────────────────────────────────────────────
 // POS 인증: X-Store-Token
@@ -83,11 +83,22 @@ const tokenInputEl = document.getElementById('token-input')
 const tokenSubmitEl = document.getElementById('token-submit')
 const tokenErrorEl = document.getElementById('token-error')
 const tokenResetButtonEl = document.getElementById('token-reset-button')
+const waitingNoteEl = document.getElementById('waiting-note')
 
 let pollTimer = null
 // 행마다 "몇 초 안에 다시 누르면 확정" 확인 상태를 들고 있는다. 번호를 탭하는 것만으로는
-// 절대 호출/완료/취소가 나가면 안 되고, 반드시 버튼을 두 번(확인 상태 진입 -> 확정) 눌러야 한다.
-const confirming = new Map() // reservationId -> { action: 'call' | 'complete' | 'cancel', timeoutId }
+// 절대 호출/완료/취소/알림 다시 보내기가 나가면 안 되고, 반드시 버튼을 두 번(확인 상태 진입 -> 확정) 눌러야 한다.
+// 'retry-twice'는 결과를 모르는 알림을 다시 보내기 전의 추가 확인 단계다(handleActionClick).
+const confirming = new Map() // reservationId -> { action: 'call' | 'retry' | 'retry-twice' | 'complete' | 'cancel', timeoutId }
+// 서버 응답을 기다리는 카드 -> 동작. 그동안 그 카드의 버튼을 잠근다(같은 요청을 두 번 보내지 않게).
+const busy = new Map()
+// [알림 다시 보내기]의 결과를 모르는 접수(서버 retry-notify notify 'unknown', 또는 응답을 못 받음). 서버는 이때도 접수를 'notify_failed'로
+// 두고 마지막 발송 결과를 대기열에 싣지 않는다 -- 이 단말기가 기억해 카드에 '전달 여부 확인 필요'를 띄운다. 알림은 실제로 나갔을 수 있어서
+// 토스트를 놓친 직원이 또 보내면 손님이 '순서입니다'를 두 번 받는다. 메모리에만 두므로 탭앱을 다시 켜면 사라진다.
+// 접수가 알림 실패 상태를 벗어나면(호출됨·완료·취소) 지운다(applyQueueResponse).
+const notifyUnknown = new Set()
+// 결과를 모르는 알림을 다시 보내기 전 확인('두 번 받을 수 있어요')을 읽을 시간. 평소 확인(3초)보다 길게 준다.
+const DOUBLE_SEND_CONFIRM_MS = 10 * 1000
 
 // getMerchant()는 더 이상 인증에 쓰이지 않는다(그 용도는 X-Store-Token이 대신한다). 대기열 응답이
 // 오기 전까지 헤더에 보여줄 매장 이름을 잠깐 채워두는, 순전히 화면 표시용 보조 정보일 뿐이다.
@@ -98,18 +109,20 @@ async function getMerchant() {
   return posPluginSdk.merchant.getMerchant()
 }
 
-function notify(kind, message) {
+// button: { text, onClick } -- POS 토스트에 버튼 하나를 붙인다(SDK ToastTypes, 새 접수·새 전산 주문의 [보기]).
+// 단말기에서 버튼이 안 보이거나 눌리지 않아도 안내 글자는 그대로 뜬다.
+function notify(kind, message, button) {
   // 실제 단말기에서는 posPluginSdk.toast로 POS 네이티브 토스트를 띄우고,
   // 로컬 미리보기에서는 toast API가 응답하지 않으므로 alert로 대신한다.
   if (!isPreview && posPluginSdk?.toast?.[kind]) {
-    posPluginSdk.toast[kind]({ message })
+    posPluginSdk.toast[kind](button ? { message, button } : { message })
   } else {
     alert(message)
   }
   pageStatusEl.textContent = message
 }
 
-// 오른쪽 위 점 하나만으로는 연결이 끊긴 걸 아무도 모른다 -- 그동안 새 예약·전산 주문이 안 보이는데 직원은
+// 오른쪽 위 점 하나만으로는 연결이 끊긴 걸 아무도 모른다 -- 그동안 새 접수·전산 주문이 안 보이는데 직원은
 // "오늘 한가하네"로 받아들인다. 연속으로 3번 실패하면(15~45초) 화면 위에 띠를 띄운다. 한 번 실패는 흔해서 띄우지 않는다.
 const CONNECTION_BANNER_AFTER = 3
 let connectionErrors = 0
@@ -123,20 +136,26 @@ function setConnection(state) {
 }
 
 function updateSummary(reservations) {
-  const waiting = reservations.filter((reservation) => reservation.status === 'waiting')
+  // '현재 대기'와 '다음 호출'은 오늘 호출할 수 있는 손님만 센다. 어제 '대기 중'으로 넘어온 접수(carriedOver)는
+  // 호출할 수 없어서(서버가 오늘 접수만 호출한다) 다음 호출 번호로 띄우면 안 된다 -- 목록에 '어제' 배지로 따로 보인다.
+  const waiting = reservations.filter((r) => r.status === 'waiting' && !isCarriedOver(r, todayServiceDate))
+  const carriedWaiting = reservations.filter((r) => r.status === 'waiting' && isCarriedOver(r, todayServiceDate)).length
   waitingCountEl.textContent = String(waiting.length)
   nextNumberEl.textContent = waiting.length ? `#${waiting[0].queueNumber}` : '—'
+  if (waitingNoteEl) {
+    waitingNoteEl.textContent = carriedWaiting
+      ? `아직 호출하지 않은 손님 · 어제 남은 ${carriedWaiting}명은 빼고 셌어요`
+      : '아직 호출하지 않은 손님'
+  }
   // 다른 화면을 보고 있어도 대기 인원이 메뉴에 보이게 한다.
   updateBadges({ waiting: waiting.length })
 }
 
 function updateLastUpdated() {
   const time = new Intl.DateTimeFormat('ko-KR', { hour: '2-digit', minute: '2-digit' }).format(new Date())
-  // 실제 주기는 고정 5초가 아니라 POLL_MIN_MS(5초)~POLL_MAX_MS(15초) 사이를 오가는 적응형
-  // 간격(pollIntervalMs)이다. 예전엔 "5초마다"로 못 박혀 있어 한산한 시간대에 간격이 늘어나도
-  // 화면 표시는 그대로였다 — 지금 값을 그대로 반영한다.
-  const seconds = Math.round(pollIntervalMs / 1000)
-  lastUpdatedEl.textContent = `${time} 기준 · ${seconds}초마다 자동 업데이트`
+  // 실제 주기는 POLL_MIN_MS(5초)~POLL_MAX_MS(15초) 사이를 오가는 적응형 간격(pollIntervalMs)이라 초를 적으면
+  // 5, 8, 11, 15로 계속 바뀌어 오히려 이상해 보인다. 화면이 멈췄는지는 기준 시각만으로 알 수 있다.
+  lastUpdatedEl.textContent = `${time} 기준 · 자동 새로고침`
 }
 
 // fetch에 상한을 두지 않으면, 서버가 응답을 영영 안 주는 순간(다운/과부하) 그 요청도 영영 안
@@ -198,7 +217,8 @@ async function apiPost(path, body = {}) {
 // 바뀌고 나머지가 어긋나는 일이 없다.
 function handleUnauthorized(errorMessage) {
   clearStoreToken()
-  showTokenScreen(errorMessage || '매장 인증 토큰이 만료되었거나 올바르지 않습니다. 다시 입력해주세요.')
+  // 토큰에는 만료가 없다 -- 본사가 재발급하면 바뀐다. 매장은 재발급할 수 없으니 새 토큰을 어디서 받는지 알려 준다.
+  showTokenScreen(errorMessage || '매장 토큰이 바뀌었거나 올바르지 않아요. 본사에서 받은 새 토큰을 입력해주세요.')
 }
 
 function clearConfirm(id) {
@@ -207,79 +227,113 @@ function clearConfirm(id) {
   confirming.delete(id)
 }
 
-// 버튼을 처음 누르면 "정말 호출/완료/취소할까요?"로 바뀌고, 3초 안에 같은 버튼을 한 번 더 눌러야
+// 버튼을 처음 누르면 "한 번 더 누르면 호출돼요"처럼 바뀌고, 3초 안에 같은 버튼을 한 번 더 눌러야
 // 실제로 서버에 요청이 나간다. 그 사이 다른 곳을 누르거나 3초가 지나면 원래 상태로 되돌아간다.
-// 이렇게 하면 "대기번호 1번을 실수로 탭"하는 정도로는 절대 알림톡이 나가거나 예약이 취소되지 않는다.
+// 이렇게 하면 "대기번호 1번을 실수로 탭"하는 정도로는 절대 알림이 나가거나 접수가 취소되지 않는다.
 function handleActionClick(id, action) {
+  if (busy.has(id)) return
   const existing = confirming.get(id)
   if (existing && existing.action === action) {
     clearConfirm(id)
     runAction(id, action)
     return
   }
+  // 결과를 모르는 알림을 다시 보낼 때는 평소 확인 앞에 '손님이 두 번 받을 수 있어요' 확인을 한 번 더 받는다(세 번 눌러야 보낸다).
+  if (action === 'retry' && notifyUnknown.has(id) && !(existing && existing.action === 'retry-twice')) {
+    armConfirm(id, 'retry-twice', DOUBLE_SEND_CONFIRM_MS)
+    return
+  }
+  armConfirm(id, action, 3000)
+}
+
+function armConfirm(id, action, ms) {
   confirming.forEach((_, otherId) => clearConfirm(otherId))
   const timeoutId = setTimeout(() => {
     confirming.delete(id)
     render(lastReservations)
-  }, 3000)
+  }, ms)
   confirming.set(id, { action, timeoutId })
   render(lastReservations)
 }
 
 const ACTION_PATH = {
-  call: (id) => `/api/pos/queue/${id}/call`,
-  complete: (id) => `/api/pos/queue/${id}/complete`,
-  cancel: (id) => `/api/pos/queue/${id}/cancel`,
-}
-
-const ACTION_SUCCESS_MESSAGE = {
-  call: (alreadyProcessed) => (alreadyProcessed ? '이미 호출 처리된 예약입니다.' : '순서 호출 알림톡을 보냈습니다.'),
-  complete: (alreadyProcessed) => (alreadyProcessed ? '이미 정비완료 처리된 예약입니다.' : '정비완료로 처리했습니다.'),
-  cancel: (alreadyProcessed) => (alreadyProcessed ? '이미 취소된 예약입니다.' : '대기열에서 취소 처리했습니다(노쇼 등).'),
+  call: (id) => `/api/pos/queue/${encodeURIComponent(id)}/call`,
+  // 알림 실패 손님에게 호출 알림을 다시 보낸다(서버 C4). 서버가 접수 한 건마다 잠가서 POS 두 대가 동시에 눌러도 한 번만 나간다.
+  retry: (id) => `/api/pos/queue/${encodeURIComponent(id)}/retry-notify`,
+  complete: (id) => `/api/pos/queue/${encodeURIComponent(id)}/complete`,
+  cancel: (id) => `/api/pos/queue/${encodeURIComponent(id)}/cancel`,
 }
 
 async function runAction(id, action) {
   // 직원이 뭔가를 눌렀다는 건 지금 바쁘다는 뜻이다 -- 폴링을 다시 빠르게 되돌린다.
   noteActivity()
-  let ok, status, body
+  // 어제 넘어온 '대기 중' 접수의 [정비완료]는 완료 알림 없이 보낸다(queueCard.completesSilently -- 하루 늦은 '찾으러 와주세요'를 막는다).
+  // 직원이 확인한 카드(지금 그려진 목록) 기준으로 정한다.
+  const reservation = lastReservations.find((r) => r.id === id)
+  const silent = action === 'complete' && completesSilently(reservation, todayServiceDate)
+  busy.set(id, action)
+  render(lastReservations)
+  let response = null
   try {
-    ;({ ok, status, body } = await apiPost(ACTION_PATH[action](id)))
+    response = await apiPost(ACTION_PATH[action](id), silent ? { notify: false } : {})
   } catch {
     // 네트워크 오류이거나 POST_TIMEOUT_MS 타임아웃이다. 위 주석대로 이 시점엔 요청이 서버에
     // 도달해 실제로는 처리됐을 수도 있어 "실패"라고 단정하지 않는다 — 안내만 하고, 아래
     // loadQueue()로 서버의 실제 최신 상태를 다시 받아와 화면을 맞춘다. 여기서 catch 없이
     // 그냥 던지면 crashGuard의 unhandledrejection이 잡아 전체 화면이 오류 패널로 덮인다
     // (버튼 하나 눌렀다고 화면 전체가 하얘지면 안 된다).
-    notify('error', '네트워크 연결을 확인해주세요. 처리 여부는 목록에서 다시 확인해주세요.')
-    // bypassGuard: 자동 폴링이 마침 진행 중이면 가드에 걸려 조용히 아무 일도 안 하고, 방금 누른
-    // 버튼의 결과가 화면에 반영되지 않는다 — 직원은 "안 눌렸나?" 하고 다시 누르게 된다. manual은
-    // 안 쓴다(사람이 새로고침을 누른 게 아니라 방금 뜬 토스트를 화면과 맞추는 것뿐이라, 여기서
-    // setConnection('checking')까지 깜빡이면 방금 본 결과를 의심하게 만드는 군더더기다).
-    await loadQueue({ bypassGuard: true })
-    return
+    // 알림 다시 보내기는 실제로 나갔을 수 있다 -- 또 누르면 손님이 두 번 받으니 직접 연락을 먼저 권한다(카드에도 남긴다, notifyUnknown).
+    if (action === 'retry') notifyUnknown.add(id)
+    notify('error', action === 'retry'
+      ? '인터넷 연결을 확인해주세요. 알림이 이미 갔을 수 있으니 다시 보내기 전에 손님께 직접 연락해주세요.'
+      : '인터넷 연결을 확인해주세요. 처리됐는지는 목록에서 다시 확인해주세요.')
+  } finally {
+    // 잠금은 응답이 오면 바로 풀고 다시 그린다. 예전엔 아래 목록 새로고침에 맡겨서, 새로고침이 실패하면(연결 끊김·서버 오류)
+    // 카드가 '처리 중...'으로 잠긴 채 다음 성공 폴링까지 남았다 -- 직원은 요청이 아직 진행 중인 줄 알았다.
+    busy.delete(id)
+    render(lastReservations)
   }
-  if (!ok) {
-    if (status === 401) {
+  if (response) {
+    const { ok, status, body } = response
+    if (status === 401 && !ok) {
       // 요청 도중 토큰이 회전/폐기됐을 수 있다. 저장된 값을 지우고 재입력을 받는다.
       handleUnauthorized(body.error)
       return
     }
-    notify('error', body.error || '처리 중 오류가 발생했습니다.')
-  } else if (action === 'complete' && body.notified === false) {
-    // 완료 처리는 됐지만 손님에게 완료 안내 문자가 안 갔다. 직원이 직접 연락하도록 알린다.
-    notify('error', '정비완료로 처리했지만 완료 안내 문자를 보내지 못했습니다. 손님께 직접 연락해 주세요.')
-  } else if (action === 'complete' && body.notified === true) {
-    notify('success', '정비완료로 처리하고 손님께 완료 안내 문자를 보냈습니다.')
-  } else {
-    notify('success', ACTION_SUCCESS_MESSAGE[action](body.alreadyProcessed))
+    // 다른 POS나 프론트 결제의 자동 완료가 먼저 끝냈으면 서버는 alreadyCompleted를 준다 -- 거절이 아니라 이미 끝난 것이다.
+    const alreadyCompleted = action === 'complete' && body && body.alreadyCompleted === true
+    if (action === 'retry') noteRetryOutcome(id, body)
+    if (ok || alreadyCompleted) {
+      // 결과 문구는 queueCard.actionResultMessage 한 곳에서 정한다(호출했지만 알림 실패, 완료 알림 실패, 다시 보내기 결과 모름 등).
+      const [kind, message] = actionResultMessage(action, body, { silent })
+      notify(kind, message)
+    } else if (action === 'retry' && (body.notify === 'failed' || body.notify === 'unknown')) {
+      // 서버(C4)는 다시 보내기가 실패하거나 결과를 모르면 502 ok:false에 notify를 실어 준다. 거절이 아니라 발송 결과이므로
+      // 결과 안내로 읽는다 -- 특히 'unknown'은 "두 번 갈 수 있으니 먼저 연락" 경고(warn)가 떠야 한다.
+      const [kind, message] = actionResultMessage(action, body)
+      notify(kind, message)
+    } else {
+      notify('error', actionErrorMessage(action, status, body))
+    }
   }
-  // 위와 같은 이유로 bypassGuard만 쓴다.
+  // bypassGuard: 자동 폴링이 마침 진행 중이면 가드에 걸려 조용히 아무 일도 안 하고, 방금 누른
+  // 버튼의 결과가 화면에 반영되지 않는다 — 직원은 "안 눌렸나?" 하고 다시 누르게 된다. manual은
+  // 안 쓴다(사람이 새로고침을 누른 게 아니라 방금 뜬 토스트를 화면과 맞추는 것뿐이라, 여기서
+  // setConnection('checking')까지 깜빡이면 방금 본 결과를 의심하게 만드는 군더더기다).
   await loadQueue({ bypassGuard: true })
 }
 
+// [알림 다시 보내기] 결과를 기억한다. 'unknown'이면 카드에 '전달 여부 확인 필요'를 남기고, 'sent'면 지운다. 'failed'는 그대로 둔다 --
+// 이번 발송은 확실히 안 갔지만 앞서 결과를 모른 발송은 손님이 받았을 수 있다.
+function noteRetryOutcome(id, body) {
+  const outcome = body && body.notify
+  if (outcome === 'unknown') notifyUnknown.add(id)
+  else if (outcome === 'sent') notifyUnknown.delete(id)
+}
+
 let lastReservations = []
-// GET /api/pos/queue 응답 최상단의 serviceDate(오늘, KST). 각 이월 건의 serviceDate와 비교해
-// '이월' 배지를 붙일지 판단하는 기준값이라 render() 밖에서 계속 들고 있어야 한다 — 두 번째 탭
+// GET /api/pos/queue 응답 최상단의 serviceDate(오늘, KST). 각 건의 serviceDate와 비교해 '어제'(넘어온 접수) 배지를
+// 붙일지, 다음 호출 번호에 넣을지 판단하는 기준값이라 render() 밖에서 계속 들고 있어야 한다 — 두 번째 탭
 // 확정을 기다리는 3초 타임아웃(handleActionClick)에서도 새 응답 없이 render(lastReservations)만
 // 다시 부르므로, 그 재렌더 시점에도 마지막으로 받은 오늘 날짜를 그대로 써야 배지가 깜빡이지 않는다.
 let todayServiceDate = null
@@ -288,7 +342,7 @@ function render(reservations) {
   lastReservations = reservations
   updateSummary(reservations)
   updateLastUpdated()
-  pageStatusEl.textContent = `대기열 ${reservations.length}건을 불러왔습니다.`
+  pageStatusEl.textContent = `대기열 ${reservations.length}건을 불러왔어요.`
 
   const activeIds = new Set(reservations.map((reservation) => reservation.id))
   confirming.forEach((_, id) => {
@@ -299,69 +353,25 @@ function render(reservations) {
     listEl.innerHTML = `
       <div class="empty">
         <div class="empty-mark" aria-hidden="true">✓</div>
-        <div class="empty-title">대기중인 손님이 없습니다</div>
-        <div class="empty-copy">새 예약이 들어오면 이곳에 표시됩니다.</div>
+        <div class="empty-title">대기 중인 손님이 없어요</div>
+        <div class="empty-copy">손님이 접수하면 이곳에 표시돼요.</div>
       </div>
     `
     return
   }
+  // 카드 한 장의 규칙(상태별 버튼만 보이기, 접수 시각·경과 시간, '어제' 배지, 알림 실패 경고)은 queueCard.js에 있다.
+  // 어제(혹은 그 이전) 접수해 아직 끝나지 않은 손님도 함께 내려온다(밤새 맡긴 차, 어제 호출하지 않은 접수). 오늘 새로 들어온
+  // 손님과 똑같이 그리면 정비사가 "오늘 접수 순서"로 착각하므로 배지와 날짜로 구분하고, 호출 버튼은 두지 않는다.
+  const now = Date.now()
   listEl.innerHTML = reservations
-    .map((r) => {
-      const state = confirming.get(r.id)
-      const callConfirming = state?.action === 'call'
-      const completeConfirming = state?.action === 'complete'
-      const cancelConfirming = state?.action === 'cancel'
-      const canCall = r.status === 'waiting'
-      const canComplete = r.status === 'called' || r.status === 'notify_failed'
-      const canCancel = r.status === 'waiting' || r.status === 'called' || r.status === 'notify_failed'
-      const statusClass = ['waiting', 'called', 'notify_failed'].includes(r.status) ? r.status : 'waiting'
-      const statusLabel = STATUS_LABEL[r.status] || r.status
-      // '이월' 배지: 대기열 조회는 오늘 접수분뿐 아니라, 어제(혹은 그 이전) 접수해 밤새 차를 맡겨두고
-      // 아직 호출/알림실패 상태로 남아있는 손님도 함께 내려준다(차를 못 찾아가고 하루를 넘긴 경우).
-      // 이 손님을 오늘 새로 들어온 손님과 똑같이 그리면, 정비사가 "오늘 접수 순서"로 착각해 대기
-      // 순번을 헷갈리거나 이미 호출된 손님을 다시 호출하려 할 수 있다. serviceDate가 오늘(응답
-      // 최상단 serviceDate)과 다른 행에만 조용히 배지를 붙여 "이건 어제 넘어온 건"임을 알려준다.
-      const isCarriedOver = Boolean(r.serviceDate) && Boolean(todayServiceDate) && r.serviceDate !== todayServiceDate
-      const carriedOverBadge = isCarriedOver
-        ? `<span class="badge carried-over" title="${escapeHtml(r.serviceDate)} 접수 · 오늘로 이월됨">이월</span>`
-        : ''
-      return `
-        <article class="queue-item status-${statusClass}">
-          <div class="queue-number">#${r.queueNumber}</div>
-          <div class="queue-main">
-            <div class="queue-top">
-              <strong class="car-number">${escapeHtml(r.carNumber)}</strong>
-              ${carriedOverBadge}
-              <span class="badge ${statusClass}">${escapeHtml(statusLabel)}</span>
-            </div>
-            <div class="service">${escapeHtml(r.serviceType || '-')}</div>
-            <div class="phone">${escapeHtml(r.phoneMasked || '-')}</div>
-          </div>
-          <div class="actions">
-            <button
-              class="action-button ${callConfirming ? 'confirm' : ''}"
-              data-id="${escapeHtml(r.id)}" data-action="call"
-              aria-label="${callConfirming ? '호출 확정' : '호출'} ${escapeHtml(r.carNumber)}"
-              ${canCall ? '' : 'disabled'}
-            >${callConfirming ? '호출 확정' : '호출'}</button>
-            <button
-              class="action-button complete ${completeConfirming ? 'confirm' : ''}"
-              data-id="${escapeHtml(r.id)}" data-action="complete"
-              aria-label="${completeConfirming ? '완료 확정' : '완료'} ${escapeHtml(r.carNumber)}"
-              ${canComplete ? '' : 'disabled'}
-            >${completeConfirming ? '완료 확정' : '완료'}</button>
-            <button
-              class="action-button cancel ${cancelConfirming ? 'confirm' : ''}"
-              data-id="${escapeHtml(r.id)}" data-action="cancel"
-              aria-label="${cancelConfirming ? '취소 확정(되돌릴 수 없음)' : '대기열에서 취소'} ${escapeHtml(r.carNumber)}"
-              ${canCancel ? '' : 'disabled'}
-            >${cancelConfirming ? '취소 확정' : '취소'}</button>
-            <button class="history-button" type="button" data-history="${escapeHtml(r.carNumber)}"
-              aria-label="${escapeHtml(r.carNumber)} 정비 이력 보기">이력</button>
-          </div>
-        </article>
-      `
-    })
+    .map((r) => queueCardHtml(r, {
+      todayServiceDate,
+      now,
+      confirmingAction: confirming.get(r.id)?.action || null,
+      busyAction: busy.get(r.id) || null,
+      notifyUnknown: notifyUnknown.has(r.id),
+      escapeHtml,
+    }))
     .join('')
 }
 
@@ -369,8 +379,9 @@ function renderError(message) {
   listEl.innerHTML = `
     <div class="error-card">
       <div class="error-mark" aria-hidden="true">!</div>
-      <div class="error-title">대기열을 불러오지 못했습니다</div>
+      <div class="error-title">대기열을 불러오지 못했어요</div>
       <div class="error-copy">${escapeHtml(message)}</div>
+      <button class="error-retry" type="button" data-retry-queue="1">다시 시도</button>
     </div>
   `
   updateSummary([])
@@ -381,6 +392,11 @@ function escapeHtml(s) {
 }
 
 listEl.addEventListener('click', (e) => {
+  // 오류 카드의 [다시 시도]. 다음 폴링(최대 15초)을 기다리지 않고 바로 다시 불러온다.
+  if (e.target.closest('button[data-retry-queue]')) {
+    loadQueue({ manual: true })
+    return
+  }
   const historyBtn = e.target.closest('button[data-history]')
   if (historyBtn) {
     // 이력은 이제 별도 화면이다. 옮겨간 뒤 그 차량번호로 바로 조회한다.
@@ -401,9 +417,20 @@ listEl.addEventListener('click', (e) => {
 function applyQueueResponse(body) {
   if (body.storeName) storeNameEl.textContent = body.storeName
   todayServiceDate = body.serviceDate || todayServiceDate
-  render(body.reservations || [])
+  const reservations = body.reservations || []
+  // 알림 실패 상태를 벗어난 접수(다시 보내기 성공·완료·취소·목록에서 빠짐)는 '전달 여부 확인 필요'를 지운다.
+  const stillFailed = new Set(reservations.filter((r) => r.status === 'notify_failed').map((r) => r.id))
+  notifyUnknown.forEach((id) => {
+    if (!stillFailed.has(id)) notifyUnknown.delete(id)
+  })
+  render(reservations)
   notifyNewReservations(body.reservations)
 }
+
+// 대기열 조회 경로. carriedOver=1은 "어제 '대기 중'으로 남은 접수(carriedOver:true)도 보내 달라"는 뜻이다(서버 C2). 그 접수를 다룰 줄 모르는
+// 옛 탭앱은 이 값을 보내지 않으므로 서버가 예전 응답(오늘 접수와 어제 호출된 접수만)을 준다 -- 옛 탭앱이 어제 번호를 '다음 호출'로 띄우고
+// 누를 수 없는 버튼을 안내하는 일을 막는다.
+const QUEUE_PATH = '/api/pos/queue?carriedOver=1'
 
 // setInterval(아래 startPolling)은 콜백이 끝났는지 신경 쓰지 않고 다음 콜백을 그대로 실행한다.
 // 서버가 느려지면 한 단말기에서 응답 못 받은 요청이 계속 쌓이고, 가맹점 400곳이 동시에 그
@@ -432,18 +459,18 @@ async function loadQueue({ manual = false, bypassGuard = false } = {}) {
   if (!skipGuard) queueLoadInFlight = true
   if (manual || !lastReservations.length) setConnection('checking')
   try {
-    // 이 요청이 출발한 시점의 전산 주문 세대. 응답을 기다리는 사이 [POS로 되돌리기]·[프론트 결제]·[지우기] 같은
+    // 이 요청이 출발한 시점의 전산 주문 세대. 응답을 기다리는 사이 [POS로 되돌리기]·[프론트로 넘기기]·[지우기] 같은
     // 상태 변경이 성공하면 세대가 올라간다. 그러면 이 응답의 전산 주문·프론트 결제 목록은 변경 전에 만들어진
     // 옛 상태라서, 반영하면 방금 되돌린 카드가 사라지거나 방금 넘긴 카드가 되살아난다(erpCarts.js erpGeneration).
     const erpGeneration = getErpGeneration()
-    const { ok, status, body } = await apiGet('/api/pos/queue')
+    const { ok, status, body } = await apiGet(QUEUE_PATH)
     if (!ok) {
       if (status === 401) {
         handleUnauthorized(body.error)
         return false
       }
       setConnection('error')
-      if (!lastReservations.length) renderError(body.error || '서버에서 대기열을 확인할 수 없습니다.')
+      if (!lastReservations.length) renderError(body.error || '서버에서 대기열을 확인하지 못했어요.')
       return false
     }
     setConnection('online')
@@ -477,7 +504,7 @@ async function loadQueue({ manual = false, bypassGuard = false } = {}) {
     return true
   } catch {
     setConnection('error')
-    if (!lastReservations.length) renderError('네트워크 연결을 확인한 뒤 다시 시도해주세요.')
+    if (!lastReservations.length) renderError('인터넷 연결을 확인한 뒤 다시 시도해주세요.')
     return false
   } finally {
     // 어느 return 경로로 빠지든(성공/401/서버오류/네트워크오류·타임아웃) 반드시 풀어준다 —
@@ -606,7 +633,7 @@ async function validateAndEnter(token) {
   tokenSubmitEl.disabled = true
   tokenErrorEl.textContent = ''
   try {
-    const { ok, status, body } = await apiGet('/api/pos/queue')
+    const { ok, status, body } = await apiGet(QUEUE_PATH)
     if (ok) {
       showMainView()
       applyQueueResponse(body)
@@ -615,10 +642,10 @@ async function validateAndEnter(token) {
     }
     clearStoreToken()
     tokenErrorEl.textContent =
-      body.error || (status === 401 ? '매장 인증 토큰이 올바르지 않습니다.' : '토큰을 확인하는 중 오류가 발생했습니다. 다시 시도해주세요.')
+      body.error || (status === 401 ? '매장 토큰이 올바르지 않아요. 다시 확인해주세요.' : '토큰을 확인하는 중 문제가 생겼어요. 다시 시도해주세요.')
   } catch {
     clearStoreToken()
-    tokenErrorEl.textContent = '네트워크 연결을 확인한 뒤 다시 시도해주세요.'
+    tokenErrorEl.textContent = '인터넷 연결을 확인한 뒤 다시 시도해주세요.'
   } finally {
     tokenSubmitEl.disabled = false
   }
@@ -640,9 +667,27 @@ tokenInputEl.addEventListener('keydown', (e) => {
   }
 })
 
-// 매장 관리자가 관리자 웹에서 토큰을 재발급(회전)한 뒤, POS 단말기에서 다시 입력할 수 있는 통로.
-// 401을 받아야만 재입력 화면으로 갈 수 있다면, 아직 만료 전인데 미리 바꿔주려는 경우 대응이 안 된다.
+// 본사가 관리자 웹에서 토큰을 재발급(회전)한 뒤, POS 단말기에서 다시 입력할 수 있는 통로.
+// 401을 받아야만 재입력 화면으로 갈 수 있다면, 아직 옛 토큰이 살아 있는데 미리 바꿔주려는 경우 대응이 안 된다.
+// 누르면 지금 토큰이 바로 지워져 이 단말기의 대기열·전산 주문이 멈춘다 -- 토큰을 모르는 직원이 스쳐 누르면 그대로 막힌다.
+// 그래서 다른 위험한 버튼처럼 3초 안에 한 번 더 눌러야 지운다.
+const TOKEN_RESET_LABEL = '토큰 다시 입력'
+let tokenResetTimer = null
 tokenResetButtonEl.addEventListener('click', () => {
+  if (!tokenResetTimer) {
+    tokenResetButtonEl.classList.add('confirming')
+    tokenResetButtonEl.textContent = '한 번 더 누르면 지금 토큰을 지우고 입력 화면으로 가요'
+    tokenResetTimer = setTimeout(() => {
+      tokenResetTimer = null
+      tokenResetButtonEl.classList.remove('confirming')
+      tokenResetButtonEl.textContent = TOKEN_RESET_LABEL
+    }, 3000)
+    return
+  }
+  clearTimeout(tokenResetTimer)
+  tokenResetTimer = null
+  tokenResetButtonEl.classList.remove('confirming')
+  tokenResetButtonEl.textContent = TOKEN_RESET_LABEL
   clearStoreToken()
   showTokenScreen()
 })
@@ -682,7 +727,8 @@ async function main() {
 initErpCarts({ apiGet, apiPost, notify, escapeHtml, onUnauthorized: handleUnauthorized, noteActivity })
 initSettledCarts({ apiPost, notify, escapeHtml, onUnauthorized: handleUnauthorized, forgetLoadedCart })
 initPromoCampaign({ apiGet, apiPost, notify, escapeHtml, onUnauthorized: handleUnauthorized })
-initHistory({ apiGet, apiPost, notify, escapeHtml, onUnauthorized: handleUnauthorized })
+// queueCarNumbers: 정비 이력의 뒷번호(4자리) 찾기가 오늘 대기열의 차량번호도 함께 본다(history.js searchByTail).
+initHistory({ apiGet, apiPost, notify, escapeHtml, onUnauthorized: handleUnauthorized, queueCarNumbers: () => lastReservations.map((r) => r.carNumber) })
 initNav({ notify })
 
 // 오늘 현황은 폴링 대상이 아니다 — 화면을 열 때와 새로고침을 누를 때만 부른다.
@@ -712,19 +758,19 @@ async function loadTodaySummary() {
         handleUnauthorized(res.error)
         return
       }
-      body.innerHTML = `<div class="empty"><div class="empty-copy">${escapeHtml(res.error || '불러오지 못했습니다.')}</div></div>`
+      body.innerHTML = `<div class="empty"><div class="empty-copy">${escapeHtml(res.error || '불러오지 못했어요.')}</div></div>`
       return
     }
     const dateEl = document.getElementById('today-date')
     if (dateEl) dateEl.textContent = `${res.serviceDate} 기준`
     body.innerHTML = [
-      todayCard('접수', res.received, '건', '오늘 들어온 예약'),
+      todayCard('접수', res.received, '건', '오늘 들어온 접수'),
       todayCard('정비완료', res.completed, '건', '처리를 마친 건'),
-      todayCard('전산 주문', res.erpCarts, '건', `그중 결제완료 ${res.erpCartsPaid}건`),
+      todayCard('전산 주문', res.erpCarts, '건', `그중 결제 완료 ${res.erpCartsPaid}건`),
       todayCard('결제 금액', Number(res.paidAmount).toLocaleString('ko-KR'), '원', '전산 주문 결제분'),
     ].join('')
   } catch {
-    body.innerHTML = '<div class="empty"><div class="empty-copy">네트워크 연결을 확인한 뒤 다시 시도해주세요.</div></div>'
+    body.innerHTML = '<div class="empty"><div class="empty-copy">인터넷 연결을 확인한 뒤 다시 시도해주세요.</div></div>'
   }
 }
 
@@ -739,8 +785,8 @@ function renderSettings() {
   }
 }
 
-// 정비 대기 화면의 [정비 이력] 버튼. 대기열이 비어 있어도 이력을 볼 수 있어야 해서 카드의 [이력]과 별도로 둔다.
-// 화면에 버튼만 있고 연결이 없어서 눌러도 아무 일도 일어나지 않았다.
+// 정비 대기 화면 위의 [정비 이력] 버튼은 뺐다. 왼쪽 메뉴(좁은 화면에서는 위쪽 탭)에 [정비 이력]이 늘 보여서 같은 버튼이
+// 두 번 있었다. 옛 index.html이 남아 있는 미리보기에서도 동작하도록 연결만 남겨 둔다.
 const historyOpenEl = document.getElementById('history-open')
 if (historyOpenEl) historyOpenEl.addEventListener('click', () => switchTo('history'))
 

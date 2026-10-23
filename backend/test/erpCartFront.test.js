@@ -981,7 +981,7 @@ testSerial('풀린 뒤 승인 보고: POS로 되돌린 주문이면 404 대신 4
   assert.equal(late.body.status, 'pending')
   const log = logs.find((l) => l.message === PAID_AFTER_RELEASE_LOG)
   assert.ok(log, '대사 필요 로그가 남지 않았다')
-  assert.deepEqual(log.meta, { cartId, status: 'pending', payTarget: 'pos', paymentKey: key, approvalNumber: '30012345', amount: 65000 })
+  assert.deepEqual(log.meta, { event: 'recon_needed', cartId, status: 'pending', payTarget: 'pos', paymentKey: key, approvalNumber: '30012345', amount: 65000 })
   const row = await rowOf(cartId)
   assert.equal(row.status, 'pending')
   assert.equal(row.payTarget, 'pos')

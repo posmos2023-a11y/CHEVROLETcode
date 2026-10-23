@@ -14,12 +14,15 @@ QThread.moveToThread로 옮기는 표준 패턴을 쓴다. QRunnable 대신 이 
 있는 편이 정지 신호(stop) 처리가 더 명확하기 때문.
 """
 
+import logging
 import secrets
 import time
 from datetime import datetime
 
 import requests
 from PyQt5.QtCore import QObject, QThread, pyqtSignal
+
+logger = logging.getLogger(__name__)
 
 
 class ApiError(Exception):
@@ -70,7 +73,9 @@ class ApiClient:
             # 있을 거라(계약서에도 명시됨) 예외 종류별로 메시지를 다르게
             # 만들지 않고 하나로 뭉뚱그린다 — 사용자가 알아야 할 건
             # "지금은 연결이 안 된다"는 사실뿐이다.
-            raise ApiError(f"서버에 연결할 수 없습니다: {exc}") from exc
+            # requests 예외 원문(영문, 수백 자)은 상태줄에 붙이지 않고 로그로만 남긴다.
+            logger.warning("서버 연결 실패: %s %s: %s", method, url, exc)
+            raise ApiError("서버에 연결할 수 없어요. 인터넷 연결과 [설정]의 API 서버 주소를 확인해주세요.") from exc
 
         try:
             data = resp.json()
@@ -81,7 +86,7 @@ class ApiClient:
             error_message = None
             if isinstance(data, dict):
                 error_message = data.get("error")
-            error_message = error_message or f"서버 오류 (HTTP {resp.status_code})"
+            error_message = error_message or f"서버 오류가 발생했어요(코드 {resp.status_code}). 잠시 후 다시 시도해주세요."
             raise ApiError(error_message)
 
         if data is None:

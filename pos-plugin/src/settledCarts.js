@@ -13,7 +13,7 @@
 //
 // 정리 기능(리허설·테스트 기록용): [숨기기]는 이 목록과 정비 이력에서만 감춘다(맨 위 '숨긴 N건 보기'로 다시
 // 꺼낼 수 있다). [삭제]는 탭앱·오늘 현황·관리자 웹 어디에도 안 보이게 한다(서버는 행을 지우지 않는다 --
-// 실제 결제라 분쟁·대사 근거가 남아야 한다). [영수증 보내기]는 예약 손님 번호로 전자영수증을 (다시) 보낸다.
+// 실제 결제라 분쟁·대사 근거가 남아야 한다). [영수증 보내기]는 이어진 접수 손님 번호로 전자영수증을 (다시) 보낸다.
 //
 // POS에 담김(결제 전) 카드:
 //   - [POS에서 결제했어요]: 결제는 했는데 탭앱이 전산 주문과 맞추지 못한 경우(다른 POS 상품을 함께 결제, 같은 내용의
@@ -24,7 +24,7 @@
 //   - [POS에서 다시 결제했어요]: 직원이 POS [주문]에서 결제를 취소하고 다른 카드로 다시 결제한 경우. 같은 고르기 칸으로 새 결제를
 //     골라 기록하면 서버가 결제 완료로 되살린다(restored).
 // 프론트 승인 경고(frontOrphan)가 있는 카드는 빨간 경고를 띄우고 [POS에서 결제했어요]·[POS에서 다시 결제했어요] 앞에서 한 번 더 확인받는다.
-// 담김 카드에는 [프론트 승인으로 결제 완료 기록]을 둔다(그 승인이 이 주문의 결제인 경우). 매장이 확인한 경고(ackAt)는 접어서 보여준다.
+// 담김 카드에는 [프론트 결제로 완료 처리]를 둔다(그 승인이 이 주문의 결제인 경우). 매장이 확인한 경고(ackAt)는 접어서 보여준다.
 import { posPluginSdk } from '@tossplace/pos-plugin-sdk'
 import {
   canRecordFrontOrphan,
@@ -62,7 +62,11 @@ const sdkCancelFailed = new Set()
 // SDK 30초 시간 제한("지연되고 있습니다")에 걸린 POS 결제. 취소가 실패한 게 아니라 결과를 모르는 상태라서
 // sdkCancelFailed와 따로 둔다 -- 그쪽에 넣으면 [결제 취소]가 사라져, 실제로는 취소 안 된 결제를 여기서 다시 못 취소한다.
 const sdkCancelTimedOut = new Set()
-// 두 상태의 키는 주문과 결제의 짝이다. 예전에는 주문 ID만 써서, 옛 결제의 취소가 막힌 뒤 [POS에서 다시 결제했어요]로 새 결제가 복원돼도
+// SDK 취소는 됐는데 서버 기록(/refunded)만 실패한 POS 결제(429·5xx·연결 끊김). sdkCancelFailed와 따로 둔다 -- 그쪽 카드 안내('여기서는
+// 취소할 수 없는 결제예요. POS [주문]에서 직접 취소한 뒤…')를 따르면 이미 취소된 결제를 다시 취소하려 하거나, 그 사이 다른 카드로 다시
+// 결제한 새 결제를 POS [주문]에서 취소해 받은 돈을 돌려줄 수 있다. 이 카드에는 [POS에서 취소했어요](기록만)만 보여준다.
+const refundRecordFailed = new Set()
+// 세 상태의 키는 주문과 결제의 짝이다. 예전에는 주문 ID만 써서, 옛 결제의 취소가 막힌 뒤 [POS에서 다시 결제했어요]로 새 결제가 복원돼도
 // 상태가 남았다 -- 복원된 카드에 [결제 취소] 없이 [POS에서 취소했어요]만 보여, 직원이 옛 결제를 보고 누르면 받은 새 결제가 환불로 기록됐다.
 // 결제가 바뀌면 키도 바뀌어 상태가 풀린다(서버도 /refunded에 실은 결제 ID가 다르면 PAYMENT_CHANGED로 막는다).
 function cancelKey(cart) {
@@ -84,9 +88,10 @@ const SHARED_CONFIRM_MS = 10 * 1000
 const REPAY_LOOKBACK_MS = 30 * 60 * 1000
 // 프론트 승인 경고가 있는 카드에서 결제를 기록하기 전에 한 번 더 확인받는 동작과 그 문구(handleClick).
 const ORPHAN_GATED = new Set(['pos-paid', 'pos-repaid'])
-const ORPHAN_STAGE_LABEL = '프론트 승인 건입니다. 그래도 POS 결제를 고를까요?'
+// '프론트 승인 건'만으로는 왜 멈추는지(이중 결제 위험) 알 수 없어서 결과를 말로 적는다(erpCarts의 담기·넘기기 확인과 같은 표현).
+const ORPHAN_STAGE_LABEL = '손님이 프론트에서 이미 결제했을 수 있어요. 그래도 POS 결제를 고를까요?'
 const ORPHAN_CONFIRM_MS = 10 * 1000
-// 확인 문구를 읽을 시간이 더 필요한 동작(프론트 승인 경고의 [확인했어요]·[프론트 승인으로 결제 완료 기록]).
+// 확인 문구를 읽을 시간이 더 필요한 동작(프론트 승인 경고의 [확인했어요]·[프론트 결제로 완료 처리]).
 const LONG_CONFIRM = new Set(['orphan-ack', 'orphan-record'])
 // 서버가 "다른 단말기에서 담은 주문"이라며 담기 취소를 거절했지만, 이제는 여기서 되돌려도 된다고(canForceAfterSec 0)
 // 답한 카드. 이 카드에만 [그래도 되돌리기]를 따로 보여준다.
@@ -95,12 +100,20 @@ const forceUnloadAllowed = new Set()
 const CLOCK_SKEW_MS = 5 * 60 * 1000
 const NO_UNMATCHED_MESSAGE =
   '이 단말기에는 전산 주문과 맞추지 못한 POS 결제가 없습니다. POS [주문]에서 이 주문이 결제됐는지 확인해주세요. ' +
-  '다른 단말기에서 결제했다면 그 단말기의 [최근 결제]에서 눌러주세요.'
+  '다른 단말기에서 결제했다면 그 단말기의 [최근 결제]에서 [POS에서 결제했어요]를 눌러주세요.'
 const NO_REPAY_MESSAGE =
   'POS에서 취소된 뒤 이 단말기에 전산 주문과 맞추지 못한 POS 결제가 없습니다. POS [주문]에서 다시 결제했는지 확인해주세요. ' +
-  '다른 단말기에서 결제했다면 그 단말기의 [최근 결제]에서 눌러주세요.'
+  '다른 단말기에서 결제했다면 그 단말기의 [최근 결제]에서 [POS에서 다시 결제했어요]를 눌러주세요.'
 const DOUBLE_PAID_MESSAGE = '이 주문은 이미 다른 결제로 결제됐습니다. 이중 결제인지 POS [주문]에서 확인하세요.'
-const CLOSED_LABEL = { dismissed: '지워진', failed: '실패 처리된', cancelled: '취소된', refunded: '환불된', expired: '만료된' }
+// 여기서 취소는 됐는데 서버 기록만 실패한 결제의 카드 안내(refundRecordFailed).
+const REFUND_RECORD_FAILED_HINT = '취소는 됐어요. [POS에서 취소했어요]로 기록해주세요.'
+// 프론트 간편결제(BARCODE -- 페이스페이도 여기로 온다)의 취소 요청 안내. 플러그인 모드 프론트의 '페이스페이로 취소' 버튼은 토스 프론트 앱
+// 업데이트(2026-10-26~30 예정, 늦어질 수 있음)부터 생긴다. 그 전에는 업데이트할 버전이 없어서 '앱을 업데이트하라'는 안내는 막다른 길이었다 --
+// 지금 실제로 되는 방법은 플러그인을 끈 기본 프론트에서 얼굴 인식으로 취소하는 것뿐이다. 그 취소는 이 탭앱에 기록할 길이 없다(프론트 결제
+// 카드에는 [POS에서 취소했어요]가 없다) -- 본사에 기록을 요청하게 한다. 앱 배포를 확인하면 이 문구를 바꾼다.
+const FACEPAY_REFUND_HINT = '페이스페이 취소 버튼이 아직 없으면 프론트에서 플러그인을 끄고 기본 화면에서 얼굴 인식으로 취소해주세요. 취소 뒤 기록은 본사에 요청해주세요.'
+// POS 화면은 카드 결제를 되돌리는 일을 '결제 취소'라 부른다(버튼 [결제 취소], 상태 '취소됨'). '환불'은 현금에만 쓴다.
+const CLOSED_LABEL = { dismissed: '지워진', failed: '실패 처리된', cancelled: '취소된', refunded: '결제 취소된', expired: '만료된' }
 
 export function initSettledCarts(injected) {
   deps = injected
@@ -134,6 +147,7 @@ function formatTime(value) {
   return new Intl.DateTimeFormat('ko-KR', opts).format(d)
 }
 
+// 모르는 값(서버가 새 결제수단을 보낸 경우)은 영문 내부 값을 그대로 보이지 않고 '기타'로 쓴다.
 const METHOD_LABEL = { CARD: '카드', CASH: '현금', BARCODE: '간편결제' }
 
 // 진행 중인 프론트 취소. 서버가 숨기기를 거부(409)하므로 숨김 상태와 관계없이 늘 목록에 보이고 [숨기기]도 없다.
@@ -163,8 +177,19 @@ function statusLabel(cart) {
         : { text: `프론트에서 취소 중 · ${minutes}분째`, cls: 'paying stuck' }
     }
     case 'refunded': return { text: '취소됨', cls: 'refunded' }
-    default: return { text: cart.status, cls: '' }
+    // 이 목록에 올 일이 거의 없는 상태들(기록 직후 서버가 다른 상태로 답한 경우 등). 영문 내부 값('dismissed' 등)을
+    // 직원에게 그대로 보이지 않는다.
+    default: return { text: OTHER_STATUS_LABEL[cart.status] || '확인 필요', cls: '' }
   }
+}
+
+const OTHER_STATUS_LABEL = {
+  pending: '결제 전',
+  paying: '프론트 결제 중',
+  dismissed: '지워짐',
+  failed: '담기 실패',
+  cancelled: '전산 취소',
+  expired: '만료됨',
 }
 
 function button(action, cart, label, confirmLabel, extraClass = '') {
@@ -179,7 +204,8 @@ function button(action, cart, label, confirmLabel, extraClass = '') {
 }
 
 // 정리·영수증 버튼(결제 취소 버튼과 줄을 나눠 실수로 누르지 않게 한다).
-const RECEIPT_LABEL = { sent: '영수증 보냄', failed: '영수증 발송 실패', no_reservation: '예약 없음 · 영수증 못 보냄', no_phone: '연락처 없음' }
+// 키(no_reservation 등)는 서버가 주는 receiptStatus 값이라 그대로 둔다. no_reservation은 같은 차량의 오늘 접수와 이어지지 않았다는 뜻이다.
+const RECEIPT_LABEL = { sent: '영수증 보냄', failed: '영수증 발송 실패', no_reservation: '접수 연결 안 됨 · 영수증 못 보냄', no_phone: '연락처 없음 · 영수증 못 보냄' }
 
 function toolsFor(cart) {
   // 결제 전(POS에 담김) 건은 POS에서 결제하거나 비우면 된다 -- 여기서 숨기거나 지울 대상이 아니다.
@@ -195,7 +221,8 @@ function toolsFor(cart) {
     parts.push(cart.hidden ? button('unhide', cart, '다시 보이기', '') : button('hide', cart, '숨기기', ''))
   }
   if (cart.status === 'paid' || cart.status === 'refunded') {
-    parts.push(button('delete', cart, '삭제', '정말 삭제할까요?', 'danger'))
+    // [숨기기]와 무엇이 다른지 확인 문구에 적는다: 삭제는 정비 이력·오늘 현황에서도 빠지고 되돌릴 수 없다(서버 소프트 삭제).
+    parts.push(button('delete', cart, '삭제', '정비 이력·오늘 현황에서도 빠지고 되돌릴 수 없어요. 삭제할까요?', 'danger wrap'))
   }
   return parts.join('')
 }
@@ -332,7 +359,7 @@ function actionsFor(cart) {
       : '정말 되돌릴까요? POS [주문]의 품목도 함께 지웁니다'
     const parts = [
       button('pos-paid', cart, 'POS에서 결제했어요', '결제한 내역을 고를까요?', 'wrap'),
-      button('unload', cart, '담기 취소(다시 대기로)', unloadConfirm, 'wrap'),
+      button('unload', cart, '담기 취소', unloadConfirm, 'wrap'),
     ]
     if (forceUnloadAllowed.has(cart.id)) {
       // 담은 단말기의 장바구니에는 품목이 그대로 남는다. 거기서 결제되면 이중 결제라 따로, 더 분명하게 묻는다.
@@ -350,15 +377,16 @@ function actionsFor(cart) {
 
   if (cart.payTarget === 'pos' && cart.status === 'paid') {
     const shared = cart.sharedPaymentCount > 1
-    const cancelConfirm = shared ? `함께 결제된 ${cart.sharedPaymentCount}건 모두 취소?` : '정말 결제 취소할까요?'
+    const cancelConfirm = shared ? `함께 결제된 ${cart.sharedPaymentCount}건 모두 결제 취소할까요?` : '정말 결제 취소할까요?'
     const hasIds = Boolean(cart.tossPaymentId && cart.tossOrderId)
     const key = cancelKey(cart)
     const parts = []
-    if (hasIds && !sdkCancelFailed.has(key)) {
+    // 취소는 됐고 기록만 실패한 결제(refundRecordFailed)에는 [결제 취소]를 두지 않는다 -- 다시 취소할 결제가 없다.
+    if (hasIds && !sdkCancelFailed.has(key) && !refundRecordFailed.has(key)) {
       parts.push(button('pos-cancel', cart, '결제 취소', cancelConfirm, 'danger'))
     }
     // 시간 초과는 두 버튼을 함께 둔다: 취소가 됐을 수도 안 됐을 수도 있어서, 안 됐으면 다시 취소하고 됐으면 기록한다.
-    if (!hasIds || sdkCancelFailed.has(key) || sdkCancelTimedOut.has(key)) {
+    if (!hasIds || sdkCancelFailed.has(key) || refundRecordFailed.has(key) || sdkCancelTimedOut.has(key)) {
       parts.push(button('pos-recorded', cart, 'POS에서 취소했어요', '취소 완료로 기록할까요?'))
     }
     return parts.join('')
@@ -430,11 +458,11 @@ function pickerHtml(cart) {
 }
 
 // 프론트 승인 경고. 문구는 주문 상태에 따라 다르다(결제 완료·취소 카드는 "두 번 냈을 수 있으니 한쪽을 환불하세요"). 담김 카드에는
-// [프론트 승인으로 결제 완료 기록]을 둔다(erpCarts.recordFrontOrphan). 매장이 확인한 경고는 한 줄로 접고 버튼을 두지 않는다.
+// [프론트 결제로 완료 처리]를 둔다(erpCarts.recordFrontOrphan). 매장이 확인한 경고는 한 줄로 접고 버튼을 두지 않는다.
 function orphanHtml(cart) {
   if (!hasFrontOrphan(cart)) return ''
   if (!isFrontOrphanOpen(cart)) {
-    return `<div class="erp-cart-memo front-orphan-acked">${deps.escapeHtml(frontOrphanAckedText(cart.frontOrphan))}</div>`
+    return `<div class="erp-cart-memo front-orphan-acked">${deps.escapeHtml(frontOrphanAckedText(cart.frontOrphan, cart.status))}</div>`
   }
   const record = canRecordFrontOrphan(cart)
     ? button('orphan-record', cart, ORPHAN_RECORD_LABEL, deps.escapeHtml(orphanRecordConfirmText(cart.frontOrphan)), 'orphan-ack wrap')
@@ -450,7 +478,7 @@ function render() {
   const hiddenCount = lastCarts.filter(isHiddenAway).length
   const visible = showHidden ? lastCarts : lastCarts.filter((c) => !isHiddenAway(c))
   const hiddenBar = hiddenCount
-    ? `<button class="settled-hidden-toggle" type="button" data-toggle-hidden="1">${showHidden ? '숨긴 결제 감추기' : `숨긴 결제 ${hiddenCount}건 보기`}</button>`
+    ? `<button class="settled-hidden-toggle" type="button" data-toggle-hidden="1">${showHidden ? '숨긴 결제 접기' : `숨긴 결제 ${hiddenCount}건 보기`}</button>`
     : ''
   // 비어 있어도 칸은 남긴다 -- 숨기면 결제 취소를 어디서 하는지 찾을 수 없다.
   if (!visible.length) {
@@ -467,7 +495,7 @@ function render() {
     .map((cart) => {
       const s = statusLabel(cart)
       const where = cart.payTarget === 'front'
-        ? `프론트${cart.paymentMethod ? ` · ${METHOD_LABEL[cart.paymentMethod] || cart.paymentMethod}` : ''}`
+        ? `프론트${cart.paymentMethod ? ` · ${METHOD_LABEL[cart.paymentMethod] || '기타'}` : ''}`
         : 'POS'
       const items = (cart.items || [])
         .map((i) => `${deps.escapeHtml(i.name)} ×${Number(i.quantity) || 0}`)
@@ -480,13 +508,32 @@ function render() {
       const repayHint = isRecentPosCancel(cart) && paidPicker?.cartId !== cart.id && repayOptions(cart).length
         ? '<div class="erp-cart-memo settled-warn">POS에서 취소된 뒤 이 단말기에 전산 주문과 맞추지 못한 POS 결제가 있습니다. 다른 카드로 다시 결제했다면 [POS에서 다시 결제했어요]를 눌러주세요.</div>'
         : ''
+      // 꼭 따라야 할 지시는 몇 초 뒤 사라지는 토스트에만 두지 않고 카드에도 남긴다(흐름 QA #11).
+      //   - 여기서 취소할 수 없는 POS 결제(나눠 결제·금액 확인 불가 등): POS [주문]에서 직접 취소한 뒤 기록해야 한다.
+      //   - 여기서 취소는 됐는데 기록만 실패한 결제: 다시 취소하지 말고 기록만 하면 된다(refundRecordFailed).
+      //   - 다른 단말기가 담은 주문의 [그래도 되돌리기]: 그 단말기 장바구니를 먼저 정리해야 이중 결제가 안 난다.
+      //   - 프론트 간편결제(페이스페이 포함)의 취소 요청: 페이스페이 취소 버튼이 없는 프론트에서 할 일(frontRefundHint).
+      const key = cancelKey(cart)
+      const cancelFailedHint = cart.status !== 'paid' || sdkCancelTimedOut.has(key)
+        ? ''
+        : refundRecordFailed.has(key)
+          ? `<div class="erp-cart-memo settled-warn">${REFUND_RECORD_FAILED_HINT}</div>`
+          : sdkCancelFailed.has(key)
+            ? '<div class="erp-cart-memo settled-warn">여기서는 취소할 수 없는 결제예요. POS [주문]에서 직접 취소한 뒤 [POS에서 취소했어요]를 눌러주세요.</div>'
+            : ''
+      const frontRefundHint = cart.payTarget === 'front' && cart.paymentMethod === 'BARCODE' && isRefundInProgress(cart)
+        ? `<div class="erp-cart-memo settled-warn">${FACEPAY_REFUND_HINT}</div>`
+        : ''
+      const forceUnloadHint = cart.status === 'loaded' && forceUnloadAllowed.has(cart.id)
+        ? '<div class="erp-cart-memo settled-warn">다른 단말기에서 담은 주문이에요. 그 단말기에서 결제하지 않았는지 확인하고 그 단말기의 품목을 지운 뒤 [그래도 되돌리기]를 눌러주세요.</div>'
+        : ''
       return `
         <article class="erp-cart-item settled-cart-item${cart.status === 'refunded' ? ' is-refunded' : ''}${cart.hidden ? ' is-hidden' : ''}${isFrontOrphanOpen(cart) ? ' has-front-orphan' : ''}">
           <div class="erp-cart-ref">${deps.escapeHtml(cart.referenceId || '')} · ${cart.paidAt ? `${formatTime(cart.paidAt)} 결제` : `${formatTime(cart.loadedAt)} POS에 담음`}</div>
           <div class="erp-cart-head">
             <strong class="erp-cart-car">${deps.escapeHtml(cart.carNumber || cart.memo || '-')}</strong>
             <span class="settled-status ${s.cls}">${s.text}</span>
-            ${cart.tossVerified ? '<span class="settled-verified" title="토스 결제내역에서 같은 결제를 확인했습니다">토스 확인</span>' : ''}
+            ${cart.tossVerified ? '<span class="settled-verified" title="토스 결제내역에서 같은 결제를 확인했습니다">토스 내역 확인됨</span>' : ''}
           </div>
           ${orphan}
           <div class="erp-cart-summary">${where}${items ? ` · ${items}` : ''}</div>
@@ -496,6 +543,9 @@ function render() {
           ${sdkCancelTimedOut.has(cancelKey(cart)) && cart.status === 'paid' ? '<div class="erp-cart-memo settled-warn">POS [주문]에서 이 결제가 취소됐는지 확인해주세요. 취소됐으면 [POS에서 취소했어요]를, 아니면 [결제 취소]를 다시 눌러주세요.</div>' : ''}
           ${cart.status === 'loaded' && paidPicker?.cartId !== cart.id && unmatchedAfterLoad(cart).length ? '<div class="erp-cart-memo settled-warn">담은 뒤 이 단말기에서 전산 주문과 맞추지 못한 POS 결제가 있습니다. 이 주문을 결제했다면 [POS에서 결제했어요]를 눌러주세요.</div>' : ''}
           ${repayHint}
+          ${cancelFailedHint}
+          ${frontRefundHint}
+          ${forceUnloadHint}
           ${receipt ? `<div class="erp-cart-memo">${deps.escapeHtml(receipt)}</div>` : ''}
           ${actions ? `<div class="erp-cart-actions">${actions}</div>` : ''}
           ${pickerHtml(cart)}
@@ -644,13 +694,20 @@ async function run(action, cartId) {
       const res = await post(`/api/pos/erp-carts/${cartId}/refund-request`)
       if (!res.ok) return deps.notify('error', res.body.error || '취소를 요청하지 못했습니다.')
       markLocal([cartId], { status: 'refund_requested' })
-      return deps.notify('success', '프론트로 취소를 요청했습니다. 손님이 프론트에서 결제한 카드를 꽂으면 취소됩니다.')
+      // 간편결제에는 페이스페이도 있다(FACEPAY_REFUND_HINT -- 같은 안내를 카드에도 남긴다, render frontRefundHint).
+      // 카드는 꽂는 손님도 대는(접촉) 손님도 있다.
+      const howTo = cart.paymentMethod === 'BARCODE'
+        ? `손님이 프론트에서 결제했던 앱 바코드로 취소합니다. ${FACEPAY_REFUND_HINT}`
+        : '손님이 결제한 카드를 프론트에 꽂거나 대면 취소됩니다.'
+      return deps.notify('success', `프론트로 취소를 요청했습니다. ${howTo}`)
     }
     if (action === 'hide' || action === 'unhide') {
       const res = await post(`/api/pos/erp-carts/${cartId}/hide`, { hidden: action === 'hide' })
       if (!res.ok) return deps.notify('error', res.body.error || '처리하지 못했습니다.')
       markLocal([cartId], { hidden: action === 'hide' })
-      return deps.notify('success', action === 'hide' ? '숨겼습니다. 맨 위 [숨긴 결제 보기]로 다시 볼 수 있습니다.' : '다시 보이게 했습니다.')
+      // 맨 위 버튼의 실제 글자('숨긴 결제 N건 보기')와 같게 안내한다.
+      const hiddenNow = lastCarts.filter((c) => c.hidden && !isRefundInProgress(c)).length
+      return deps.notify('success', action === 'hide' ? `숨겼어요. 맨 위 [숨긴 결제 ${hiddenNow}건 보기]에서 다시 볼 수 있어요.` : '다시 보이게 했어요.')
     }
     if (action === 'delete') {
       const res = await post(`/api/pos/erp-carts/${cartId}/delete`)
@@ -994,7 +1051,7 @@ async function cancelOnPos(cart) {
   // 결제는 이미 취소됐다. 손님이 다른 카드로 새 POS 주문을 찍어 다시 결제할 수 있으니 다시 결제를 기다리는 창을 먼저 연다 -- 아래 기록이
   // 실패해도 열려 있어야 한다(erpCarts.js repay 창 주석). 기록이 실패해도 토스 취소 웹훅이 오면 서버가 맞춘다.
   openRepayWindow(sharedCartsOf(cart, [cart.id]))
-  await recordRefund(cart, 'pos', '결제를 취소했습니다.')
+  await recordRefund(cart, 'pos', '결제를 취소했습니다.', { cancelled: true })
 }
 
 // 같은 결제로 함께 기록된 주문들(서버가 돌려준 ID)의 { id, ref }. 목록에 없는 ID는 ID를 참조번호 대신 쓴다.
@@ -1005,7 +1062,9 @@ function sharedCartsOf(cart, ids) {
   })
 }
 
-async function recordRefund(cart, method, successMessage) {
+// cancelled: 이 탭앱이 방금 SDK로 결제를 취소했다(cancelOnPos). 기록이 실패해도 결제는 이미 취소된 것이라 안내와 카드 상태를 따로 둔다.
+async function recordRefund(cart, method, successMessage, { cancelled = false } = {}) {
+  const key = cancelKey(cart)
   // POS 취소는 어느 결제를 취소했는지 함께 보낸다. 그 사이 [POS에서 다시 결제했어요]로 결제가 바뀌었으면 서버가 PAYMENT_CHANGED로 막는다 --
   // 막지 않으면 옛 결제의 취소 기록이 새로 받은 결제까지 환불로 바꾼다.
   const body = method === 'pos' && cart.tossPaymentId ? { method, paymentId: cart.tossPaymentId } : { method }
@@ -1014,8 +1073,9 @@ async function recordRefund(cart, method, successMessage) {
     if (res.status === 401) return
     if (res.status === 409 && res.body && res.body.code === 'PAYMENT_CHANGED') {
       // 카드의 결제가 낡았다. 이 상태로 [POS에서 취소했어요]를 다시 보여주면 같은 거절이 반복되니 상태를 남기지 않고 새 목록을 기다린다.
-      sdkCancelFailed.delete(cancelKey(cart))
-      sdkCancelTimedOut.delete(cancelKey(cart))
+      sdkCancelFailed.delete(key)
+      sdkCancelTimedOut.delete(key)
+      refundRecordFailed.delete(key)
       try {
         if (typeof deps.noteActivity === 'function') deps.noteActivity()
       } catch {
@@ -1024,10 +1084,20 @@ async function recordRefund(cart, method, successMessage) {
       deps.notify('error', '결제가 바뀌었습니다(다시 결제 기록됨). 목록을 새로 불러온 뒤 다시 확인해주세요')
       return
     }
+    // 이미 취소된 결제의 기록이 실패했다(방금 SDK로 취소했거나, 그 뒤의 기록 재시도가 또 실패). '여기서 취소할 수 없는 결제' 안내(sdkCancelFailed)를
+    // 띄우면 직원이 이미 취소된 결제를 POS [주문]에서 다시 취소하려 한다 -- 결제는 취소됐다고 먼저 말하고 기록만 다시 하게 한다.
+    if (method === 'pos' && (cancelled || refundRecordFailed.has(key))) {
+      refundRecordFailed.add(key)
+      sdkCancelFailed.delete(key)
+      const reason = res.body && res.body.error ? ` (${res.body.error})` : ''
+      deps.notify('error', `결제는 취소됐지만 기록하지 못했어요. 잠시 후 [POS에서 취소했어요]로 기록해주세요.${reason}`)
+      return
+    }
     deps.notify('error', res.body.error || '취소를 기록하지 못했습니다. 잠시 후 [POS에서 취소했어요]로 다시 기록해주세요.')
-    if (method === 'pos') sdkCancelFailed.add(cancelKey(cart))
+    if (method === 'pos') sdkCancelFailed.add(key)
     return
   }
+  refundRecordFailed.delete(key)
   const ids = res.body.refundedCartIds || [cart.id]
   markLocal(ids, { status: 'refunded', refundNote: method === 'cash' ? '현금 환불(기록만)' : 'POS에서 결제 취소', refundedAt: new Date().toISOString() })
   if (method === 'pos') {

@@ -1,6 +1,11 @@
 const CAR_NUMBER_RE = /^\d{2,3}[가-힣]\d{4}$/
 const PHONE_RE = /^01[0-9]{8,9}$/
 
+// '12가 3456', '12가-3456'처럼 띄어 쓰거나 하이픈을 넣어도 받는다 -- 서버(normalizeCarNumber)와 같은 정규화다.
+function normalizeCarNumber(raw) {
+  return String(raw || '').replace(/[\s-]/g, '')
+}
+
 const mode = new URLSearchParams(location.search).get('mode') === 'payment' ? 'payment' : 'reservation'
 // 플러그인이 탭앱으로 이 페이지를 띄울 때 자기 merchantId를 쿼리파라미터로 넘겨준다
 // (예: index.html?merchantId=xxx&mode=payment). 없으면 서버가 가맹점을 식별할 수 없어 400을 반환한다.
@@ -42,7 +47,7 @@ const doneMessage = document.getElementById('doneMessage')
 
 let carNumber = ''
 let serviceType = ''
-const submitLabel = mode === 'payment' ? '영수증 받기' : '예약 완료'
+const submitLabel = mode === 'payment' ? '영수증 받기' : '접수하기'
 
 // 서버가 idempotency/중복 결제 판별에 쓰는 키. 같은 제출 시도(네트워크 재시도 포함) 동안에는
 // 값을 재사용해야 중복 Payment/Reservation 생성을 막을 수 있으므로, 처음 필요할 때 한 번만 생성해
@@ -79,24 +84,24 @@ function setSubmitting(isSubmitting) {
 
 carNumberInput.addEventListener('input', () => {
   carError.textContent = ''
-  toPhoneBtn.disabled = !CAR_NUMBER_RE.test(carNumberInput.value.trim())
+  toPhoneBtn.disabled = !CAR_NUMBER_RE.test(normalizeCarNumber(carNumberInput.value))
 })
 
 carNumberInput.addEventListener('keydown', e => {
-  if (e.key === 'Enter' && !toPhoneBtn.disabled) goFromCarStep(carNumberInput.value.trim())
+  if (e.key === 'Enter' && !toPhoneBtn.disabled) goFromCarStep(normalizeCarNumber(carNumberInput.value))
 })
 
-toPhoneBtn.addEventListener('click', () => goFromCarStep(carNumberInput.value.trim()))
+toPhoneBtn.addEventListener('click', () => goFromCarStep(normalizeCarNumber(carNumberInput.value)))
 
 skipCarBtn.addEventListener('click', () => goFromCarStep(''))
 
 function goFromCarStep(value) {
   if (value && !CAR_NUMBER_RE.test(value)) {
-    carError.textContent = '차량번호 형식이 올바르지 않습니다. 예) 12가3456'
+    carError.textContent = '차량번호를 다시 확인해주세요. 예) 12가3456'
     return
   }
   if (mode === 'reservation' && !value) {
-    carError.textContent = '차량번호 형식이 올바르지 않습니다. 예) 12가3456'
+    carError.textContent = '차량번호를 다시 확인해주세요. 예) 12가3456'
     return
   }
   carNumber = value
@@ -160,7 +165,7 @@ async function submitReservation() {
   const amount = amountInput.value.trim()
 
   if (!PHONE_RE.test(phone)) {
-    phoneError.textContent = '전화번호 형식이 올바르지 않습니다.'
+    phoneError.textContent = '휴대폰 번호를 다시 확인해주세요. 예) 01012345678'
     return
   }
   if (!privacyConsentInput.checked) {
@@ -168,7 +173,7 @@ async function submitReservation() {
     return
   }
   if (!merchantId) {
-    phoneError.textContent = '가맹점 정보가 없는 링크입니다. 담당 매장에 문의해주세요.'
+    phoneError.textContent = '매장 정보를 확인할 수 없어요. 직원에게 문의해주세요.'
     return
   }
 
@@ -212,8 +217,10 @@ async function submitReservation() {
     })
     const json = await res.json().catch(() => ({}))
 
+    // 실패하면 입력한 값을 그대로 두고 이 화면에 머문다 -- 접수가 몰려 한도에 걸린 경우(429 RATE_LIMITED)도 잠시 뒤 같은 버튼으로
+    // 다시 보내면 된다(같은 Idempotency-Key라 두 번 접수되지 않는다).
     if (!res.ok) {
-      phoneError.textContent = json.error || '처리 중 오류가 발생했습니다.'
+      phoneError.textContent = json.error || '처리 중 오류가 발생했어요. 잠시 후 다시 시도해주세요.'
       setSubmitting(false)
       return
     }
@@ -222,12 +229,18 @@ async function submitReservation() {
       doneTitle.textContent = '전자영수증이 발송되었습니다'
       doneMessage.textContent = '알림톡을 확인해주세요.'
     } else {
-      doneTitle.textContent = '예약이 접수되었습니다'
-      doneMessage.textContent = `대기번호 ${json.queueNumber}번. 순서가 되면 알림톡으로 안내드려요.`
+      // duplicate: 같은 차·같은 번호가 오늘 이미 대기열에 있어 서버가 기존 접수를 돌려줬다(새 번호·새 알림 없음).
+      // 이미 호출된(called·notify_failed) 접수면 호출 문자는 이미 나갔고(또는 실패했고) 다시 보내지 않는다 -- '알려드릴게요'라고 하면
+      // 손님이 오지 않을 문자를 기다린다. 토스 프론트(showAccepted)와 같은 기준으로 직원에게 말하라고 안내한다.
+      const alreadyCalled = json.duplicate && (json.status === 'called' || json.status === 'notify_failed')
+      doneTitle.textContent = json.duplicate ? '이미 접수되어 있어요' : '접수했어요'
+      doneMessage.textContent = alreadyCalled
+        ? `대기번호는 ${json.queueNumber}번이에요. 이미 순서가 됐어요. 직원에게 말씀해주세요.`
+        : `대기번호는 ${json.queueNumber}번이에요. 순서가 되면 메시지로 알려드릴게요.`
     }
     setStep('done')
   } catch (err) {
-    phoneError.textContent = '네트워크 오류가 발생했습니다.'
+    phoneError.textContent = '인터넷 연결이 불안정해요. 잠시 후 다시 시도해주세요.'
     setSubmitting(false)
   }
 }

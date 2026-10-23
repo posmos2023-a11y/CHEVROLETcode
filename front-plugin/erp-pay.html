@@ -118,15 +118,22 @@
 
       // 토스트는 안내일 뿐이다. 이 SDK의 openToast가 거부된 Promise를 돌려주면 unhandledrejection이 되어 recoverFromError가
       // 멀쩡한 화면을 오류 안내로 덮어쓴다.
+      // 아이콘은 SDK가 그릴 수 있는 'success'·'error'만 넘긴다. CDN 번들의 ICON_NAME_MAP에 이 둘뿐이고, 예전 결제 취소 안내의
+      // icon: 'info'는 아이콘 이름이 없어 화면 전체가 하얗게 멈췄다 -- 환불하러 온 손님 앞에서 취소창이 뜨지 않은 채 대기화면으로
+      // 돌아갔다(2026-10-23 렌더링으로 확인). 그 밖의 값은 아이콘 없이(글자만) 띄운다(공식 문서 예시).
+      const TOAST_ICONS = ['success', 'error']
       function toast(options) {
+        const { icon, ...rest } = options || {}
+        const safe = TOAST_ICONS.includes(icon) ? { ...rest, icon } : rest
         try {
-          Promise.resolve(sdk.template.openToast?.(options)).catch(() => {})
+          Promise.resolve(sdk.template.openToast?.(safe)).catch(() => {})
         } catch { /* 안내일 뿐 */ }
       }
 
       // 결과 보고가 401·403(토큰이 틀림·매장 비활성)을 받았을 때. 기록은 남아 있고 토큰을 바로잡으면 다음 복구가 다시 보고한다.
+      // 손님 화면에 뜨는 직원용 안내라 [직원 확인]을 앞에 붙인다(토스트는 3초라 짧게).
       function toastTokenProblem() {
-        toast({ message: '결제 결과를 전산에 알리지 못했습니다. 플러그인 설정에서 매장 토큰을 확인해주세요.', icon: 'error' })
+        toast({ message: '[직원 확인] 매장 토큰이 맞지 않아 결제 결과를 못 보냈어요', icon: 'error' })
       }
 
       // SDK 호출(getPayment 등)은 시간 제한이 없어서, 결제를 시작하기 전 지난 시도 확인이 끝나지 않으면 화면이 그대로 멈춘다.
@@ -178,7 +185,7 @@
         recovering = true
         aborted = true
         try {
-          showMessage('error', '화면을 불러오지 못했습니다', '잠시 후 처음 화면으로 돌아갑니다. 결제가 됐는지는 직원에게 확인해주세요.', 5000)
+          showMessage('error', '화면을 불러오지 못했어요', '결제 여부는 직원에게 확인해주세요', 5000)
         } catch {
           goHomeWhenIdle()
           return
@@ -188,6 +195,8 @@
       window.addEventListener('error', (e) => recoverFromError(e.error || e.message))
       window.addEventListener('unhandledrejection', (e) => recoverFromError(e.reason))
 
+      // image 타입 결과 화면은 제목·설명을 자동으로 줄바꿈하지 않는다(white-space: pre -- 긴 줄은 좌우가 잘린다). 그래서 설명은 한 줄을
+      // 짧게 쓰고 필요하면 \n으로 직접 나눈다. 'N초 뒤에 닫혀요'는 SDK가 붙이므로 '잠시 후 돌아갑니다'를 따로 쓰지 않는다.
       function showMessage(status, title, description, timerMs) {
         stopLoadWatchdog()
         sdk.template.renderResultPage({
@@ -201,14 +210,18 @@
         })
       }
 
+      // 손님 화면(차량 선택·결과·안내·토스트)에 보이는 주문 이름. 차량번호가 없으면 전산 참조번호 끝 4자리를 쓴다.
+      // 전산 메모(memo)는 쓰지 않는다 -- 손님 이름이나 직원 메모가 들어 있을 수 있어 예전엔 남의 이름이 손님 화면에 크게 떴다.
       function cartTitle(cart) {
-        return cart.carNumber || cart.memo || cart.referenceId
+        if (cart?.carNumber) return cart.carNumber
+        const ref = String(cart?.referenceId ?? '').trim()
+        return ref ? `주문 ${ref.slice(-4)}` : '정비 주문'
       }
 
       async function init() {
         const token = await pay.getToken()
         if (!token) {
-          showMessage('error', '매장 토큰이 없습니다', '프론트 설정 > 플러그인 설정에서 매장 토큰을 넣어주세요.', 6000)
+          showMessage('error', '매장 토큰이 없어요', '[직원 확인] 프론트 설정 > 플러그인 설정에서\n매장 토큰을 넣어주세요', 6000)
           return
         }
         // 지난번 결제·취소가 보고 없이 끝난 기록이 남아 있으면 새 건을 받기 **전에** 마무리한다. 기록은 건별로 쌓이므로(erp-front-pay.js)
@@ -239,7 +252,11 @@
         if (aborted) return // 응답을 기다리는 사이 오류 복구 화면이 떴다 -- 그 위에 새 화면을 그리지 않는다
         if (ok) storeName = body.storeName || ''
         if (!ok) {
-          showMessage('error', status === 401 ? '매장 토큰이 올바르지 않습니다' : '주문을 불러오지 못했습니다', body.error)
+          if (status === 401) {
+            showMessage('error', '매장 토큰이 올바르지 않아요', '[직원 확인] 프론트 설정 > 플러그인 설정에서\n다시 넣어주세요')
+          } else {
+            showMessage('error', '결제할 주문을 불러오지 못했어요', body.error)
+          }
           return
         }
         // 기록이 남은 건(확인이 안 끝났거나 아직 뒤에서 확인 중)은 이번에 띄우지 않고 쉬게 한다. 기록 목록을 읽지 못하면 전부 걸린 것으로 본다.
@@ -259,11 +276,10 @@
         // 직원이 탭앱에서 [프론트에서 취소]를 두 번 눌러 이미 확정했으므로 여기서 다시 묻지 않고 바로 취소창을 띄운다.
         const refunds = withoutRecord(pay.filterStartableRefunds(body.refunds), refundIds, 'refund')
         if (refunds.length) {
-          const isCard = ['CARD', 'BARCODE'].includes(refunds[0].refund?.paymentMethod)
-          toast({
-            message: `${cartTitle(refunds[0])} ${pay.formatWon(refunds[0].totalAmount)} 결제를 취소합니다.${isCard ? ' 결제했던 카드를 꽂아주세요.' : ''}`,
-            icon: 'info',
-          })
+          // 취소창 앞에 토스트('…결제를 취소해요. 결제한 카드를 준비해주세요')를 띄우지 않는다. SDK 토스트는 템플릿 화면(Layout) 안에서만
+          // 그려지는데 이 길은 취소창 전에 아무 화면도 그리지 않아서, 토스트가 저장돼 있다가 취소가 끝난 뒤의 '환불이 완료됐어요' 화면 위에
+          // 떴다 -- 환불이 끝난 손님에게 카드를 다시 준비하라고 했다(CDN SDK로 확인). 어느 차·얼마의 취소인지는 취소 뒤 화면(showRefunded·
+          // showRefundStopped)에 있고, 손님 앞에 있는 직원이 탭앱에서 취소를 요청하며 결제수단별 방법을 안내받는다(settledCarts.js).
           runRefund(token, refunds[0])
           return
         }
@@ -273,7 +289,7 @@
         const carts = withoutRecord(startable, paymentIds, 'payment')
         if (!carts.length) {
           if (tokenProblem) {
-            showMessage('error', '매장 토큰을 확인해주세요', '지난 결제(또는 취소) 결과를 전산에 알리지 못했습니다. 플러그인 설정에서 매장 토큰을 확인해주세요.', 8000)
+            showMessage('error', '매장 토큰을 확인해주세요', '[직원 확인] 지난 결제·취소 결과를\n전산에 보내지 못했어요\n프론트 설정 > 플러그인 설정을 확인해주세요', 8000)
           } else if (stuck.length) {
             showStuckNotice(stuck)
           } else {
@@ -290,9 +306,9 @@
           return
         }
         // 여러 건이면 손님이 자기 차를 고르게 한다. 대기 중인 손님 것을 남이 결제하지 않도록
-        // 차량번호를 크게 보여준다.
+        // 차량번호를 크게 보여준다. 선택 화면은 subtitle이 큰 제목이라 손님이 할 일(내 차 고르기)을 subtitle에 둔다.
         stopLoadWatchdog()
-        // 손님이 차량을 고르지 않고 떠나면 이 화면이 영원히 남아 다음 손님이 프론트를 못 쓴다(예약 화면은 타이머가 있는데 이
+        // 손님이 차량을 고르지 않고 떠나면 이 화면이 영원히 남아 다음 손님이 프론트를 못 쓴다(접수 화면은 타이머가 있는데 이
         // 화면은 없었다). 60초 안에 아무것도 안 누르면 모든 주문을 쉬게 하고 대기화면으로 돌아간다 -- 쉬게 하지 않으면 대기화면이
         // 폴링하자마자 같은 선택 화면으로 되돌아온다. 쉬기는 2분이고, 직원이 주문을 다시 보내면 열쇠가 달라져 바로 다시 뜬다.
         const selectTimer = setTimeout(() => {
@@ -303,8 +319,8 @@
         // 이긴 쪽의 기록을 건드린다. 같은 주문은 startPayment의 주문별 잠금이 한 번 더 막는다.
         let picked = false
         sdk.template.renderSelectPage({
-          title: '결제할 차량을 선택해주세요',
-          subtitle: '차량번호를 확인해주세요',
+          title: '결제할 주문이 여러 건이에요',
+          subtitle: '내 차량번호를 선택해주세요',
           options: carts.map((cart) => ({
             title: `${cartTitle(cart)} · ${pay.formatWon(cart.totalAmount)}`,
             onClick: () => {
@@ -346,9 +362,10 @@
 
       // 같은 주문의 지난 시도 기록이 정리되지 않아(또는 저장소를 읽지 못해) 새 결제를 띄우지 못할 때. 그 주문만 쉬게 한다(holdStuck --
       // 1분부터 점점 길게). 예전엔 쉬게 하지 않아서, 대기화면이 곧바로 다시 이 화면으로 끌고 와 같은 안내만 되풀이했다.
+      // 손님이 '다시 시도'할 방법은 없다 -- 화면은 저절로 닫히고 그 주문은 쉬었다가 다시 뜬다. 그래서 할 일 대신 사실만 알린다.
       function showPriorChecking(cart) {
         pay.holdStuck('payment', cart.id)
-        showMessage('error', '이전 결제를 확인하고 있습니다', '잠시 후 다시 시도해주세요.', 5000)
+        showMessage('error', '이전 결제를 확인하고 있어요', '잠시 뒤 다시 확인할게요\n급하시면 직원에게 알려주세요', 5000)
       }
 
       // init에서 확인이 안 끝난 지난 기록 때문에 띄우지 못한 건만 있을 때의 안내. 그 건들은 이미 쉬게 했다(holdStuck).
@@ -356,8 +373,8 @@
         const more = items.length > 1 ? ` 외 ${items.length - 1}건` : ''
         showMessage(
           'error',
-          '이전 결제를 확인하고 있습니다',
-          `${cartTitle(items[0])}${more} · 지난 결제(또는 취소) 결과를 아직 확인하지 못해 잠시 뒤 다시 확인합니다. 급하면 직원에게 알려주세요.`,
+          '이전 결제를 확인하고 있어요',
+          `${cartTitle(items[0])}${more}\n잠시 뒤 다시 확인할게요\n급하시면 직원에게 알려주세요`,
           8000,
         )
       }
@@ -401,7 +418,7 @@
           const prior = await preNativeStep(pay.recoverInflight(token, cart.id), PRIOR_CHECK_TIMEOUT_MS, 'pending')
           if (aborted) return
           if (prior === 'paid') {
-            showMessage('success', '이미 결제가 끝난 주문입니다', '지난 결제를 전산에 알렸습니다.', 5000)
+            showMessage('success', '이미 결제된 주문이에요', '다시 결제하지 않으셔도 돼요', 5000)
             return
           }
           if (prior === 'orphan') {
@@ -425,7 +442,7 @@
           const listed = await pay.listCarts(token)
           if (aborted) return
           if (!listed.ok) {
-            showMessage('error', '결제를 시작하지 못했습니다', listed.body?.error || '잠시 후 다시 시도해주세요.')
+            showMessage('error', '결제를 시작하지 못했어요', listed.body?.error || '잠시 뒤 다시 시도할게요')
             return
           }
           const latest = (listed.body?.carts || []).find((c) => String(c.id) === String(cart.id))
@@ -434,6 +451,9 @@
             showServerOrphanNotice(latest, latestServerOrphan)
             return
           }
+          // 차량 선택 화면에 머무는 사이 전산이 같은 주문을 금액·품목을 바꿔 다시 보냈을 수 있다(같은 id로 덮어쓴다). 결제 뒤 화면·영수증은
+          // 이 주문 정보로 그리므로 방금 받은 값으로 바꿔 쓴다. 목록에 없으면 들고 있던 값 그대로다(아래 시작 응답의 금액으로 한 번 더 맞춘다).
+          if (latest) cart = latest
         }
 
         const paymentKey = crypto.randomUUID()
@@ -466,13 +486,17 @@
             // 목록을 받은 뒤 다른 프론트의 늦은 승인이 기록된 경우 -- 서버가 시작을 막았다.
             showServerOrphanNotice(cart, started.body.frontOrphan || {})
           } else if (started.status === 409) {
-            showMessage('error', '이미 처리 중인 주문입니다', '다른 기기에서 결제 중이거나 이미 끝난 주문입니다.')
+            showMessage('error', '이미 처리 중인 주문이에요', '다른 단말기에서 결제 중이거나\n이미 결제된 주문이에요')
           } else {
-            showMessage('error', '결제를 시작하지 못했습니다', started.body.error || '잠시 후 다시 시도해주세요.')
+            showMessage('error', '결제를 시작하지 못했어요', started.body.error || '잠시 뒤 다시 시도할게요')
           }
           return
         }
         record.amount = started.body.totalAmount ?? cart.totalAmount // 서버 기준 금액
+        // 결제창은 시작 응답의 금액(서버 기준)으로 결제한다. 결제 뒤 화면(금액)·영수증(품목·할인)·다시 결제 안내도 같은 값을 써야 한다 --
+        // 들고 있던 주문 정보로 그리면 그 사이 전산이 주문을 바꿨을 때 손님 화면과 출력 영수증이 실제 결제와 다른 금액·품목을 보였다.
+        // 시작 응답에 품목이 있으면 그것을, 없는데 금액이 다르면 품목을 비운다(영수증은 품목 없이 결제 영수증만 -- receiptOrderInfo).
+        const paidCart = paidCartOf(cart, started.body)
         if (!await preNativeStep(pay.claimInflight({ ...record, phase: 'paying' }), STORAGE_STEP_TIMEOUT_MS, false)) {
           // 기록을 고쳐 쓰지 못했다(칸에 다른 시도의 기록이 있거나 저장소 오류·시간 초과). 기록 없이 결제창을 띄우면 결과를 복구할 수
           // 없으니 되돌린다. 'starting' 기록은 남아 있으므로 되돌리기 보고가 닿지 못해도 다음 복구가 같은 키로 다시 되돌린다.
@@ -488,6 +512,9 @@
           return
         }
         stopLoadWatchdog() // 결제창이 떠 있는 동안, 그리고 창이 닫힌 뒤의 결과 정리 도중에 끌고 나가지 않는다
+        // 결제창 앞에 토스트('12가3456 · 55,000원 정비 결제예요')를 띄우지 않는다. SDK 토스트는 템플릿 화면(Layout) 안에서만 그려진다 --
+        // 주문 한 건 자동 결제는 결제창 전에 아무 화면도 그리지 않아, 토스트가 결제창 전에는 보이지 않고 창이 닫힌 뒤의 결과 화면 위에
+        // 늦게 떴다(CDN SDK로 확인). 어느 차·얼마인지는 앞 화면(여러 건이면 차량 선택)과 뒤 화면(showPaid·showRetryChoice)에 있다.
 
         let result
         try {
@@ -504,19 +531,19 @@
           // 예외만으로는 승인 여부를 알 수 없다. 단말기 캐시를 확인해 승인이면 paid로, 아니면 되돌린다.
           console.error('[erp-pay] requestPayment 예외', err)
           // 이 주문의 기록만 본다 -- 다른 건의 확인 불가가 이 건 결과를 흐리지 않게. 저장소가 멈춰 끝나지 않으면 AFTER_NATIVE_WAIT_MS 뒤
-          // '확인하지 못했습니다'로 넘어간다(확인은 뒤에서 계속 돌고, 기록은 남아 다음 복구가 다시 본다).
+          // '확인하지 못했어요'로 넘어간다(확인은 뒤에서 계속 돌고, 기록은 남아 다음 복구가 다시 본다).
           const recovered = await withTimeout(trackReporting(() => pay.recoverInflight(token, cart.id)), AFTER_NATIVE_WAIT_MS, 'pending')
           if (recovered === 'paid') {
-            showPaid(cart, paymentKey)
+            showPaid(paidCart, paymentKey)
           } else if (recovered === 'orphan') {
             // 승인은 됐는데 서버가 받지 않았다. 손님은 결제했으니 영수증은 뽑고, 직원이 알 수 있게 안내한다.
-            printReceiptFor(cart, paymentKey).catch((e) => console.error('[erp-pay] 영수증 출력 오류', e))
-            showOrphanNotice(await withTimeout(pay.takeOrphanNotices(), STORAGE_STEP_TIMEOUT_MS, []), cart)
+            printReceiptFor(paidCart, paymentKey).catch((e) => console.error('[erp-pay] 영수증 출력 오류', e))
+            showOrphanNotice(await withTimeout(pay.takeOrphanNotices(), STORAGE_STEP_TIMEOUT_MS, []), paidCart)
           } else if (recovered === 'released') {
-            showRetryChoice(token, cart, '결제가 완료되지 않았습니다')
+            showRetryChoice(token, paidCart, '결제가 완료되지 않았어요')
           } else {
             if (recovered === 'auth') toastTokenProblem()
-            showMessage('error', '결제 상태를 확인하지 못했습니다', '직원에게 알려주세요. 결제가 됐는지 확인이 필요합니다.', 8000)
+            showMessage('error', '결제 상태를 확인하지 못했어요', '결제됐는지 확인이 필요해요\n직원에게 알려주세요', 8000)
           }
           return
         }
@@ -527,9 +554,9 @@
           // 타이머가 페이지를 옮기지 않는다(goHomeWhenIdle -- 최대 1분, 그 뒤엔 남은 기록을 다음 복구가 보고한다). showPaid가 예외로
           // 끝나도 보고는 반드시 한다.
           try {
-            showPaid(cart, paymentKey)
+            showPaid(paidCart, paymentKey)
           } finally {
-            reportPaidInBackground(token, cart, record, result.response)
+            reportPaidInBackground(token, paidCart, record, result.response)
           }
           return
         }
@@ -545,7 +572,9 @@
           errorMessage: failed ? `프론트 결제 실패(${result.type})` : undefined,
         })), AFTER_NATIVE_WAIT_MS, 'pending')
         if (released === 'auth') toastTokenProblem()
-        showRetryChoice(token, cart, failed ? '결제에 실패했습니다' : '결제가 취소되었습니다')
+        // 손님이 결제창을 닫았거나 시간이 지났다(돈이 나가지 않았다). 예전 제목 '결제가 취소되었습니다'는 환불이 끝난 화면(showRefunded)과
+        // 같아서, 정반대인 두 상황을 손님도 직원도 헷갈렸다. 환불 완료는 '환불이 완료됐어요'로 나눈다.
+        showRetryChoice(token, paidCart, failed ? '결제에 실패했어요' : '결제가 진행되지 않았어요')
       }
 
       // 결제 완료 보고(erp-front-pay.js reportPaid). 서버가 기록했을 때만 inflight 기록을 지운다. 409·404 같은 확정 거절은 성공이
@@ -582,14 +611,16 @@
         const amount = first?.amount ?? (sameCart ? subject.totalAmount : null)
         const details = [
           sameCart ? cartTitle(subject) : '',
-          first?.approvalNumber ? `${isRefund ? '원결제 승인번호' : '승인번호'} ${first.approvalNumber}` : '',
+          first?.approvalNumber ? `${isRefund ? '결제 승인번호' : '승인번호'} ${first.approvalNumber}` : '',
           amount != null ? pay.formatWon(amount) : '',
         ].filter(Boolean).join(' · ')
         const more = list.length > 1 ? ` 외 ${list.length - 1}건` : ''
+        // 손님에게는 '완료됐다'를 먼저 알린다 -- '전산에 기록하지 못했습니다'는 손님을 불안하게 해 다시 결제하게 만들 수 있다.
+        // 승인번호·금액은 직원이 토스 결제내역과 맞춰 보는 값이라 줄을 나눠 읽기 쉽게 둔다(image 타입은 줄을 자동으로 바꾸지 않는다).
         showMessage(
           'error',
-          isRefund ? '결제 취소는 됐지만 전산에 기록하지 못했습니다' : '결제는 승인됐지만 전산에 기록하지 못했습니다',
-          `직원에게 알려주세요${details ? ` (${details})` : ''}${more}`,
+          isRefund ? '결제 취소는 완료됐어요\n직원 확인이 필요해요' : '결제는 완료됐어요\n직원 확인이 필요해요',
+          `직원에게 알려주세요${details ? `\n${details}` : ''}${more}`,
           10000,
         )
       }
@@ -603,14 +634,26 @@
         const details = [
           cartTitle(cart),
           orphan?.approvalNo ? `승인번호 ${orphan.approvalNo}` : '',
-          Number.isFinite(amount) ? `금액 ${pay.formatWon(amount)}` : '',
-        ].filter(Boolean).join(', ')
+          Number.isFinite(amount) ? pay.formatWon(amount) : '',
+        ].filter(Boolean).join(' · ')
         showMessage(
           'error',
-          '이미 승인된 결제가 있는 주문입니다',
-          `이 주문은 이미 승인된 결제가 있어 직원 확인이 필요합니다${details ? ` (${details})` : ''}`,
+          '이미 결제가 승인된 주문이에요',
+          `직원 확인이 필요해요${details ? `\n${details}` : ''}`,
           10000,
         )
+      }
+
+      // 결제 뒤 화면·영수증에 쓸 주문 정보를 시작 응답(서버 기준)에 맞춘다(startPaymentLocked). 금액은 응답의 totalAmount, 품목은 응답에
+      // items가 있으면 그것을 쓴다. 응답에 품목이 없는데 금액이 들고 있던 값과 다르면 품목도 바뀌었을 수 있어 비운다 -- 틀린 품목으로
+      // 영수증을 뽑느니 결제 영수증만 뽑는다(receiptOrderInfo가 null). 옛 서버처럼 금액이 없으면 들고 있던 값 그대로다.
+      function paidCartOf(cart, startBody) {
+        const raw = startBody?.totalAmount
+        const amount = raw === null || raw === undefined || raw === '' ? NaN : Number(raw)
+        const serverItems = Array.isArray(startBody?.items) ? startBody.items : null
+        if (!Number.isFinite(amount)) return serverItems ? { ...cart, items: serverItems } : cart
+        const changed = amount !== Number(cart.totalAmount)
+        return { ...cart, totalAmount: amount, items: serverItems || (changed ? [] : cart.items) }
       }
 
       // 결제가 끝나면 영수증을 기본으로 출력한다(프론트에 연결된 프린터, sdk.printer.printReceipt). 전산 주문의 품목·단가를
@@ -649,7 +692,7 @@
             console.error('[erp-pay] 결제 영수증 출력도 실패', e)
           }
         }
-        toast({ message: '영수증을 출력하지 못했습니다. 프린터 연결을 확인해주세요.', icon: 'error' })
+        toast({ message: '영수증을 출력하지 못했어요. 프린터를 확인해주세요', icon: 'error' })
       }
 
       function showPaid(cart, paymentKey) {
@@ -658,8 +701,8 @@
         sdk.template.renderResultPage({
           type: 'text',
           text: pay.formatWon(cart.totalAmount),
-          title: '결제가 완료되었습니다',
-          description: `${cartTitle(cart)} 정비 결제가 끝났습니다. 감사합니다.`,
+          title: '결제가 완료됐어요',
+          description: `${cartTitle(cart)}\n감사합니다`,
           timerMs: 8000, // 영수증이 나오는 동안 이 화면을 둔다
           onTimeout: goHomeWhenIdle, // 결과 보고가 아직 돌고 있으면 끝날 때까지(최대 1분) 기다린다
           localeCode: 'ko',
@@ -690,7 +733,7 @@
       function showRetryChoice(token, cart, title) {
         showStoppedWithRetry({
           title,
-          description: `${cartTitle(cart)} · ${pay.formatWon(cart.totalAmount)}`,
+          description: `${cartTitle(cart)} · ${pay.formatWon(cart.totalAmount)}\n다시 결제하려면 아래 버튼을 눌러주세요`,
           retryLabel: '다시 결제하기',
           onRetry: () => startPayment(token, cart),
           snoozeKey: pay.cartSnoozeKey(cart),
@@ -724,7 +767,7 @@
       function showPriorRefundChecking(item) {
         pay.snooze(pay.refundSnoozeKey(item))
         pay.holdStuck('refund', item.id)
-        showMessage('error', '이전 결제 취소를 확인하고 있습니다', '잠시 후 다시 시도해주세요.', 5000)
+        showMessage('error', '이전 결제 취소를 확인하고 있어요', '잠시 뒤 다시 확인할게요\n급하시면 직원에게 알려주세요', 5000)
       }
 
       async function runRefundLocked(token, item) {
@@ -788,9 +831,9 @@
           }
           if (started.status === 409 && started.body?.status === 'paid') {
             // 취소 요청이 그 사이 끝났거나 중단돼 결제 완료로 돌아갔다. 다시 취소하려면 직원이 다시 요청해야 한다.
-            showMessage('error', '취소를 시작하지 못했습니다', '다시 취소하려면 직원에게 요청해주세요.', 6000)
+            showMessage('error', '결제 취소를 시작하지 못했어요', '다시 취소하려면 직원에게 말씀해주세요', 6000)
           } else {
-            showMessage('error', '취소를 시작하지 못했습니다', started.body.error || '정비 대기열에서 상태를 확인해주세요.')
+            showMessage('error', '결제 취소를 시작하지 못했어요', started.body.error || '직원에게 알려주세요')
           }
           return
         }
@@ -823,7 +866,7 @@
           result = await withNative(() => pay.requestRefund(refund))
         } catch (err) {
           console.error('[erp-pay] 결제 취소 요청 예외', err)
-          // 이 주문의 기록만. 저장소가 멈춰 끝나지 않으면 AFTER_NATIVE_WAIT_MS 뒤 '확인하지 못했습니다'로 넘어간다(결제와 같다).
+          // 이 주문의 기록만. 저장소가 멈춰 끝나지 않으면 AFTER_NATIVE_WAIT_MS 뒤 '확인하지 못했어요'로 넘어간다(결제와 같다).
           const recovered = await withTimeout(trackReporting(() => pay.recoverRefundInflight(token, item.id)), AFTER_NATIVE_WAIT_MS, 'pending')
           if (recovered === 'refunded') {
             showRefunded(item)
@@ -831,12 +874,12 @@
             showOrphanNotice(await withTimeout(pay.takeOrphanNotices(), STORAGE_STEP_TIMEOUT_MS, []), item, 'refund')
           } else if (recovered === 'released') {
             // 취소가 안 됐고 서버도 주문을 결제 완료로 되돌렸다. 이 화면에서 다시 시도할 수 없다(showRefundStopped).
-            showRefundStopped(item, '결제 취소가 완료되지 않았습니다')
+            showRefundStopped(item, '결제 취소가 완료되지 않았어요')
           } else {
             // 'pending'·'auth'(됐는지 아직 모른다). 예전의 [다시 시도하기]는 남은 기록 때문에 시작하지 못하고(서버도 아직 이 시도로
             // 취소 중이라 409) 항상 실패했다 -- 버튼 없이 안내만 하고 저절로 대기화면으로 돌아간다. 기록은 다음 복구가 마무리한다.
             if (recovered === 'auth') toastTokenProblem()
-            showMessage('error', '취소 상태를 확인하지 못했습니다', '직원에게 알려주세요. 취소됐는지 확인이 필요합니다.', 8000)
+            showMessage('error', '결제 취소 상태를 확인하지 못했어요', '취소됐는지 확인이 필요해요\n직원에게 알려주세요', 8000)
           }
           return
         }
@@ -844,7 +887,7 @@
         if (result.type === 'SUCCESS') {
           // 서버가 기록했을 때만 기록을 지운다. 끝내 받지 않으면(409 stale 포함) 미기록 목록에 옮기고 직원 안내 화면을 띄운다.
           // 인증 문제·네트워크 오류면 기록을 남겨 두고 다음 복구가 다시 보고한다(erp-front-pay.js reportRefunded).
-          // 보고 뒤의 기록 정리가 끝나지 않으면 AFTER_NATIVE_WAIT_MS 뒤 '취소되었습니다'를 띄운다(손님 돈은 돌려줬다. 보고는 뒤에서 계속 돈다).
+          // 보고 뒤의 기록 정리가 끝나지 않으면 AFTER_NATIVE_WAIT_MS 뒤 '환불이 완료됐어요'를 띄운다(손님 돈은 돌려줬다. 보고는 뒤에서 계속 돈다).
           const outcome = await withTimeout(trackReporting(() => pay.reportRefunded(token, active)), AFTER_NATIVE_WAIT_MS, 'pending')
           if (outcome === 'orphan') {
             showOrphanNotice(await withTimeout(pay.takeOrphanNotices(), STORAGE_STEP_TIMEOUT_MS, []), item, 'refund')
@@ -861,7 +904,8 @@
           errorMessage: failed ? `프론트 결제 취소 실패(${result.type})` : undefined,
         })), AFTER_NATIVE_WAIT_MS, 'pending')
         if (released === 'auth') toastTokenProblem()
-        showRefundStopped(item, failed ? '결제 취소에 실패했습니다' : '결제 취소를 중단했습니다')
+        // '중단했습니다'는 시스템이 일부러 멈춘 것처럼 읽혔다. 실제로는 손님이 취소창을 닫았거나 시간이 지난 것이다.
+        showRefundStopped(item, failed ? '결제 취소에 실패했어요' : '결제 취소가 중단됐어요')
       }
 
       // 결제 취소가 중단·실패했을 때의 화면. 서버는 중단·실패 보고를 받으면 주문을 결제 완료(paid)로 되돌리므로 이 프론트가 같은
@@ -869,7 +913,7 @@
       // 정비 대기열(POS 탭앱)에서 [프론트에서 취소]를 다시 눌러야 하므로 그렇게 안내하고, 버튼 없이 잠시 뒤 대기화면으로 돌아간다.
       function showRefundStopped(item, title) {
         pay.snooze(pay.refundSnoozeKey(item))
-        showMessage('error', title, `다시 취소하려면 직원에게 요청해주세요. (${cartTitle(item)} · ${pay.formatWon(item.totalAmount)})`, 8000)
+        showMessage('error', title, `${cartTitle(item)} · ${pay.formatWon(item.totalAmount)}\n다시 취소하려면 직원에게 말씀해주세요`, 8000)
       }
 
       // 취소 시작 요청이 시간 초과였거나 시작 직후 오류 복구가 화면을 가져가서 취소창을 못 띄운 건을 되돌린다(releaseInBackground와 같다).
@@ -878,13 +922,14 @@
         reportInBackground(() => pay.reportRefundReleased(token, record))
       }
 
+      // 환불(결제 취소)이 끝난 화면. 손님이 결제창을 닫은 화면('결제가 진행되지 않았어요')과 헷갈리지 않게 제목을 나눴다.
       function showRefunded(item) {
         stopLoadWatchdog() // 지난 기록 확인으로 이미 취소된 걸 알게 된 경우(취소창 전)에도 이 화면의 타이머로 돌아간다
         sdk.template.renderResultPage({
           type: 'text',
           text: pay.formatWon(item.totalAmount),
-          title: '결제가 취소되었습니다',
-          description: `${cartTitle(item)} 결제를 취소했습니다.`,
+          title: '환불이 완료됐어요',
+          description: `${cartTitle(item)} 결제를 취소했어요`,
           timerMs: 5000,
           onTimeout: goHomeWhenIdle,
           localeCode: 'ko',

@@ -1207,7 +1207,7 @@ testSerial('정비 이력 삭제: 지운 마지막 방문이 광고 거부였다
 
 // --- R3: 기간·수동 발송도 발송사 탓 실패를 가리고, 이어지면 기간 발송을 멈춘다 -----------------------------------
 
-const PROVIDER_STOP_MESSAGE = '문자 발송 계정(잔액·발신번호·템플릿) 문제로 멈췄습니다. 본사 확인이 필요합니다'
+const PROVIDER_STOP_MESSAGE = '문자 발송 계정(잔액·발신번호·템플릿) 문제로 멈췄습니다. 본사 확인이 필요합니다.'
 const statusesOf = async (store) => (await prisma.promoSend.findMany({ where: { storeId: store.id } })).map((r) => r.status)
 
 testSerial('기간 발송: 잔액 부족 같은 발송사 탓 실패가 이어지면 그 묶음 뒤에 멈추고(stopped provider) 남은 대상은 시도하지 않는다', async () => {

@@ -606,7 +606,7 @@ testSerial('같은 전화번호로 영수증 요청이 한도를 넘으면 429�
 
 // --- serviceDate day-scope (계약 §3.1, §3.6, §3.13) ---
 
-testSerial('peopleAhead와 POS 대기열은 오늘(KST) serviceDate만 집계하고, call-next도 어제 건은 호출하지 않는다', async () => {
+testSerial('peopleAhead는 오늘(KST) 접수분만 세고, 어제 waiting은 POS 대기열에 이월(carriedOver)로만 보이며 call-next도 어제 건은 호출하지 않는다', async () => {
   const store = await createStore('day-scope')
   const yesterday = kstDateString(new Date(Date.now() - 24 * 60 * 60 * 1000))
   const staleReservation = await prisma.reservation.create({
@@ -621,10 +621,17 @@ testSerial('peopleAhead와 POS 대기열은 오늘(KST) serviceDate만 집계하
     },
   })
 
-  // 1) POS 대기열에 어제 건이 보이면 안 된다.
-  const queue = await request(app).get('/api/pos/queue').set('X-Store-Token', store.posToken)
+  // 1) 어제 호출하지 않은 waiting은 새 탭앱(?carriedOver=1)의 POS 대기열에 carriedOver:true로 보인다(정비완료·취소로 정리할 수
+  // 있게 -- C2). carriedOver를 모르는 옛 탭앱(값 없음)에는 예전처럼 싣지 않는다.
+  const legacyQueue = await request(app).get('/api/pos/queue').set('X-Store-Token', store.posToken)
+  assert.equal(legacyQueue.status, 200)
+  assert.equal(legacyQueue.body.reservations.length, 0)
+  const queue = await request(app).get('/api/pos/queue?carriedOver=1').set('X-Store-Token', store.posToken)
   assert.equal(queue.status, 200)
-  assert.deepEqual(queue.body.reservations, [])
+  assert.equal(queue.body.reservations.length, 1)
+  assert.equal(queue.body.reservations[0].id, staleReservation.id)
+  assert.equal(queue.body.reservations[0].carriedOver, true)
+  assert.equal(queue.body.reservations[0].serviceDate, yesterday)
 
   // 2) 오늘 첫 접수의 peopleAhead는 어제 건의 영향을 받지 않고 0이어야 한다. queueNumber도
   // 날짜별로 분리된 QueueCounter 덕분에 어제 채번과 무관하게 1부터 시작한다.
@@ -690,10 +697,10 @@ testSerial('예약 취소는 waiting/called/notify_failed만 허용하고 대기
   })
   assert.equal(second.body.peopleAhead, 0)
 
-  // completed 상태는 취소 대상이 아니다(409).
+  // completed 상태는 취소 대상이 아니다(409). 다른 차로 접수한다 -- 같은 차는 오늘 대기 중인 second를 돌려준다.
   const third = await request(app).post('/api/reservations').send({
     merchantId: store.merchantId,
-    carNumber: '12가3456',
+    carNumber: '34나5678',
     phone: '01066667779',
     serviceType: 'oil',
     privacyConsent: true,
@@ -1233,7 +1240,7 @@ testSerial('예약/결제 목록의 q 파라미터가 전화번호 일부/차량
 
 // --- 전날 손님 POS 완료/취소 (API 계약 v3 §4) ---
 
-testSerial('어제 called 상태의 예약이 POS 대기열에 이월 표시되어 완료 처리되고, 어제 waiting은 뜨지 않으며 call은 오늘 것만 허용한다', async () => {
+testSerial('어제 called·waiting 접수가 POS 대기열에 이월 표시되어 완료 처리되고(어제 waiting만 carriedOver), 그제 waiting은 뜨지 않으며 call은 오늘 것만 허용한다', async () => {
   const store = await createStore('carry-over')
   const yesterday = kstDateString(new Date(Date.now() - 24 * 60 * 60 * 1000))
 
@@ -1260,14 +1267,40 @@ testSerial('어제 called 상태의 예약이 POS 대기열에 이월 표시되�
     },
   })
 
-  const queue = await request(app).get('/api/pos/queue').set('X-Store-Token', store.posToken)
+  const twoDaysAgo = kstDateString(new Date(Date.now() - 2 * 24 * 60 * 60 * 1000))
+  const waitingTwoDaysAgo = await prisma.reservation.create({
+    data: {
+      storeId: store.id,
+      carNumber: '56다8888',
+      phone: '01022220002',
+      serviceType: '정비',
+      queueNumber: 1,
+      serviceDate: twoDaysAgo,
+      status: 'waiting',
+    },
+  })
+
+  // carriedOver를 모르는 옛 탭앱(값 없음)에는 어제 waiting을 싣지 않는다. 이월(called) 건은 그대로 뜬다.
+  const legacyQueue = await request(app).get('/api/pos/queue').set('X-Store-Token', store.posToken)
+  assert.equal(legacyQueue.status, 200)
+  const legacyIds = legacyQueue.body.reservations.map((r) => r.id)
+  assert.ok(legacyIds.includes(calledYesterday.id))
+  assert.ok(!legacyIds.includes(waitingYesterday.id))
+
+  const queue = await request(app).get('/api/pos/queue?carriedOver=1').set('X-Store-Token', store.posToken)
   assert.equal(queue.status, 200)
   const ids = queue.body.reservations.map((r) => r.id)
   assert.ok(ids.includes(calledYesterday.id)) // 이월(called) 건은 뜬다.
-  assert.ok(!ids.includes(waitingYesterday.id)) // 어제 waiting(노쇼 추정)은 안 뜬다.
+  assert.ok(ids.includes(waitingYesterday.id)) // 새 탭앱에는 어제 waiting도 뜬다(C2 -- 호출하지 않고 하룻밤 맡긴 차).
+  assert.ok(!ids.includes(waitingTwoDaysAgo.id)) // 그보다 오래된 waiting(노쇼 추정)은 안 뜬다.
   const carriedItem = queue.body.reservations.find((r) => r.id === calledYesterday.id)
   assert.equal(carriedItem.serviceDate, yesterday)
   assert.notEqual(carriedItem.serviceDate, queue.body.serviceDate)
+  assert.equal(carriedItem.carriedOver, false) // carriedOver는 전날의 waiting에만 붙는다.
+  const waitingItem = queue.body.reservations.find((r) => r.id === waitingYesterday.id)
+  assert.equal(waitingItem.carriedOver, true)
+  assert.equal(waitingItem.calledAt, null)
+  assert.ok(waitingItem.createdAt)
 
   // call은 여전히 오늘 것만 — 어제 waiting 건을 호출하려 하면 404.
   const callYesterdayWaiting = await request(app)
@@ -1281,6 +1314,13 @@ testSerial('어제 called 상태의 예약이 POS 대기열에 이월 표시되�
     .set('X-Store-Token', store.posToken)
   assert.equal(complete.status, 200)
   assert.equal(complete.body.status, 'completed')
+
+  // 호출하지 않은 어제 waiting도 POS에서 바로 정비완료로 정리할 수 있다(C3).
+  const completeWaiting = await request(app)
+    .post(`/api/pos/queue/${waitingYesterday.id}/complete`)
+    .set('X-Store-Token', store.posToken)
+  assert.equal(completeWaiting.status, 200)
+  assert.equal(completeWaiting.body.status, 'completed')
 })
 
 // --- 일별 요약 (API 계약 v3 §5) ---
@@ -1374,12 +1414,13 @@ testSerial('/api/admin/summary가 상태별 카운트/결제합계/intakeFailed�
 testSerial('같은 매장에 동시에 여러 예약이 접수돼도 대기번호가 충돌하지 않는다', async () => {
   // QueueCounter 원자적 채번(INSERT ... ON CONFLICT DO UPDATE)이 없던 시절엔 오늘 첫 두 손님이
   // 거의 동시에 접수하면 하나가 unique 제약(P2002)에 걸려 500을 돌려주는 버그가 있었다.
+  // 차가 서로 달라야 한다 -- 같은 차는 이제 기존 접수를 돌려준다(아래 '같은 차' 테스트).
   const store = await createStore('concurrent')
-  const requests = Array.from({ length: 5 }, () =>
+  const requests = Array.from({ length: 5 }, (_, i) =>
     request(app).post('/api/reservations').send({
       merchantId: store.merchantId,
-      carNumber: '12가3456',
-      phone: '01099998888',
+      carNumber: `1${i}가345${i}`,
+      phone: `0109999888${i}`,
       serviceType: 'oil',
       privacyConsent: true,
     })

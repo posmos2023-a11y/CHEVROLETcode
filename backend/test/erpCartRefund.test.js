@@ -679,7 +679,7 @@ testSerial('비상구(취소 중): 10분이 안 지났으면 409와 남은 시�
   assert.equal(cart.refundRequestedAt, null)
   assert.equal(cart.refundStartedAt, null)
   assert.equal(cart.refundReleasedAttemptId, a)
-  assert.equal(cart.errorMessage, '프론트 취소 상태를 직원이 풀었음')
+  assert.equal(cart.errorMessage, '프론트 결제 취소 중 상태를 직원이 풀었어요')
 
   // 풀린 시도의 늦은 start는 거절된다(직원이 다시 취소를 요청해도 그 시도가 가로채지 못한다).
   assert.equal((await pos(store, 'post', `/api/pos/erp-carts/${cartId}/refund-request`)).status, 200)
@@ -690,7 +690,7 @@ testSerial('비상구(취소 중): 10분이 안 지났으면 409와 남은 시�
   assert.equal(late.body.status, 'refunded')
   const refunded = await row(cartId)
   assert.equal(refunded.status, 'refunded')
-  assert.equal(refunded.refundNote, '프론트에서 결제 취소(풀린 뒤 보고)')
+  assert.equal(refunded.refundNote, '프론트에서 결제 취소(늦게 확인됨)')
   assert.equal(refunded.refundRequestedAt, null)
 })
 
@@ -725,7 +725,7 @@ testSerial('비상구(취소 중): 풀린 뒤 결제 완료(paid)로 돌아간 �
   assert.deepEqual({ ok: late.body.ok, status: late.body.status }, { ok: true, status: 'refunded' })
   const cart = await row(cartId)
   assert.equal(cart.status, 'refunded')
-  assert.equal(cart.refundNote, '프론트에서 결제 취소(풀린 뒤 보고)')
+  assert.equal(cart.refundNote, '프론트에서 결제 취소(늦게 확인됨)')
   assert.ok(cart.refundedAt)
   assert.ok(warns.some((w) => w.message.includes('풀린 취소 시도의 완료 보고') && w.meta.cartId === cartId && w.meta.attemptId === a))
   // 같은 보고의 재시도는 이미 처리됨

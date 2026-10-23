@@ -849,17 +849,23 @@ testSerial('무차별 대입 방어: 틀린 토큰 10회 뒤 429로 차단된다
   assert.equal(codes.slice(0, 10).every((c) => c === 401), true, `앞 10회가 401이 아님: ${codes}`)
   assert.equal(first429, 10, `11번째부터 429여야 하는데 ${first429 + 1}번째: ${codes}`)
 
-  // 실패는 DB에 기록돼야 한다(인스턴스가 여러 개여도 시도 횟수가 공유되도록).
-  const rows = await prisma.$queryRawUnsafe('SELECT "count" FROM "RateLimitHit"')
+  // 실패는 DB에 기록돼야 한다(인스턴스가 여러 개여도 시도 횟수가 공유되도록). IP별 카운터와 전체 카운터(pos-auth-global)가 하나씩 생긴다.
+  const rows = await prisma.$queryRawUnsafe(`SELECT "key", "count" FROM "RateLimitHit" WHERE "key" LIKE 'pos-auth:%'`)
   assert.equal(rows.length, 1)
   assert.equal(Number(rows[0].count) >= 10, true)
+  const globalRows = await prisma.$queryRawUnsafe(`SELECT "count" FROM "RateLimitHit" WHERE "key" = 'pos-auth-global:all'`)
+  assert.equal(globalRows.length, 1)
+  assert.equal(Number(globalRows[0].count), 13)
+  // 인증이 실패한 요청은 상태 변경 한도(posLimiter, 'pos:' 키)를 쓰지 않는다 -- 한도가 인증 뒤에 있다(A3).
+  const posRows = await prisma.$queryRawUnsafe(`SELECT "key" FROM "RateLimitHit" WHERE "key" LIKE 'pos:%'`)
+  assert.equal(posRows.length, 0)
 })
 
 testSerial('무차별 대입 방어: 토큰을 아예 안 보내도 실패로 센다', async () => {
   await prisma.$executeRawUnsafe('DELETE FROM "RateLimitHit"')
   const res = await request(app).get('/api/pos/erp-carts')
   assert.equal(res.status, 401)
-  const rows = await prisma.$queryRawUnsafe('SELECT "count" FROM "RateLimitHit"')
+  const rows = await prisma.$queryRawUnsafe(`SELECT "count" FROM "RateLimitHit" WHERE "key" LIKE 'pos-auth:%'`)
   assert.equal(rows.length, 1)
 })
 
@@ -2816,14 +2822,33 @@ testSerial('완료 안내: 문자가 실패해도 완료 처리는 되고 notifi
   assert.equal((await prisma.reservation.findUnique({ where: { id: r.id } })).status, 'completed')
 })
 
-testSerial('완료 안내: 완료할 수 없는 상태(대기중)면 문자를 보내지 않는다', async () => {
+testSerial('완료 안내: 완료할 수 없는 상태(취소됨)면 문자를 보내지 않는다', async () => {
+  global.__notifications.length = 0
+  const store = await createStore('done-notice-cancelled')
+  const r = await calledReservation(store)
+  await prisma.reservation.update({ where: { id: r.id }, data: { status: 'cancelled' } })
+  const res = await posComplete(store, r.id)
+  assert.equal(res.status, 409)
+  assert.equal(res.body.status, 'cancelled')
+  assert.equal(global.__notifications.filter((n) => n.method === 'sendRepairDoneAlimtalk').length, 0)
+})
+
+testSerial('완료 안내: POS는 호출하지 않은 대기(waiting) 접수도 바로 정비완료로 처리하고 완료 문자를 한 번 보낸다(C3)', async () => {
   global.__notifications.length = 0
   const store = await createStore('done-notice-waiting')
   const r = await calledReservation(store)
   await prisma.reservation.update({ where: { id: r.id }, data: { status: 'waiting', calledAt: null } })
   const res = await posComplete(store, r.id)
-  assert.equal(res.status, 409)
-  assert.equal(global.__notifications.filter((n) => n.method === 'sendRepairDoneAlimtalk').length, 0)
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal(res.body.status, 'completed')
+  assert.equal(res.body.notified, true)
+  assert.equal(global.__notifications.filter((n) => n.method === 'sendRepairDoneAlimtalk').length, 1)
+  // 호출 알림("고객님의 순서입니다")은 보내지 않는다 -- 호출을 건너뛰는 것이 목적이다.
+  assert.equal(global.__notifications.filter((n) => n.method === 'sendQueueTurnAlimtalk').length, 0)
+  const again = await posComplete(store, r.id)
+  assert.equal(again.status, 200)
+  assert.equal(again.body.alreadyCompleted, true)
+  assert.equal(global.__notifications.filter((n) => n.method === 'sendRepairDoneAlimtalk').length, 1)
 })
 
 testSerial('영수증: POS에서 결제한 전산 주문도 예약과 이어져 있으면 영수증이 한 번 간다', async () => {

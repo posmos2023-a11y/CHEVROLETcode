@@ -33,7 +33,12 @@ GitHub Actions에서는 동일한 PostgreSQL 서비스 컨테이너를 사용합
 문서의 로컬 재현 절차와는 무관하니 혼동하지 마세요.
 
 - **`syntax-check`** — `node --check`로 `backend/server.js`, `backend/src/*.js`,
-  `backend/public/reservation.js`가 파싱 가능한지만 확인합니다(린터가 없는 프로젝트라 최소한의
-  구문 오류 방지용, 런타임 동작은 검증하지 않음).
+  `backend/public/reservation.js`, 빌드 없이 ZIP에 들어가는 프론트 스크립트(`front-plugin/erp-front-pay.js`,
+  `sdk.js`, `api-config.js`), `backend/public/admin.html`의 인라인 스크립트(꺼내서 검사)가 파싱 가능한지만
+  확인합니다(린터가 없는 프로젝트라 최소한의 구문 오류 방지용, 런타임 동작은 검증하지 않음).
 - **`pos-plugin-build`** — `pos-plugin/`에서 `npm ci && npm run build`를 실행해 POS 탭앱 번들이
-  매 커밋 컴파일되는지 확인합니다. 백엔드 코드와는 별개 프로젝트지만 같은 워크플로 파일에서 관리합니다.
+  매 커밋 컴파일되는지 확인합니다. `build.js`가 `CHEVROLET_API_BASE_URL` 없이는 실패하므로 CI는
+  `https://ci.invalid`를 넣습니다(컴파일 확인용 -- 이 번들은 배포하지 않음). 백엔드 코드와는 별개
+  프로젝트지만 같은 워크플로 파일에서 관리합니다.
+
+세 잡 모두 운영 이미지(`Dockerfile`의 `node:22`)와 같은 Node 22로 돕니다.
